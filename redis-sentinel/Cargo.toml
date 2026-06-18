@@ -1,0 +1,19 @@
+[package]
+name = "redis-sentinel"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "redis-wrapper"
+path = "src/bin/redis_wrapper.rs"
+
+[dependencies]
+common = { path = "../common" }
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+nix.workspace = true
+axum.workspace = true
+redis.workspace = true
