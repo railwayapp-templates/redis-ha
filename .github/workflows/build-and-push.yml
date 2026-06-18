@@ -21,7 +21,8 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_PREFIX: ghcr.io/${{ github.repository }}
-  REDIS_VERSION: "7"
+  # Which major version gets the "latest" tag
+  LATEST_REDIS_MAJOR: 8
   REDIS_DISTRO: "bookworm"
   HAPROXY_VERSION: "3.2"
   # No suffix - publish to regular tags
@@ -53,7 +54,8 @@ jobs:
               - 'Cargo.lock'
               - '.github/workflows/build-and-push.yml'
 
-  # Build Rust binary for redis-sentinel (AMD64 - alpine, native, fast ~2-3min)
+  # Build Rust binary for redis-sentinel (AMD64 - bookworm, native, fast ~2-3min)
+  # The binary is version-agnostic — one build covers all Redis major versions.
   build-rust-binaries-redis-sentinel-amd64:
     needs: changes
     if: ${{ needs.changes.outputs['redis-sentinel'] == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
@@ -123,7 +125,7 @@ jobs:
           cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/haproxy-rust-binaries:latest
           cache-to: type=inline
 
-  # Build redis-sentinel image for AMD64
+  # Build redis-sentinel for AMD64 (one image per Redis major version)
   build-redis-sentinel-amd64:
     needs: [changes, build-rust-binaries-redis-sentinel-amd64]
     if: ${{ needs.changes.outputs['redis-sentinel'] == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
@@ -131,6 +133,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+
+    strategy:
+      matrix:
+        redis_major: [7, 8]
 
     steps:
       - name: Checkout repository
@@ -155,17 +161,17 @@ jobs:
         with:
           context: .
           file: ./redis-sentinel/Dockerfile
-          build-args: REDIS_VERSION=${{ env.REDIS_VERSION }}
+          build-args: REDIS_VERSION=${{ matrix.redis_major }}
           build-contexts: |
             rust-binaries=docker-image://${{ env.IMAGE_PREFIX }}/redis-sentinel-rust-binaries:latest
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ env.IMAGE_PREFIX }}/redis-sentinel:latest${{ env.BETA_SUFFIX }}
-            ${{ env.IMAGE_PREFIX }}/redis-sentinel:${{ env.REDIS_VERSION }}${{ env.BETA_SUFFIX }}
-            ${{ env.IMAGE_PREFIX }}/redis-sentinel:${{ env.REDIS_VERSION }}-${{ env.REDIS_DISTRO }}${{ env.BETA_SUFFIX }}
-            ${{ env.IMAGE_PREFIX }}/redis-sentinel:${{ env.REDIS_VERSION }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}
-          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/redis-sentinel:latest
+            ${{ env.IMAGE_PREFIX }}/redis-sentinel:${{ matrix.redis_major }}${{ env.BETA_SUFFIX }}
+            ${{ env.IMAGE_PREFIX }}/redis-sentinel:${{ matrix.redis_major }}-${{ env.REDIS_DISTRO }}${{ env.BETA_SUFFIX }}
+            ${{ env.IMAGE_PREFIX }}/redis-sentinel:${{ matrix.redis_major }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}
+            ${{ matrix.redis_major == env.LATEST_REDIS_MAJOR && format('{0}/redis-sentinel:latest{1}', env.IMAGE_PREFIX, env.BETA_SUFFIX) || '' }}
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/redis-sentinel:${{ matrix.redis_major }}
           cache-to: type=inline
 
   # Build haproxy image for AMD64

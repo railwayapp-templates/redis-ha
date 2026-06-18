@@ -52,6 +52,7 @@ Scale from 2–5 replicas via the cluster overview. Sentinel uses gossip to disc
 
 | Image | GHCR tag | Base |
 |---|---|---|
+| `redis-sentinel` | `ghcr.io/railwayapp-templates/redis-ha/redis-sentinel:8-bookworm` (latest) | `redis:8-bookworm` |
 | `redis-sentinel` | `ghcr.io/railwayapp-templates/redis-ha/redis-sentinel:7-bookworm` | `redis:7-bookworm` |
 | `haproxy` | `ghcr.io/railwayapp-templates/redis-ha/haproxy:3.2-alpine` | `haproxy:3.2-alpine` |
 
@@ -104,4 +105,4 @@ docker build -f haproxy/Dockerfile -t redis-ha-haproxy:local .
 
 ### Publish
 
-CI publishes on every push to `main` that touches a component. To release a new Redis or HAProxy base version, update `REDIS_VERSION` / `HAPROXY_VERSION` in `.github/workflows/build-and-push.yml` and push.
+CI publishes on every push to `main` that touches a component. To add a new Redis major version, add it to the `redis_major` matrix and update `LATEST_REDIS_MAJOR` in `.github/workflows/build-and-push.yml`. To bump HAProxy, update `HAPROXY_VERSION`.
