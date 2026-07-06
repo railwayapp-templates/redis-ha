@@ -3,7 +3,7 @@ ARG REDIS_VERSION=7
 # ============================================================
 # Rust builder stage
 # ============================================================
-FROM rust:1.83-alpine AS rust-builder
+FROM rust:1.90-alpine AS rust-builder
 
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static
 

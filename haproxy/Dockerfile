@@ -3,7 +3,7 @@ ARG HAPROXY_VERSION=3.2
 # ============================================================
 # Rust builder stage (statically linked with musl)
 # ============================================================
-FROM rust:1.83-alpine AS rust-builder
+FROM rust:1.90-alpine AS rust-builder
 
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static
 
