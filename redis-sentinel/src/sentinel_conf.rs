@@ -51,7 +51,7 @@ pub fn generate_sentinel_conf(config: &Config) -> String {
             continue;
         }
         let parts: Vec<&str> = peer.splitn(2, ':').collect();
-        if parts.len() == 2 {
+        if parts.len() == 2 && !parts[0].is_empty() {
             if let Ok(port) = parts[1].parse::<u16>() {
                 lines.push(format!("sentinel known-sentinel {} {} {}", config.redis_master_name, parts[0], port));
             }

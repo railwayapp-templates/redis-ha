@@ -207,7 +207,11 @@ pub async fn run_health_server(
         .route("/role", get(role))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], health_port));
+    // Bind the IPv6 unspecified address rather than 0.0.0.0: Railway's private
+    // network is IPv6 (fd12::... hostnames), and a IPv4-only listener refuses
+    // every connection HAProxy's health check makes over it. Linux dual-stack
+    // sockets accept IPv4-mapped connections on the same listener by default.
+    let addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], health_port));
     info!(port = health_port, "health server listening");
 
     let listener = tokio::net::TcpListener::bind(addr)

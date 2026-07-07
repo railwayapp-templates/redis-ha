@@ -12,8 +12,10 @@ pub fn generate_redis_conf(config: &Config) -> String {
         // Log to stdout so Railway captures it
         "logfile \"\"".to_string(),
         "loglevel notice".to_string(),
-        // Allow replication from any host on the private network
-        "bind 0.0.0.0".to_string(),
+        // Allow replication from any host on the private network. Railway's
+        // private network is IPv6 (fd12::... hostnames) — binding only 0.0.0.0
+        // leaves Redis unreachable from any peer connecting over it.
+        "bind 0.0.0.0 ::".to_string(),
         // Announce this node's stable private hostname (not its IP, which changes on
         // redeploy) to the master/replicas during replication handshake. The "ip" name
         // is legacy — the field accepts any string, including a hostname.
