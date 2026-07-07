@@ -14,8 +14,11 @@ pub fn generate_redis_conf(config: &Config) -> String {
         "loglevel notice".to_string(),
         // Allow replication from any host on the private network
         "bind 0.0.0.0".to_string(),
-        // Resolve replica/Sentinel peers by hostname
-        "replica-announce-hostname yes".to_string(),
+        // Announce this node's stable private hostname (not its IP, which changes on
+        // redeploy) to the master/replicas during replication handshake. The "ip" name
+        // is legacy — the field accepts any string, including a hostname.
+        format!("replica-announce-ip {}", config.private_domain),
+        format!("replica-announce-port {}", config.redis_port),
         "cluster-preferred-endpoint-type hostname".to_string(),
         // Split-brain fence: master stops accepting writes when it loses contact
         // with all replicas for longer than min-replicas-max-lag seconds.

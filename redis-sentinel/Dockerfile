@@ -30,15 +30,22 @@ FROM redis:${REDIS_VERSION}-bookworm
 USER root
 
 # redis-cli is bundled with the redis image; no extra packages needed.
-# Install bash for Railway's Database UI SSH tunnel compatibility.
-RUN apt-get update && apt-get install -y --no-install-recommends bash && rm -rf /var/lib/apt/lists/*
+# Install bash for Railway's Database UI SSH tunnel compatibility, and wget for
+# the HEALTHCHECK below (this base image, unlike the haproxy alpine one, doesn't
+# bundle it).
+RUN apt-get update && apt-get install -y --no-install-recommends bash wget && rm -rf /var/lib/apt/lists/*
 
 # Copy the Rust entrypoint
 COPY --from=rust-binaries --chmod=755 /redis-wrapper /usr/local/bin/redis-wrapper
 
-RUN mkdir -p /data && chown redis:redis /data
+RUN mkdir -p /data
 
-USER redis
+# TODO(security): runs as root. Railway's runtime-mounted volume at /data has its
+# own ownership, independent of a build-time `chown`, so a non-root USER here
+# was unable to write redis.conf/sentinel.conf to the actual mounted volume.
+# The proper fix — matching upstream redis's own docker-entrypoint.sh — is to
+# start as root, chown /data to a non-root user at runtime, then drop privileges
+# (e.g. via gosu) before exec'ing redis-server/sentinel. Deferred for now.
 
 VOLUME ["/data"]
 
