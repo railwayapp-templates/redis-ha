@@ -3,7 +3,9 @@
 //! Spawns both processes, forwards OS signals to them, and exits the container
 //! if either dies — letting Railway's restart policy handle recovery.
 
+use crate::redis_conf::aof_manifest_exists;
 use anyhow::{Context, Result};
+use common::{Telemetry, TelemetryEvent};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use redis::Client;
@@ -23,26 +25,48 @@ pub async fn spawn_redis(data_dir: &str, _redis_port: u16) -> Result<Child> {
         .context("failed to spawn redis-server")
 }
 
-/// Turn AOF on after Redis has loaded an adopted RDB.
-///
-/// `CONFIG SET appendonly yes` makes Redis rewrite the AOF from the dataset it
-/// currently holds, so the adopted keys end up in the AOF instead of being
-/// abandoned. `CONFIG REWRITE` then persists `appendonly yes` into redis.conf
-/// — though the wrapper regenerates that file on every boot anyway, and by
-/// then `appendonlydir` exists so the migration no longer triggers.
-///
-/// Best-effort: a failure here leaves a running Redis serving the adopted data
-/// with AOF off, which is recoverable. Killing the node would not be.
-pub async fn enable_aof_after_rdb_load(port: u16, password: &str) -> Result<()> {
-    let url = format!("redis://:{}@127.0.0.1:{}", password, port);
-    let client = Client::open(url).context("failed to build redis client")?;
+/// Parsed slice of `INFO persistence`: (aof enabled, rewrite in progress).
+fn aof_status_from_info(info: &str) -> (bool, bool) {
+    let flag = |needle: &str| info.lines().any(|line| line.trim_end() == needle);
+    (flag("aof_enabled:1"), flag("aof_rewrite_in_progress:1"))
+}
 
-    // Redis listens BEFORE it finishes loading the RDB and answers -LOADING
-    // to most commands (DBSIZE included) until the load completes, so the
-    // command has to be retried, not just the connection. The deadline is
-    // sized for multi-gigabyte RDBs; the caller runs this in the background,
-    // so nothing else waits on it.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
+/// Drive the adopted dataset's AOF migration until it is durably committed.
+///
+/// `CONFIG SET appendonly yes` only STARTS the migration: Redis rewrites the
+/// in-memory dataset into the AOF in a background child and commits by
+/// atomically renaming the manifest into place. The child can fail — fork
+/// under the memory pressure that follows loading a large RDB, a full volume
+/// — and a failed child leaves AOF nominally enabled with nothing durable.
+/// Re-issuing CONFIG SET is a no-op in that state; BGREWRITEAOF is what
+/// starts a new attempt.
+///
+/// So this reconciles instead of firing once: wait out the RDB load, then
+/// keep nudging Redis until the manifest exists. Runs for as long as it
+/// takes — it lives in a background task that dies with the container, and a
+/// boot that never commits a manifest re-triggers the migration on the next
+/// one. While it retries, the node serves the adopted data with RDB save
+/// points as its durability — exactly what the standalone service had before
+/// conversion.
+pub async fn enable_aof_after_rdb_load(
+    port: u16,
+    password: &str,
+    data_dir: &str,
+    telemetry: &Telemetry,
+) {
+    let url = format!("redis://:{}@127.0.0.1:{}", password, port);
+    let client = match Client::open(url) {
+        Ok(client) => client,
+        Err(err) => {
+            error!(error = %err, "failed to build redis client for the AOF migration");
+            return;
+        }
+    };
+
+    // Phase 1: wait out the RDB load. Redis listens before it finishes
+    // loading and answers -LOADING to most commands, so the command has to be
+    // retried, not just the connection. No deadline: a huge RDB takes as long
+    // as it takes, and if redis dies instead, supervise exits the container.
     let mut waiting_logged = false;
     let dbsize: i64 = loop {
         let attempt = async {
@@ -52,11 +76,7 @@ pub async fn enable_aof_after_rdb_load(port: u16, password: &str) -> Result<()> 
         .await;
         match attempt {
             Ok(n) => break n,
-            Err(err) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(anyhow::Error::new(err)
-                        .context("redis did not finish loading the dataset in time"));
-                }
+            Err(_) => {
                 if !waiting_logged {
                     info!("waiting for redis to finish loading the adopted dataset");
                     waiting_logged = true;
@@ -66,30 +86,77 @@ pub async fn enable_aof_after_rdb_load(port: u16, password: &str) -> Result<()> 
         }
     };
 
-    let mut conn = client
-        .get_multiplexed_async_connection()
-        .await
-        .context("failed to reconnect after the dataset loaded")?;
+    // Phase 2: reconcile until the manifest exists. Healthy waits (rewrite
+    // running) poll fast; failure paths back off, since each BGREWRITEAOF
+    // attempt forks the whole dataset.
+    let mut reported = false;
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if aof_manifest_exists(data_dir) {
+            info!(
+                keys_adopted = dbsize,
+                "enabled AOF after loading adopted RDB"
+            );
+            return;
+        }
 
-    redis::cmd("CONFIG")
-        .arg("SET")
-        .arg("appendonly")
-        .arg("yes")
-        .query_async::<()>(&mut conn)
-        .await
-        .context("CONFIG SET appendonly yes failed")?;
+        // Ok(true) = progressing (just enabled, or a rewrite is running).
+        // Ok(false) = a previous rewrite child failed; a new attempt was started.
+        let step: Result<bool, redis::RedisError> = async {
+            let mut conn = client.get_multiplexed_async_connection().await?;
+            let info: String = redis::cmd("INFO")
+                .arg("persistence")
+                .query_async(&mut conn)
+                .await?;
+            let (enabled, in_progress) = aof_status_from_info(&info);
+            if !enabled {
+                redis::cmd("CONFIG")
+                    .arg("SET")
+                    .arg("appendonly")
+                    .arg("yes")
+                    .query_async::<()>(&mut conn)
+                    .await?;
+                return Ok(true);
+            }
+            if in_progress {
+                return Ok(true);
+            }
+            redis::cmd("BGREWRITEAOF")
+                .query_async::<String>(&mut conn)
+                .await?;
+            Ok(false)
+        }
+        .await;
 
-    redis::cmd("CONFIG")
-        .arg("REWRITE")
-        .query_async::<()>(&mut conn)
-        .await
-        .context("CONFIG REWRITE failed")?;
-
-    info!(
-        keys_adopted = dbsize,
-        "enabled AOF after loading adopted RDB"
-    );
-    Ok(())
+        match step {
+            Ok(true) => backoff = Duration::from_secs(1),
+            Ok(false) => {
+                warn!("background AOF rewrite did not commit; started a new attempt");
+                if !reported {
+                    reported = true;
+                    telemetry.send(TelemetryEvent::ComponentError {
+                        component: "redis-wrapper".to_string(),
+                        error: "AOF migration rewrite failing; retrying".to_string(),
+                        context: "startup".to_string(),
+                    });
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(300));
+            }
+            Err(err) => {
+                warn!(error = %err, "AOF migration attempt failed; will retry");
+                if !reported {
+                    reported = true;
+                    telemetry.send(TelemetryEvent::ComponentError {
+                        component: "redis-wrapper".to_string(),
+                        error: format!("AOF migration failing; retrying: {}", err),
+                        context: "startup".to_string(),
+                    });
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(300));
+            }
+        }
+        tokio::time::sleep(backoff).await;
+    }
 }
 
 pub async fn spawn_sentinel(data_dir: &str) -> Result<Child> {
@@ -197,5 +264,45 @@ async fn graceful_shutdown(
                 let _ = redis.kill().await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aof_status_from_info;
+
+    // Real `INFO persistence` lines are CRLF-terminated; keep that in the
+    // samples so the parser is tested against what Redis actually sends.
+    fn info(enabled: u8, in_progress: u8) -> String {
+        format!(
+            "# Persistence\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_last_bgrewrite_status:ok\r\n",
+            enabled, in_progress
+        )
+    }
+
+    #[test]
+    fn parses_enabled_with_rewrite_running() {
+        assert_eq!(aof_status_from_info(&info(1, 1)), (true, true));
+    }
+
+    #[test]
+    fn parses_enabled_and_idle() {
+        // The failure-recovery branch: enabled, idle, and (per the caller) no
+        // manifest — the state a dead rewrite child leaves behind.
+        assert_eq!(aof_status_from_info(&info(1, 0)), (true, false));
+    }
+
+    #[test]
+    fn parses_disabled() {
+        assert_eq!(aof_status_from_info(&info(0, 0)), (false, false));
+    }
+
+    #[test]
+    fn missing_fields_read_as_disabled() {
+        assert_eq!(aof_status_from_info(""), (false, false));
+        assert_eq!(
+            aof_status_from_info("# Persistence\r\nloading:0\r\n"),
+            (false, false)
+        );
     }
 }
