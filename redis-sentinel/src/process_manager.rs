@@ -6,6 +6,8 @@
 use anyhow::{Context, Result};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
+use redis::Client;
+use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info, warn};
@@ -19,6 +21,60 @@ pub async fn spawn_redis(data_dir: &str, _redis_port: u16) -> Result<Child> {
         .kill_on_drop(false)
         .spawn()
         .context("failed to spawn redis-server")
+}
+
+/// Turn AOF on after Redis has loaded an adopted RDB.
+///
+/// `CONFIG SET appendonly yes` makes Redis rewrite the AOF from the dataset it
+/// currently holds, so the adopted keys end up in the AOF instead of being
+/// abandoned. `CONFIG REWRITE` then persists `appendonly yes` into redis.conf
+/// — though the wrapper regenerates that file on every boot anyway, and by
+/// then `appendonlydir` exists so the migration no longer triggers.
+///
+/// Best-effort: a failure here leaves a running Redis serving the adopted data
+/// with AOF off, which is recoverable. Killing the node would not be.
+pub async fn enable_aof_after_rdb_load(port: u16, password: &str) -> Result<()> {
+    let url = format!("redis://:{}@127.0.0.1:{}", password, port);
+    let client = Client::open(url).context("failed to build redis client")?;
+
+    // Redis is a few hundred ms behind the spawn; loading a large RDB can take
+    // longer, and it refuses commands until that finishes.
+    let mut conn = None;
+    for _ in 0..60 {
+        match client.get_multiplexed_async_connection().await {
+            Ok(c) => {
+                conn = Some(c);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
+    }
+    let mut conn = conn.context("redis did not accept connections in time")?;
+
+    let dbsize: i64 = redis::cmd("DBSIZE")
+        .query_async(&mut conn)
+        .await
+        .context("DBSIZE failed")?;
+
+    redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("appendonly")
+        .arg("yes")
+        .query_async::<()>(&mut conn)
+        .await
+        .context("CONFIG SET appendonly yes failed")?;
+
+    redis::cmd("CONFIG")
+        .arg("REWRITE")
+        .query_async::<()>(&mut conn)
+        .await
+        .context("CONFIG REWRITE failed")?;
+
+    info!(
+        keys_adopted = dbsize,
+        "enabled AOF after loading adopted RDB"
+    );
+    Ok(())
 }
 
 pub async fn spawn_sentinel(data_dir: &str) -> Result<Child> {

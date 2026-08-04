@@ -14,8 +14,8 @@ use common::{init_logging, RailwayEnv, Telemetry, TelemetryEvent};
 use redis_sentinel::{
     config::Config,
     health_server::run_health_server,
-    process_manager::{spawn_redis, spawn_sentinel, supervise},
-    redis_conf::generate_redis_conf,
+    process_manager::{enable_aof_after_rdb_load, spawn_redis, spawn_sentinel, supervise},
+    redis_conf::{generate_redis_conf, needs_rdb_to_aof_migration},
     sentinel_conf::generate_sentinel_conf,
 };
 use std::fs;
@@ -106,8 +106,27 @@ async fn main() -> Result<()> {
         role: role.to_string(),
     });
 
+    // Captured before spawning: once Redis is up it writes its own
+    // appendonlydir, so the check would no longer be true.
+    let adopting_rdb = needs_rdb_to_aof_migration(&config.data_dir);
+
     // Spawn Redis
     let redis_proc = spawn_redis(&config.data_dir, config.redis_port).await?;
+
+    // redis.conf carries `appendonly no` for this boot so the adopted RDB is
+    // the thing Redis loads; turn AOF back on now that it has.
+    if adopting_rdb {
+        info!("adopted dataset has an RDB and no AOF — enabling AOF after load");
+        if let Err(err) = enable_aof_after_rdb_load(config.redis_port, &config.redis_password).await
+        {
+            tracing::error!(error = %err, "failed to enable AOF after loading adopted RDB");
+            telemetry.send(TelemetryEvent::ComponentError {
+                component: "redis-wrapper".to_string(),
+                error: format!("AOF migration failed: {}", err),
+                context: "startup".to_string(),
+            });
+        }
+    }
 
     // Spawn Sentinel (colocated)
     let sentinel_proc = if config.sentinel_enabled {
