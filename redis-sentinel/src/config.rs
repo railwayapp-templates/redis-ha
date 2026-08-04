@@ -114,3 +114,218 @@ impl Config {
         }
     }
 }
+
+#[cfg(test)]
+impl Config {
+    /// A fully-populated Config for tests to mutate. Built directly instead of
+    /// through from_env so tests that don't care about the environment don't
+    /// have to serialize on it.
+    pub fn for_tests() -> Self {
+        Self {
+            redis_password: "pw".to_string(),
+            redis_port: 6379,
+            replica_of: String::new(),
+            sentinel_enabled: true,
+            sentinel_port: 26379,
+            sentinel_quorum: 2,
+            sentinel_hosts: "redis-1:26379".to_string(),
+            redis_master_name: "mymaster".to_string(),
+            sentinel_down_after_ms: 5000,
+            sentinel_failover_timeout_ms: 30000,
+            health_port: 8080,
+            data_dir: "/data".to_string(),
+            private_domain: "redis-1.railway.internal".to_string(),
+        }
+    }
+}
+
+/// Whether the resolved data dir actually lives on the mounted volume —
+/// equal to the mount, or nested under it. A plain string-prefix test is not
+/// enough: `/database` starts with `/data` but is a different directory.
+pub fn data_dir_is_on_volume(data_dir: &str, mount: &str) -> bool {
+    !mount.is_empty() && (data_dir == mount || data_dir.starts_with(&format!("{}/", mount)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Env vars are process-global and cargo runs tests in parallel threads —
+    /// every test that reads or writes the environment holds this.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn clear_env() {
+        for key in [
+            "DATA_DIR",
+            "RAILWAY_VOLUME_MOUNT_PATH",
+            "REDIS_PASSWORD",
+            "SENTINEL_ENABLED",
+            "SENTINEL_HOSTS",
+            "REPLICA_OF",
+            "REDIS_PORT",
+        ] {
+            env::remove_var(key);
+        }
+    }
+
+    // --- resolve_data_dir: every branch ---
+
+    #[test]
+    fn explicit_data_dir_wins_over_the_mount() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("DATA_DIR", "/custom");
+        env::set_var("RAILWAY_VOLUME_MOUNT_PATH", "/vol");
+        assert_eq!(Config::resolve_data_dir(), "/custom");
+    }
+
+    #[test]
+    fn empty_data_dir_is_ignored() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("DATA_DIR", "");
+        env::set_var("RAILWAY_VOLUME_MOUNT_PATH", "/vol");
+        assert_eq!(Config::resolve_data_dir(), "/vol");
+    }
+
+    #[test]
+    fn follows_the_volume_mount() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("RAILWAY_VOLUME_MOUNT_PATH", "/bitnami/redis/data");
+        assert_eq!(Config::resolve_data_dir(), "/bitnami/redis/data");
+    }
+
+    #[test]
+    fn empty_mount_falls_back_to_default() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("RAILWAY_VOLUME_MOUNT_PATH", "");
+        assert_eq!(Config::resolve_data_dir(), "/data");
+    }
+
+    #[test]
+    fn no_env_falls_back_to_default() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        assert_eq!(Config::resolve_data_dir(), "/data");
+    }
+
+    // --- data_dir_is_on_volume: every branch ---
+
+    #[test]
+    fn dir_equal_to_mount_is_on_volume() {
+        assert!(data_dir_is_on_volume("/data", "/data"));
+    }
+
+    #[test]
+    fn subdirectory_of_mount_is_on_volume() {
+        assert!(data_dir_is_on_volume("/data/redis", "/data"));
+    }
+
+    #[test]
+    fn sibling_sharing_a_prefix_is_not_on_volume() {
+        // The bug a plain starts_with would introduce.
+        assert!(!data_dir_is_on_volume("/database", "/data"));
+    }
+
+    #[test]
+    fn unrelated_dir_is_not_on_volume() {
+        assert!(!data_dir_is_on_volume("/tmp/elsewhere", "/data"));
+    }
+
+    #[test]
+    fn empty_mount_is_never_on_volume() {
+        assert!(!data_dir_is_on_volume("/data", ""));
+    }
+
+    // --- from_env: every branch of its validation ---
+
+    #[test]
+    fn from_env_requires_a_password() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let err = Config::from_env()
+            .err()
+            .expect("should fail without a password");
+        assert!(err.to_string().contains("REDIS_PASSWORD"));
+    }
+
+    #[test]
+    fn from_env_rejects_sentinel_without_hosts() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("REDIS_PASSWORD", "pw");
+        env::set_var("SENTINEL_ENABLED", "true");
+        let err = Config::from_env()
+            .err()
+            .expect("should fail without sentinel hosts");
+        assert!(err.to_string().contains("SENTINEL_HOSTS"));
+    }
+
+    #[test]
+    fn from_env_accepts_sentinel_with_hosts() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("REDIS_PASSWORD", "pw");
+        env::set_var("SENTINEL_ENABLED", "true");
+        env::set_var("SENTINEL_HOSTS", "redis-1:26379");
+        let config = Config::from_env().unwrap();
+        assert!(config.sentinel_enabled);
+        assert_eq!(config.sentinel_hosts, "redis-1:26379");
+    }
+
+    #[test]
+    fn from_env_accepts_sentinel_disabled_without_hosts() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("REDIS_PASSWORD", "pw");
+        let config = Config::from_env().unwrap();
+        assert!(!config.sentinel_enabled);
+    }
+
+    // --- is_primary / initial master host and port: every branch ---
+
+    #[test]
+    fn empty_replica_of_means_primary() {
+        assert!(Config::for_tests().is_primary());
+    }
+
+    #[test]
+    fn set_replica_of_means_replica() {
+        let mut config = Config::for_tests();
+        config.replica_of = "master:6379".to_string();
+        assert!(!config.is_primary());
+    }
+
+    #[test]
+    fn primary_master_host_is_own_domain() {
+        let config = Config::for_tests();
+        assert_eq!(config.initial_master_host(), "redis-1.railway.internal");
+        assert_eq!(config.initial_master_port(), 6379);
+    }
+
+    #[test]
+    fn replica_master_host_and_port_come_from_replica_of() {
+        let mut config = Config::for_tests();
+        config.replica_of = "master-host:7000".to_string();
+        assert_eq!(config.initial_master_host(), "master-host");
+        assert_eq!(config.initial_master_port(), 7000);
+    }
+
+    #[test]
+    fn replica_of_without_port_falls_back_to_own_port() {
+        let mut config = Config::for_tests();
+        config.replica_of = "master-host".to_string();
+        assert_eq!(config.initial_master_host(), "master-host");
+        assert_eq!(config.initial_master_port(), 6379);
+    }
+
+    #[test]
+    fn replica_of_with_junk_port_falls_back_to_own_port() {
+        let mut config = Config::for_tests();
+        config.replica_of = "master-host:abc".to_string();
+        assert_eq!(config.initial_master_port(), 6379);
+    }
+}
