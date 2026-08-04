@@ -12,10 +12,12 @@
 use anyhow::{Context, Result};
 use common::{init_logging, RailwayEnv, Telemetry, TelemetryEvent};
 use redis_sentinel::{
-    config::Config,
+    config::{data_dir_is_on_volume, Config},
     health_server::run_health_server,
     process_manager::{enable_aof_after_rdb_load, spawn_redis, spawn_sentinel, supervise},
-    redis_conf::{generate_redis_conf, needs_rdb_to_aof_migration},
+    redis_conf::{
+        generate_redis_conf, needs_rdb_to_aof_migration, quarantine_manifestless_aof_dir,
+    },
     sentinel_conf::generate_sentinel_conf,
 };
 use std::fs;
@@ -48,9 +50,7 @@ async fn main() -> Result<()> {
     // data, it only removed the node.
     if RailwayEnv::is_railway() {
         let mount = std::env::var("RAILWAY_VOLUME_MOUNT_PATH").unwrap_or_default();
-        let persisted = !mount.is_empty()
-            && (config.data_dir == mount || config.data_dir.starts_with(&format!("{}/", mount)));
-        if !persisted {
+        if !data_dir_is_on_volume(&config.data_dir, &mount) {
             tracing::warn!(
                 data_dir = %config.data_dir,
                 volume_mount_path = %mount,
@@ -109,6 +109,20 @@ async fn main() -> Result<()> {
     // Captured before spawning: once Redis is up it writes its own
     // appendonlydir, so the check would no longer be true.
     let adopting_rdb = needs_rdb_to_aof_migration(&config.data_dir);
+
+    if adopting_rdb {
+        match quarantine_manifestless_aof_dir(&config.data_dir) {
+            Ok(Some(orphaned)) => tracing::warn!(
+                to = %orphaned.display(),
+                "moved manifest-less appendonlydir aside before AOF migration"
+            ),
+            Ok(None) => {}
+            Err(err) => tracing::error!(
+                error = %err,
+                "failed to move manifest-less appendonlydir aside"
+            ),
+        }
+    }
 
     // Spawn Redis
     let redis_proc = spawn_redis(&config.data_dir, config.redis_port).await?;

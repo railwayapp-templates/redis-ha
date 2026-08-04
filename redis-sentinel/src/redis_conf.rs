@@ -13,8 +13,42 @@ use crate::config::Config;
 /// runtime (`CONFIG SET appendonly yes`), which is the documented migration
 /// and rewrites the AOF from the in-memory dataset.
 pub fn needs_rdb_to_aof_migration(data_dir: &str) -> bool {
-    std::path::Path::new(&format!("{}/dump.rdb", data_dir)).exists()
-        && !std::path::Path::new(&format!("{}/appendonlydir", data_dir)).exists()
+    let has_rdb = std::path::Path::new(&format!("{}/dump.rdb", data_dir)).exists();
+    // The manifest, not the directory: `CONFIG SET appendonly yes` commits the
+    // rewritten AOF by atomically renaming the manifest into place, so a crash
+    // before that commit leaves an appendonlydir with orphan files Redis
+    // cannot load. Keying on the directory would skip the migration on the
+    // next boot and strand the (still intact) dump.rdb all over again.
+    let has_loadable_aof = std::path::Path::new(&format!(
+        "{}/appendonlydir/appendonly.aof.manifest",
+        data_dir
+    ))
+    .exists();
+    has_rdb && !has_loadable_aof
+}
+
+/// Move a manifest-less `appendonlydir` out of the way before an RDB
+/// adoption boot.
+///
+/// A previous adoption that crashed between `CONFIG SET appendonly yes` and
+/// the rewrite committing its manifest leaves an appendonlydir Redis cannot
+/// load, whose orphan files would collide with the AOF the new boot creates.
+/// Renamed aside, never deleted — those files are the only trace of writes
+/// accepted in that window. Returns the quarantine path when something moved.
+pub fn quarantine_manifestless_aof_dir(
+    data_dir: &str,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    let aof_dir = std::path::Path::new(data_dir).join("appendonlydir");
+    if !aof_dir.exists() || aof_dir.join("appendonly.aof.manifest").exists() {
+        return Ok(None);
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let orphaned = std::path::Path::new(data_dir).join(format!("appendonlydir.orphaned-{}", ts));
+    std::fs::rename(&aof_dir, &orphaned)?;
+    Ok(Some(orphaned))
 }
 
 pub fn generate_redis_conf(config: &Config) -> String {
@@ -69,4 +103,184 @@ pub fn generate_redis_conf(config: &Config) -> String {
     }
 
     lines.join("\n") + "\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn config_at(data_dir: &str) -> Config {
+        let mut config = Config::for_tests();
+        config.data_dir = data_dir.to_string();
+        config
+    }
+
+    fn write_rdb(dir: &std::path::Path) {
+        fs::write(dir.join("dump.rdb"), b"REDIS0011fake").unwrap();
+    }
+
+    fn write_manifestless_aof_dir(dir: &std::path::Path) {
+        let aof = dir.join("appendonlydir");
+        fs::create_dir_all(&aof).unwrap();
+        fs::write(aof.join("appendonly.aof.1.incr.aof"), b"orphan").unwrap();
+    }
+
+    fn write_aof_manifest(dir: &std::path::Path) {
+        let aof = dir.join("appendonlydir");
+        fs::create_dir_all(&aof).unwrap();
+        fs::write(
+            aof.join("appendonly.aof.manifest"),
+            b"file appendonly.aof.1.base.rdb seq 1 type b\n",
+        )
+        .unwrap();
+    }
+
+    // --- needs_rdb_to_aof_migration: every branch ---
+
+    #[test]
+    fn fresh_volume_needs_no_migration() {
+        let dir = tempdir().unwrap();
+        assert!(!needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn rdb_only_needs_migration() {
+        // The adoption case: a standalone Railway redis persists via RDB only.
+        let dir = tempdir().unwrap();
+        write_rdb(dir.path());
+        assert!(needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn rdb_with_manifestless_aof_dir_still_needs_migration() {
+        // The crash window: a previous attempt died between CONFIG SET and the
+        // manifest commit. Keying on the directory instead of the manifest
+        // would skip the migration here and strand the dump.rdb again.
+        let dir = tempdir().unwrap();
+        write_rdb(dir.path());
+        write_manifestless_aof_dir(dir.path());
+        assert!(needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn rdb_with_committed_aof_needs_no_migration() {
+        // Post-migration boots: the manifest exists, the AOF is the source.
+        let dir = tempdir().unwrap();
+        write_rdb(dir.path());
+        write_aof_manifest(dir.path());
+        assert!(!needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn aof_without_rdb_needs_no_migration() {
+        // A bitnami-lineage volume that always ran AOF, or any AOF-only node.
+        let dir = tempdir().unwrap();
+        write_aof_manifest(dir.path());
+        assert!(!needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
+    }
+
+    // --- quarantine_manifestless_aof_dir: every branch ---
+
+    #[test]
+    fn quarantine_does_nothing_without_an_aof_dir() {
+        let dir = tempdir().unwrap();
+        let moved = quarantine_manifestless_aof_dir(dir.path().to_str().unwrap()).unwrap();
+        assert!(moved.is_none());
+    }
+
+    #[test]
+    fn quarantine_leaves_a_committed_aof_alone() {
+        let dir = tempdir().unwrap();
+        write_aof_manifest(dir.path());
+        let moved = quarantine_manifestless_aof_dir(dir.path().to_str().unwrap()).unwrap();
+        assert!(moved.is_none());
+        assert!(dir
+            .path()
+            .join("appendonlydir/appendonly.aof.manifest")
+            .exists());
+    }
+
+    #[test]
+    fn quarantine_moves_a_manifestless_dir_aside_preserving_contents() {
+        let dir = tempdir().unwrap();
+        write_manifestless_aof_dir(dir.path());
+        let moved = quarantine_manifestless_aof_dir(dir.path().to_str().unwrap())
+            .unwrap()
+            .expect("should have quarantined");
+        // Renamed, not deleted: the orphan incr file is the only trace of
+        // writes accepted in the crashed window.
+        assert!(!dir.path().join("appendonlydir").exists());
+        assert!(moved.join("appendonly.aof.1.incr.aof").exists());
+        assert_eq!(
+            fs::read(moved.join("appendonly.aof.1.incr.aof")).unwrap(),
+            b"orphan"
+        );
+    }
+
+    // --- generate_redis_conf: every branch ---
+
+    #[test]
+    fn fresh_volume_boots_with_aof_on() {
+        let dir = tempdir().unwrap();
+        let conf = generate_redis_conf(&config_at(dir.path().to_str().unwrap()));
+        assert!(conf.contains("appendonly yes"));
+        assert!(!conf.contains("appendonly no"));
+    }
+
+    #[test]
+    fn rdb_adoption_boots_with_aof_off() {
+        // AOF at boot would make Redis load an empty AOF and ignore the RDB —
+        // this one boot loads the RDB; AOF is enabled at runtime after.
+        let dir = tempdir().unwrap();
+        write_rdb(dir.path());
+        let conf = generate_redis_conf(&config_at(dir.path().to_str().unwrap()));
+        assert!(conf.contains("appendonly no"));
+    }
+
+    #[test]
+    fn crash_remnants_still_boot_with_aof_off() {
+        let dir = tempdir().unwrap();
+        write_rdb(dir.path());
+        write_manifestless_aof_dir(dir.path());
+        let conf = generate_redis_conf(&config_at(dir.path().to_str().unwrap()));
+        assert!(conf.contains("appendonly no"));
+    }
+
+    #[test]
+    fn conf_points_redis_at_the_data_dir() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let conf = generate_redis_conf(&config_at(path));
+        assert!(conf.contains(&format!("dir {}", path)));
+    }
+
+    #[test]
+    fn primary_has_no_replicaof_or_masterauth() {
+        let dir = tempdir().unwrap();
+        let conf = generate_redis_conf(&config_at(dir.path().to_str().unwrap()));
+        assert!(!conf.contains("replicaof"));
+        assert!(!conf.contains("masterauth"));
+    }
+
+    #[test]
+    fn replica_gets_replicaof_and_masterauth() {
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path().to_str().unwrap());
+        config.replica_of = "master-host:7000".to_string();
+        let conf = generate_redis_conf(&config);
+        assert!(conf.contains("replicaof master-host 7000"));
+        assert!(conf.contains("masterauth pw"));
+    }
+
+    #[test]
+    fn malformed_replica_of_skips_replicaof_but_keeps_masterauth() {
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path().to_str().unwrap());
+        config.replica_of = "master-host".to_string();
+        let conf = generate_redis_conf(&config);
+        assert!(!conf.contains("replicaof"));
+        assert!(conf.contains("masterauth pw"));
+    }
 }
