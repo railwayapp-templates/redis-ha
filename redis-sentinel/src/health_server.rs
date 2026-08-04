@@ -3,6 +3,10 @@
 //! Exposes two endpoints that HAProxy uses for intelligent routing:
 //!
 //!   GET /health  → 200 if Redis is up and responding to PING, 503 otherwise.
+//!   POST /failover → asks the local Sentinel to fail the cluster over
+//!                    (SENTINEL FAILOVER). 202 when accepted, 409 when Sentinel
+//!                    refuses (no quorum, no eligible replica, one already in
+//!                    flight), 503 when Sentinel is unreachable.
 //!   GET /role    → 200 {"role":"master"} only if BOTH conditions hold:
 //!                    1. local Redis reports role:master
 //!                    2. local Sentinel confirms this node is the current master
@@ -21,7 +25,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Json},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use redis::{aio::MultiplexedConnection, Client};
@@ -190,6 +194,61 @@ async fn is_sentinel_confirmed_master(state: &AppState) -> bool {
     sentinel_confirms_master(state, "mymaster").await
 }
 
+/// Ask the local Sentinel to fail the cluster over to a replica.
+///
+/// This is the Sentinel-native operation and it is deliberately UNTARGETED:
+/// `SENTINEL FAILOVER` hands candidate selection to Sentinel, which ranks
+/// replicas by replica-priority, replication offset and runid. Redis exposes no
+/// "promote this specific replica" primitive — targeting one would mean
+/// rewriting replica-priority across every node first, a non-atomic mutation of
+/// live config that can strand the cluster with a skewed election policy if it
+/// fails halfway. So callers get "fail over now", not "promote node X".
+///
+/// Sentinel itself enforces the safety rules: it refuses without quorum, with
+/// no reachable eligible replica, or while another failover is in flight. We
+/// surface that refusal as 409 rather than retrying, because each refusal is a
+/// real cluster-state answer the operator needs to see.
+async fn failover(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(mut conn) = state.get_sentinel_conn().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "sentinel-unreachable"})),
+        );
+    };
+
+    let result: redis::RedisResult<String> = redis::cmd("SENTINEL")
+        .arg("failover")
+        .arg("mymaster")
+        .query_async(&mut conn)
+        .await;
+
+    match result {
+        Ok(_) => {
+            info!("failover requested via /failover — Sentinel accepted");
+            (StatusCode::ACCEPTED, Json(json!({"status": "accepted"})))
+        }
+        Err(err) => {
+            // Drop the pooled connection: a broken socket would otherwise be
+            // reused by /role and fail its Sentinel confirmation too.
+            if err.is_io_error() {
+                *state.sentinel_conn.lock().await = None;
+                warn!(error = %err, "sentinel connection broke during failover request");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"status": "sentinel-unreachable"})),
+                );
+            }
+            // Sentinel replying with an error is a decision, not a fault:
+            // "NOGOODSLAVE", "INPROG", "NOQUORUM" all land here.
+            warn!(error = %err, "sentinel refused the failover request");
+            (
+                StatusCode::CONFLICT,
+                Json(json!({"status": "refused", "reason": err.to_string()})),
+            )
+        }
+    }
+}
+
 pub async fn run_health_server(
     health_port: u16,
     redis_port: u16,
@@ -205,6 +264,7 @@ pub async fn run_health_server(
     let app = Router::new()
         .route("/health", get(health))
         .route("/role", get(role))
+        .route("/failover", post(failover))
         .with_state(state);
 
     // Bind the IPv6 unspecified address rather than 0.0.0.0: Railway's private

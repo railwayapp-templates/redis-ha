@@ -511,6 +511,60 @@ t_sentinel_failover() {
   ok "$t"
 }
 
+# POST /failover asks the local Sentinel to fail over. Proves the endpoint on a
+# real quorum: the master moves and the dataset survives — and that a lone node
+# with no eligible replica gets a 409 refusal rather than a broken cluster.
+t_failover_endpoint() {
+  local t=t_failover_endpoint
+  local hosts="fo-1:26379,fo-2:26379,fo-3:26379"
+  mkvol fo-vol-1; mkvol fo-vol-2; mkvol fo-vol-3
+  seed_rdb_volume fo-vol-1 /data fokey fovalue
+  start_node fo-1 fo-vol-1 /data -e SENTINEL_HOSTS="$hosts"
+  start_node fo-2 fo-vol-2 /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=fo-1:6379
+  start_node fo-3 fo-vol-3 /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=fo-1:6379
+  wait_for_role_master fo-1 || { ko "$t" "fo-1 never became master" fo-1 fo-2 fo-3; return; }
+  local i
+  for i in $(seq 1 60); do
+    [ "$(rcli fo-2 GET fokey)" = "fovalue" ] && [ "$(rcli fo-3 GET fokey)" = "fovalue" ] && break
+    sleep 1
+  done
+  wait_for_sentinel_peers fo-2 2 || { ko "$t" "fo-2 sentinel never saw 2 peers" fo-2; return; }
+  wait_for_sentinel_slave_view fo-1 2 \
+    || { dump_sentinel_view fo-1; ko "$t" "fo-1 sentinel never got a live view of both replicas" fo-1; return; }
+
+  # 202 = Sentinel accepted the request.
+  local code
+  code=$(docker exec fo-1 sh -c \
+    'wget -qO- --post-data="" --server-response http://127.0.0.1:8080/failover 2>&1 | awk "/HTTP\//{print \$2; exit}"' 2>/dev/null)
+  [ "$code" = "202" ] || { dump_sentinel_view fo-1; ko "$t" "expected 202 from /failover, got ${code:-<none>}" fo-1; return; }
+
+  # The master must actually move off fo-1, and the data must come with it.
+  local promoted=""
+  for i in $(seq 1 120); do
+    for n in fo-2 fo-3; do
+      docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
+        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+    done
+    sleep 1
+  done
+  [ -n "$promoted" ] || { dump_sentinel_view fo-2 fo-3; ko "$t" "no replica was promoted after /failover" fo-2 fo-3; return; }
+  [ "$(rcli "$promoted" GET fokey)" = "fovalue" ] \
+    || { ko "$t" "data lost across endpoint-driven failover (promoted=${promoted})" "$promoted"; return; }
+  note "promoted: ${promoted}"
+  docker rm -f fo-1 fo-2 fo-3 >/dev/null 2>&1
+
+  # A lone node has no eligible replica — Sentinel must refuse, and the endpoint
+  # must surface that as 409 rather than pretending it worked.
+  mkvol solo-vol
+  start_node solo-1 solo-vol /data
+  wait_for_role_master solo-1 || { ko "$t" "solo-1 never became master" solo-1; return; }
+  code=$(docker exec solo-1 sh -c \
+    'wget -qO- --post-data="" --server-response http://127.0.0.1:8080/failover 2>&1 | awk "/HTTP\//{print \$2; exit}"' 2>/dev/null)
+  [ "$code" = "409" ] || { ko "$t" "expected 409 with no eligible replica, got ${code:-<none>}" solo-1; return; }
+  docker rm -f solo-1 >/dev/null 2>&1
+  ok "$t"
+}
+
 # ----- runner ------------------------------------------------------------------
 ALL_TESTS=(
   t_fresh_boot
@@ -523,6 +577,7 @@ ALL_TESTS=(
   t_rewrite_failure_recovers
   t_replication_of_adopted_data
   t_sentinel_failover
+  t_failover_endpoint
 )
 
 setup
