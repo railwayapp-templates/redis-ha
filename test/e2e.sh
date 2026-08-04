@@ -168,6 +168,51 @@ wait_for_file_in_volume() { # wait_for_file_in_volume VOLUME PATH [timeout]
   return 1
 }
 
+wait_for_sentinel_peers() { # wait_for_sentinel_peers NODE MIN_PEERS [timeout]
+  # Sentinels discover each other through the master's pub/sub; killing the
+  # master before discovery completes leaves the survivors unable to reach
+  # quorum, so failover tests must wait for the mesh to form first.
+  local i peers
+  for i in $(seq 1 "${3:-60}"); do
+    peers=$(docker exec "$1" redis-cli -p 26379 SENTINEL master mymaster 2>/dev/null       | grep -A1 "^num-other-sentinels$" | tail -1)
+    [ -n "$peers" ] && [ "$peers" -ge "$2" ] 2>/dev/null && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# The sentinel's own links to the replicas must be live before a failover
+# test: selection skips replicas whose instance link is disconnected or whose
+# INFO is stale, and that state is invisible from the outside — the election
+# succeeds and then aborts with -failover-abort-no-good-slave forever. When a
+# view doesn't converge, SENTINEL RESET forces rediscovery from the master's
+# INFO — the same remedy an operator would use.
+wait_for_sentinel_slave_view() { # wait_for_sentinel_slave_view NODE MIN_SLAVES [timeout]
+  local i good resets=0
+  for i in $(seq 1 "${3:-60}"); do
+    good=$(docker exec "$1" redis-cli -p 26379 SENTINEL slaves mymaster 2>/dev/null       | paste - - | awk '
+        $1=="flags" && $2=="slave" { f=1 }
+        $1=="master-link-status" && $2=="ok" { l=1 }
+        $1=="info-refresh" && $2+0 < 10000 { r=1 }
+        $1=="name" { if (f&&l&&r) n++; f=l=r=0 }
+        END { if (f&&l&&r) n++; print n+0 }')
+    [ "$good" -ge "$2" ] 2>/dev/null && return 0
+    if [ $(( i % 20 )) -eq 0 ] && [ "$resets" -lt 2 ]; then
+      docker exec "$1" redis-cli -p 26379 SENTINEL RESET mymaster >/dev/null 2>&1
+      resets=$((resets + 1))
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+dump_sentinel_view() { # dump_sentinel_view NODE...
+  for n in "$@"; do
+    echo "--- SENTINEL view (${n}) ---" >&2
+    docker exec "$n" redis-cli -p 26379 SENTINEL slaves mymaster 2>/dev/null       | paste - - | grep -E "^name|^flags|master-link-status|info-refresh|last-ping-reply" >&2
+  done
+}
+
 wait_for_role_master() { # wait_for_role_master NODE [timeout]
   local i
   for i in $(seq 1 "${2:-90}"); do
@@ -317,6 +362,67 @@ t_large_rdb_loading_retry() {
   ok "$t"
 }
 
+# When the AOF rewrite child DIES (here: ENOSPC on a size-capped volume), the
+# node must keep serving the adopted data, keep retrying — CONFIG SET is a
+# no-op once AOF is nominally on; only BGREWRITEAOF starts a new attempt — and
+# commit the manifest as soon as the cause clears.
+t_rewrite_failure_recovers() {
+  local t=t_rewrite_failure_recovers n=fail-1
+  docker ps -aq --filter "volume=fail-vol" | xargs -r docker rm -f >/dev/null 2>&1
+  docker volume rm -f fail-vol >/dev/null 2>&1
+  docker volume create --label "$LABEL" \
+    --opt type=tmpfs --opt device=tmpfs --opt o=size=16m fail-vol >/dev/null
+
+  # A tmpfs volume only lives while something has it mounted — contents written
+  # by one container evaporate when it exits. The holder keeps the tmpfs alive
+  # (and shared) across the ballast, seeder and node containers.
+  docker run -d --name fail-holder --label "$LABEL" -v fail-vol:/hold \
+    alpine:latest sleep 600 >/dev/null
+
+  # 8MB of ballast so the ~5MB dataset fits but its rewrite (~5MB more) can't.
+  docker run --rm -v fail-vol:/v alpine:latest sh -c \
+    'dd if=/dev/zero of=/v/ballast bs=1M count=8 2>/dev/null && chown 999:999 /v' \
+    >/dev/null 2>&1
+
+  docker rm -f seeder >/dev/null 2>&1
+  docker run -d --name seeder --label "$LABEL" -v fail-vol:/data "$SEED_IMAGE" \
+    redis-server --requirepass "$PW" --save 60 1 --dir /data --enable-debug-command yes >/dev/null
+  wait_for_ping seeder || { ko "$t" "seeder never came up" seeder; return; }
+  docker exec seeder redis-cli -a "$PW" DEBUG POPULATE 200000 >/dev/null 2>&1
+  docker exec seeder redis-cli -a "$PW" SET failkey failvalue >/dev/null 2>&1
+  docker exec seeder redis-cli -a "$PW" BGSAVE >/dev/null 2>&1
+  local i
+  for i in $(seq 1 30); do
+    docker exec seeder redis-cli -a "$PW" INFO persistence 2>/dev/null \
+      | grep -q "rdb_bgsave_in_progress:0" && break
+    sleep 1
+  done
+  docker rm -f seeder >/dev/null 2>&1
+  docker run --rm -v fail-vol:/v alpine:latest test -s /v/dump.rdb \
+    || { ko "$t" "seeding produced no dump.rdb"; return; }
+
+  start_node "$n" fail-vol /data
+  wait_for_log_line "$n" "background AOF rewrite did not commit; started a new attempt" 90 \
+    || { ko "$t" "reconcile loop never detected the dead rewrite child" "$n"; return; }
+  # The node must keep serving the adopted data while the rewrite is failing.
+  [ "$(rcli "$n" GET failkey)" = "failvalue" ] \
+    || { ko "$t" "adopted data unavailable while the rewrite fails" "$n"; return; }
+  docker run --rm -v fail-vol:/v alpine:latest test -e /v/appendonlydir/appendonly.aof.manifest \
+    >/dev/null 2>&1 && { ko "$t" "manifest exists while ENOSPC — test premise broken" "$n"; return; }
+
+  # Clear the cause; the loop's next attempt (backoff-capped) must commit.
+  docker run --rm -v fail-vol:/v alpine:latest rm -f /v/ballast >/dev/null 2>&1
+  wait_for_log_line "$n" "enabled AOF after loading adopted RDB" 180 \
+    || { ko "$t" "migration never recovered after space was freed" "$n"; return; }
+  wait_for_file_in_volume fail-vol appendonlydir/appendonly.aof.manifest 30 \
+    || { ko "$t" "manifest missing after recovery" "$n"; return; }
+  [ "$(rcli "$n" GET failkey)" = "failvalue" ] || { ko "$t" "adopted key lost" "$n"; return; }
+  [ "$(rcli "$n" CONFIG GET appendonly | tail -1)" = "yes" ] \
+    || { ko "$t" "appendonly not on after recovery" "$n"; return; }
+  docker rm -f "$n" fail-holder >/dev/null 2>&1
+  ok "$t"
+}
+
 # A replica full-syncs the adopted dataset — the failover story depends on
 # replicas carrying the past, independently of the AOF.
 t_replication_of_adopted_data() {
@@ -368,20 +474,39 @@ t_sentinel_failover() {
   done
   [ "$(rcli ha-2 GET hakey)" = "havalue" ] \
     || { ko "$t" "replicas never synced before the kill" ha-1 ha-2; return; }
+  # Each survivor must see BOTH other sentinels before the master dies, or the
+  # 2-of-3 quorum can never form and no promotion happens.
+  wait_for_sentinel_peers ha-2 2 || { ko "$t" "ha-2 sentinel never saw 2 peers" ha-2; return; }
+  wait_for_sentinel_peers ha-3 2 || { ko "$t" "ha-3 sentinel never saw 2 peers" ha-3; return; }
+  wait_for_sentinel_slave_view ha-2 2 \
+    || { dump_sentinel_view ha-2; ko "$t" "ha-2 sentinel never got a live view of both replicas" ha-2; return; }
+  wait_for_sentinel_slave_view ha-3 2 \
+    || { dump_sentinel_view ha-3; ko "$t" "ha-3 sentinel never got a live view of both replicas" ha-3; return; }
 
-  docker kill ha-1 >/dev/null 2>&1
+  # Pause, not kill: on Railway a dead node's private domain keeps resolving
+  # (connections fail); docker kill deregisters the name entirely (NXDOMAIN)
+  # and Sentinel spins on resolution instead of failing over. Pause keeps the
+  # DNS endpoint alive with a hung host behind it — the realistic failure.
+  docker pause ha-1 >/dev/null 2>&1
   local promoted=""
-  for i in $(seq 1 90); do
+  # 180s: sdown at ~5s, but a tied first election only retries after the
+  # template's 30s failover-timeout — leave room for two full retry cycles.
+  for i in $(seq 1 180); do
     for n in ha-2 ha-3; do
       docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
         | grep -q '"role":"master"' && { promoted="$n"; break 2; }
     done
     sleep 1
   done
-  [ -n "$promoted" ] || { ko "$t" "no replica was promoted after killing the master" ha-2 ha-3; return; }
+  [ -n "$promoted" ] || {
+    dump_sentinel_view ha-2 ha-3
+    ko "$t" "no replica was promoted after killing the master" ha-2 ha-3
+    return
+  }
   [ "$(rcli "$promoted" GET hakey)" = "havalue" ] \
     || { ko "$t" "adopted key lost across failover (promoted=${promoted})" "$promoted"; return; }
   note "promoted: ${promoted}"
+  docker unpause ha-1 >/dev/null 2>&1
   docker rm -f ha-1 ha-2 ha-3 >/dev/null 2>&1
   ok "$t"
 }
@@ -395,6 +520,7 @@ ALL_TESTS=(
   t_adoption_at_custom_mount
   t_data_dir_outside_volume_warns
   t_large_rdb_loading_retry
+  t_rewrite_failure_recovers
   t_replication_of_adopted_data
   t_sentinel_failover
 )

@@ -31,6 +31,33 @@ fn aof_status_from_info(info: &str) -> (bool, bool) {
     (flag("aof_enabled:1"), flag("aof_rewrite_in_progress:1"))
 }
 
+/// What the reconcile loop should do next, given the observable state.
+#[derive(Debug, PartialEq, Eq)]
+enum AofNudge {
+    /// The manifest exists — the migration is durably committed.
+    Done,
+    /// AOF is off; `CONFIG SET appendonly yes` starts the enable + rewrite.
+    EnableAof,
+    /// A rewrite is running; poll again soon.
+    Wait,
+    /// AOF is nominally on, nothing is running, and there is no manifest:
+    /// the previous rewrite child died. `CONFIG SET` is a no-op here —
+    /// only `BGREWRITEAOF` starts a new attempt.
+    StartRewrite,
+}
+
+fn aof_nudge(manifest_exists: bool, enabled: bool, in_progress: bool) -> AofNudge {
+    if manifest_exists {
+        AofNudge::Done
+    } else if !enabled {
+        AofNudge::EnableAof
+    } else if in_progress {
+        AofNudge::Wait
+    } else {
+        AofNudge::StartRewrite
+    }
+}
+
 /// Drive the adopted dataset's AOF migration until it is durably committed.
 ///
 /// `CONFIG SET appendonly yes` only STARTS the migration: Redis rewrites the
@@ -92,15 +119,7 @@ pub async fn enable_aof_after_rdb_load(
     let mut reported = false;
     let mut backoff = Duration::from_secs(1);
     loop {
-        if aof_manifest_exists(data_dir) {
-            info!(
-                keys_adopted = dbsize,
-                "enabled AOF after loading adopted RDB"
-            );
-            return;
-        }
-
-        // Ok(true) = progressing (just enabled, or a rewrite is running).
+        // Ok(true) = progressing (done, just enabled, or a rewrite is running).
         // Ok(false) = a previous rewrite child failed; a new attempt was started.
         let step: Result<bool, redis::RedisError> = async {
             let mut conn = client.get_multiplexed_async_connection().await?;
@@ -109,24 +128,34 @@ pub async fn enable_aof_after_rdb_load(
                 .query_async(&mut conn)
                 .await?;
             let (enabled, in_progress) = aof_status_from_info(&info);
-            if !enabled {
-                redis::cmd("CONFIG")
-                    .arg("SET")
-                    .arg("appendonly")
-                    .arg("yes")
-                    .query_async::<()>(&mut conn)
-                    .await?;
-                return Ok(true);
+            match aof_nudge(aof_manifest_exists(data_dir), enabled, in_progress) {
+                AofNudge::Done | AofNudge::Wait => Ok(true),
+                AofNudge::EnableAof => {
+                    redis::cmd("CONFIG")
+                        .arg("SET")
+                        .arg("appendonly")
+                        .arg("yes")
+                        .query_async::<()>(&mut conn)
+                        .await?;
+                    Ok(true)
+                }
+                AofNudge::StartRewrite => {
+                    redis::cmd("BGREWRITEAOF")
+                        .query_async::<String>(&mut conn)
+                        .await?;
+                    Ok(false)
+                }
             }
-            if in_progress {
-                return Ok(true);
-            }
-            redis::cmd("BGREWRITEAOF")
-                .query_async::<String>(&mut conn)
-                .await?;
-            Ok(false)
         }
         .await;
+
+        if aof_manifest_exists(data_dir) {
+            info!(
+                keys_adopted = dbsize,
+                "enabled AOF after loading adopted RDB"
+            );
+            return;
+        }
 
         match step {
             Ok(true) => backoff = Duration::from_secs(1),
@@ -304,5 +333,33 @@ mod tests {
             aof_status_from_info("# Persistence\r\nloading:0\r\n"),
             (false, false)
         );
+    }
+}
+
+#[cfg(test)]
+mod nudge_tests {
+    use super::{aof_nudge, AofNudge};
+
+    #[test]
+    fn manifest_wins_over_everything() {
+        assert_eq!(aof_nudge(true, false, false), AofNudge::Done);
+        assert_eq!(aof_nudge(true, true, true), AofNudge::Done);
+    }
+
+    #[test]
+    fn disabled_gets_enabled() {
+        assert_eq!(aof_nudge(false, false, false), AofNudge::EnableAof);
+    }
+
+    #[test]
+    fn running_rewrite_is_left_alone() {
+        assert_eq!(aof_nudge(false, true, true), AofNudge::Wait);
+    }
+
+    #[test]
+    fn dead_rewrite_child_gets_a_new_attempt() {
+        // Enabled, idle, no manifest: the state a failed child leaves behind,
+        // where CONFIG SET is a no-op and only BGREWRITEAOF makes progress.
+        assert_eq!(aof_nudge(false, true, false), AofNudge::StartRewrite);
     }
 }
