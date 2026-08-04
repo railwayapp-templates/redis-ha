@@ -114,18 +114,24 @@ async fn main() -> Result<()> {
     let redis_proc = spawn_redis(&config.data_dir, config.redis_port).await?;
 
     // redis.conf carries `appendonly no` for this boot so the adopted RDB is
-    // the thing Redis loads; turn AOF back on now that it has.
+    // what Redis loads; AOF is turned back on as soon as the load finishes.
+    // Runs in the background: a large RDB takes minutes to load, and neither
+    // Sentinel startup nor signal handling (supervise) should wait on it —
+    // this keeps the startup sequence identical to a non-adopting boot.
     if adopting_rdb {
-        info!("adopted dataset has an RDB and no AOF — enabling AOF after load");
-        if let Err(err) = enable_aof_after_rdb_load(config.redis_port, &config.redis_password).await
-        {
-            tracing::error!(error = %err, "failed to enable AOF after loading adopted RDB");
-            telemetry.send(TelemetryEvent::ComponentError {
-                component: "redis-wrapper".to_string(),
-                error: format!("AOF migration failed: {}", err),
-                context: "startup".to_string(),
-            });
-        }
+        info!("adopted dataset has an RDB and no AOF — enabling AOF once it finishes loading");
+        let redis_port = config.redis_port;
+        let redis_password = config.redis_password.clone();
+        tokio::spawn(async move {
+            if let Err(err) = enable_aof_after_rdb_load(redis_port, &redis_password).await {
+                tracing::error!(error = %err, "failed to enable AOF after loading adopted RDB");
+                telemetry.send(TelemetryEvent::ComponentError {
+                    component: "redis-wrapper".to_string(),
+                    error: format!("AOF migration failed: {}", err),
+                    context: "startup".to_string(),
+                });
+            }
+        });
     }
 
     // Spawn Sentinel (colocated)

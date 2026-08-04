@@ -37,24 +37,39 @@ pub async fn enable_aof_after_rdb_load(port: u16, password: &str) -> Result<()> 
     let url = format!("redis://:{}@127.0.0.1:{}", password, port);
     let client = Client::open(url).context("failed to build redis client")?;
 
-    // Redis is a few hundred ms behind the spawn; loading a large RDB can take
-    // longer, and it refuses commands until that finishes.
-    let mut conn = None;
-    for _ in 0..60 {
-        match client.get_multiplexed_async_connection().await {
-            Ok(c) => {
-                conn = Some(c);
-                break;
-            }
-            Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+    // Redis listens BEFORE it finishes loading the RDB and answers -LOADING
+    // to most commands (DBSIZE included) until the load completes, so the
+    // command has to be retried, not just the connection. The deadline is
+    // sized for multi-gigabyte RDBs; the caller runs this in the background,
+    // so nothing else waits on it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
+    let mut waiting_logged = false;
+    let dbsize: i64 = loop {
+        let attempt = async {
+            let mut conn = client.get_multiplexed_async_connection().await?;
+            redis::cmd("DBSIZE").query_async::<i64>(&mut conn).await
         }
-    }
-    let mut conn = conn.context("redis did not accept connections in time")?;
+        .await;
+        match attempt {
+            Ok(n) => break n,
+            Err(err) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(anyhow::Error::new(err)
+                        .context("redis did not finish loading the dataset in time"));
+                }
+                if !waiting_logged {
+                    info!("waiting for redis to finish loading the adopted dataset");
+                    waiting_logged = true;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    };
 
-    let dbsize: i64 = redis::cmd("DBSIZE")
-        .query_async(&mut conn)
+    let mut conn = client
+        .get_multiplexed_async_connection()
         .await
-        .context("DBSIZE failed")?;
+        .context("failed to reconnect after the dataset loaded")?;
 
     redis::cmd("CONFIG")
         .arg("SET")
