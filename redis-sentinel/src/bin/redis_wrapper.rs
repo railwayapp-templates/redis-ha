@@ -136,15 +136,9 @@ async fn main() -> Result<()> {
         info!("adopted dataset has an RDB and no AOF — enabling AOF once it finishes loading");
         let redis_port = config.redis_port;
         let redis_password = config.redis_password.clone();
+        let data_dir = config.data_dir.clone();
         tokio::spawn(async move {
-            if let Err(err) = enable_aof_after_rdb_load(redis_port, &redis_password).await {
-                tracing::error!(error = %err, "failed to enable AOF after loading adopted RDB");
-                telemetry.send(TelemetryEvent::ComponentError {
-                    component: "redis-wrapper".to_string(),
-                    error: format!("AOF migration failed: {}", err),
-                    context: "startup".to_string(),
-                });
-            }
+            enable_aof_after_rdb_load(redis_port, &redis_password, &data_dir, &telemetry).await;
         });
     }
 

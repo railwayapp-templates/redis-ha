@@ -19,12 +19,16 @@ pub fn needs_rdb_to_aof_migration(data_dir: &str) -> bool {
     // before that commit leaves an appendonlydir with orphan files Redis
     // cannot load. Keying on the directory would skip the migration on the
     // next boot and strand the (still intact) dump.rdb all over again.
-    let has_loadable_aof = std::path::Path::new(&format!(
-        "{}/appendonlydir/appendonly.aof.manifest",
-        data_dir
-    ))
-    .exists();
-    has_rdb && !has_loadable_aof
+    has_rdb && !aof_manifest_exists(data_dir)
+}
+
+/// Whether a committed (loadable) multi-part AOF exists — the manifest is the
+/// atomic commit marker; base/incr files without it are unreadable orphans.
+pub fn aof_manifest_exists(data_dir: &str) -> bool {
+    std::path::Path::new(data_dir)
+        .join("appendonlydir")
+        .join("appendonly.aof.manifest")
+        .exists()
 }
 
 /// Move a manifest-less `appendonlydir` out of the way before an RDB
