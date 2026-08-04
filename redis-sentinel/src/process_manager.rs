@@ -6,6 +6,8 @@
 use anyhow::{Context, Result};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
+use redis::Client;
+use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info, warn};
@@ -19,6 +21,75 @@ pub async fn spawn_redis(data_dir: &str, _redis_port: u16) -> Result<Child> {
         .kill_on_drop(false)
         .spawn()
         .context("failed to spawn redis-server")
+}
+
+/// Turn AOF on after Redis has loaded an adopted RDB.
+///
+/// `CONFIG SET appendonly yes` makes Redis rewrite the AOF from the dataset it
+/// currently holds, so the adopted keys end up in the AOF instead of being
+/// abandoned. `CONFIG REWRITE` then persists `appendonly yes` into redis.conf
+/// — though the wrapper regenerates that file on every boot anyway, and by
+/// then `appendonlydir` exists so the migration no longer triggers.
+///
+/// Best-effort: a failure here leaves a running Redis serving the adopted data
+/// with AOF off, which is recoverable. Killing the node would not be.
+pub async fn enable_aof_after_rdb_load(port: u16, password: &str) -> Result<()> {
+    let url = format!("redis://:{}@127.0.0.1:{}", password, port);
+    let client = Client::open(url).context("failed to build redis client")?;
+
+    // Redis listens BEFORE it finishes loading the RDB and answers -LOADING
+    // to most commands (DBSIZE included) until the load completes, so the
+    // command has to be retried, not just the connection. The deadline is
+    // sized for multi-gigabyte RDBs; the caller runs this in the background,
+    // so nothing else waits on it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
+    let mut waiting_logged = false;
+    let dbsize: i64 = loop {
+        let attempt = async {
+            let mut conn = client.get_multiplexed_async_connection().await?;
+            redis::cmd("DBSIZE").query_async::<i64>(&mut conn).await
+        }
+        .await;
+        match attempt {
+            Ok(n) => break n,
+            Err(err) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(anyhow::Error::new(err)
+                        .context("redis did not finish loading the dataset in time"));
+                }
+                if !waiting_logged {
+                    info!("waiting for redis to finish loading the adopted dataset");
+                    waiting_logged = true;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    };
+
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .context("failed to reconnect after the dataset loaded")?;
+
+    redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("appendonly")
+        .arg("yes")
+        .query_async::<()>(&mut conn)
+        .await
+        .context("CONFIG SET appendonly yes failed")?;
+
+    redis::cmd("CONFIG")
+        .arg("REWRITE")
+        .query_async::<()>(&mut conn)
+        .await
+        .context("CONFIG REWRITE failed")?;
+
+    info!(
+        keys_adopted = dbsize,
+        "enabled AOF after loading adopted RDB"
+    );
+    Ok(())
 }
 
 pub async fn spawn_sentinel(data_dir: &str) -> Result<Child> {

@@ -1,12 +1,37 @@
 use crate::config::Config;
 
+/// Whether this boot has to adopt an RDB-only dataset.
+///
+/// Redis loads the AOF, not the RDB, whenever `appendonly yes` is set at
+/// startup. On a volume that holds a `dump.rdb` but no `appendonlydir` — a
+/// standalone Redis being adopted as a cluster primary, since Railway's
+/// standalone template runs `--save 60 1` with no AOF — that means booting
+/// from an empty AOF and silently abandoning the customer's data, with
+/// `dump.rdb` left untouched on disk beside it.
+///
+/// So start with AOF off, let Redis load the RDB, and switch AOF on at
+/// runtime (`CONFIG SET appendonly yes`), which is the documented migration
+/// and rewrites the AOF from the in-memory dataset.
+pub fn needs_rdb_to_aof_migration(data_dir: &str) -> bool {
+    std::path::Path::new(&format!("{}/dump.rdb", data_dir)).exists()
+        && !std::path::Path::new(&format!("{}/appendonlydir", data_dir)).exists()
+}
+
 pub fn generate_redis_conf(config: &Config) -> String {
+    let adopting_rdb = needs_rdb_to_aof_migration(&config.data_dir);
+
     let mut lines: Vec<String> = vec![
         format!("port {}", config.redis_port),
         format!("requirepass {}", config.redis_password),
         "protected-mode yes".to_string(),
-        // Persist data to the volume
-        "appendonly yes".to_string(),
+        // Persist data to the volume. Deliberately off for this one boot when
+        // adopting an RDB-only dataset — enabled at runtime once the RDB is
+        // loaded (see needs_rdb_to_aof_migration).
+        if adopting_rdb {
+            "appendonly no".to_string()
+        } else {
+            "appendonly yes".to_string()
+        },
         "appendfsync everysec".to_string(),
         format!("dir {}", config.data_dir),
         // Log to stdout so Railway captures it
