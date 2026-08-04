@@ -21,6 +21,7 @@ use redis_sentinel::{
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 #[tokio::main]
@@ -109,6 +110,34 @@ async fn main() -> Result<()> {
     // Captured before spawning: once Redis is up it writes its own
     // appendonlydir, so the check would no longer be true.
     let adopting_rdb = needs_rdb_to_aof_migration(&config.data_dir);
+
+    // A previous adoption that crashed between `CONFIG SET appendonly yes` and
+    // the rewrite committing its manifest leaves an appendonlydir Redis cannot
+    // load, whose orphan files would collide with the AOF this boot creates.
+    // Move it aside — never delete: those files are the only trace of writes
+    // accepted in that window.
+    if adopting_rdb {
+        let aof_dir = format!("{}/appendonlydir", config.data_dir);
+        if Path::new(&aof_dir).exists() {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let orphaned = format!("{}.orphaned-{}", aof_dir, ts);
+            match fs::rename(&aof_dir, &orphaned) {
+                Ok(()) => tracing::warn!(
+                    from = %aof_dir,
+                    to = %orphaned,
+                    "moved manifest-less appendonlydir aside before AOF migration"
+                ),
+                Err(err) => tracing::error!(
+                    error = %err,
+                    dir = %aof_dir,
+                    "failed to move manifest-less appendonlydir aside"
+                ),
+            }
+        }
+    }
 
     // Spawn Redis
     let redis_proc = spawn_redis(&config.data_dir, config.redis_port).await?;

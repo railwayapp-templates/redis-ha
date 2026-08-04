@@ -13,8 +13,18 @@ use crate::config::Config;
 /// runtime (`CONFIG SET appendonly yes`), which is the documented migration
 /// and rewrites the AOF from the in-memory dataset.
 pub fn needs_rdb_to_aof_migration(data_dir: &str) -> bool {
-    std::path::Path::new(&format!("{}/dump.rdb", data_dir)).exists()
-        && !std::path::Path::new(&format!("{}/appendonlydir", data_dir)).exists()
+    let has_rdb = std::path::Path::new(&format!("{}/dump.rdb", data_dir)).exists();
+    // The manifest, not the directory: `CONFIG SET appendonly yes` commits the
+    // rewritten AOF by atomically renaming the manifest into place, so a crash
+    // before that commit leaves an appendonlydir with orphan files Redis
+    // cannot load. Keying on the directory would skip the migration on the
+    // next boot and strand the (still intact) dump.rdb all over again.
+    let has_loadable_aof = std::path::Path::new(&format!(
+        "{}/appendonlydir/appendonly.aof.manifest",
+        data_dir
+    ))
+    .exists();
+    has_rdb && !has_loadable_aof
 }
 
 pub fn generate_redis_conf(config: &Config) -> String {
