@@ -57,11 +57,17 @@ impl Config {
     /// This matters for HA conversion. Adopting a live standalone service as
     /// the cluster's primary keeps that service's existing volume and mount
     /// path, which is `/data` only by coincidence of the Railway `redis`
-    /// template. A root of bitnami lineage (`railwayapp/redis`, Railway's
-    /// mirror) is mounted at `/bitnami/redis/data`, and any customer is free
-    /// to pick their own path. Hardcoding `/data` there meant redis started
-    /// against an empty directory on the container filesystem while the real
-    /// RDB/AOF sat unread on the volume.
+    /// template, and any customer is free to pick their own path. Hardcoding
+    /// `/data` there meant redis started against an empty directory on the
+    /// container filesystem while the real RDB/AOF sat unread on the volume.
+    ///
+    /// The mount is not always the data dir either. Bitnami's redis (Railway
+    /// mirrors it as `railwayapp/redis`, and the `bitnami-redis` template
+    /// mounts the volume at `/bitnami`) keeps its dataset one level down, in
+    /// `<mount>/redis/data`. Taking the mount at face value there points redis
+    /// at a directory holding only the `redis/` subtree — no RDB, no AOF — so
+    /// it starts empty and the adopted dataset is silently abandoned, exactly
+    /// the failure the paragraph above describes.
     ///
     /// Mirrors postgres-patroni's `volume_root()`, which has always derived
     /// its paths from `RAILWAY_VOLUME_MOUNT_PATH` — the reason the equivalent
@@ -74,10 +80,48 @@ impl Config {
         }
         if let Ok(mount) = env::var("RAILWAY_VOLUME_MOUNT_PATH") {
             if !mount.is_empty() {
-                return mount;
+                return Self::resolve_nested_dataset(&mount);
             }
         }
         "/data".to_string()
+    }
+
+    /// Redirects to a nested dataset directory under `mount` when one holds the
+    /// data and the mount root does not.
+    ///
+    /// Keyed on evidence rather than on the image, the same way the RDB->AOF
+    /// adoption is: a bitnami-lineage volume is recognised by carrying redis
+    /// files under `redis/data`, so a customer who set `REDIS_DATA_DIR` to that
+    /// layout on an official image is picked up too, and a fresh volume — where
+    /// bitnami's `redis/data` exists but is empty — is left at the mount root
+    /// so a new cluster keeps the plain layout.
+    fn resolve_nested_dataset(mount: &str) -> String {
+        // Only when the mount root itself has nothing to lose. If both hold
+        // data, the mount root is what a previous HA boot wrote and must win —
+        // redirecting would strand whatever has been written since.
+        if Self::holds_redis_dataset(mount) {
+            return mount.to_string();
+        }
+        let nested = format!("{}/redis/data", mount.trim_end_matches('/'));
+        if Self::holds_redis_dataset(&nested) {
+            return nested;
+        }
+        mount.to_string()
+    }
+
+    /// True if `dir` contains a dataset redis could actually load — an RDB
+    /// snapshot, a committed multi-part AOF, or a pre-7 single-file AOF.
+    ///
+    /// Loadable is the operative word, which is why the AOF check goes through
+    /// `aof_manifest_exists` rather than testing for `appendonlydir`: a crashed
+    /// adoption leaves that directory holding orphan files Redis cannot read.
+    /// Counting it would keep a mount root whose data is unreadable and abandon
+    /// a perfectly good nested dataset.
+    fn holds_redis_dataset(dir: &str) -> bool {
+        let path = std::path::Path::new(dir);
+        path.join("dump.rdb").exists()
+            || crate::redis_conf::aof_manifest_exists(dir)
+            || path.join("appendonly.aof").exists()
     }
 
     /// True if this node starts as the primary (REPLICA_OF is empty).
@@ -149,6 +193,9 @@ pub fn data_dir_is_on_volume(data_dir: &str, mount: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
 
     /// Env vars are process-global and cargo runs tests in parallel threads —
@@ -327,5 +374,120 @@ mod tests {
         let mut config = Config::for_tests();
         config.replica_of = "master-host:abc".to_string();
         assert_eq!(config.initial_master_port(), 6379);
+    }
+
+    // --- resolve_nested_dataset: the bitnami layout ---
+    //
+    // These touch the filesystem rather than the environment, so they take no
+    // ENV_LOCK: each builds its own uniquely-named directory under the temp
+    // dir and reads only that.
+
+    static NEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// A unique empty directory, standing in for a mounted volume.
+    fn temp_mount(label: &str) -> PathBuf {
+        let n = NEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("redis-ha-{}-{}-{}", std::process::id(), label, n));
+        fs::create_dir_all(&dir).expect("create temp mount");
+        dir
+    }
+
+    fn touch(path: PathBuf) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent");
+        }
+        fs::write(path, b"").expect("write file");
+    }
+
+    #[test]
+    fn plain_layout_stays_at_the_mount_root() {
+        let mount = temp_mount("plain");
+        touch(mount.join("dump.rdb"));
+
+        assert_eq!(
+            Config::resolve_nested_dataset(mount.to_str().unwrap()),
+            mount.to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn bitnami_layout_redirects_to_the_nested_dataset() {
+        // What the `bitnami-redis` template produces: volume mounted at
+        // /bitnami, dataset written to /bitnami/redis/data. Reading the mount
+        // root here is the data-loss bug this function exists to prevent.
+        let mount = temp_mount("bitnami");
+        touch(mount.join("redis/data/appendonlydir/appendonly.aof.manifest"));
+
+        assert_eq!(
+            Config::resolve_nested_dataset(mount.to_str().unwrap()),
+            mount.join("redis/data").to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_pre_7_single_file_aof_counts_as_a_dataset() {
+        let mount = temp_mount("legacy-aof");
+        touch(mount.join("redis/data/appendonly.aof"));
+
+        assert_eq!(
+            Config::resolve_nested_dataset(mount.to_str().unwrap()),
+            mount.join("redis/data").to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_fresh_volume_keeps_the_plain_layout() {
+        // Bitnami creates redis/data on first boot, so its mere existence must
+        // not redirect a cluster that has no dataset to adopt.
+        let mount = temp_mount("fresh");
+        fs::create_dir_all(mount.join("redis/data")).expect("create empty nested");
+
+        assert_eq!(
+            Config::resolve_nested_dataset(mount.to_str().unwrap()),
+            mount.to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn the_mount_root_wins_when_both_hold_data() {
+        // A second boot after a conversion: the HA node has been writing at the
+        // mount root, so redirecting to the stale nested copy would strand
+        // every write since the conversion.
+        let mount = temp_mount("both");
+        touch(mount.join("appendonlydir/appendonly.aof.manifest"));
+        touch(mount.join("redis/data/dump.rdb"));
+
+        assert_eq!(
+            Config::resolve_nested_dataset(mount.to_str().unwrap()),
+            mount.to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn an_orphan_aof_dir_at_the_root_does_not_hold_the_nested_dataset_hostage() {
+        // An adoption that crashed before its rewrite committed leaves an
+        // appendonlydir with no manifest — orphan files Redis cannot load. The
+        // nested dataset is the only readable copy, so it has to win.
+        let mount = temp_mount("orphan-root");
+        touch(mount.join("appendonlydir/appendonly.aof.1.base.rdb"));
+        touch(mount.join("redis/data/dump.rdb"));
+
+        assert_eq!(
+            Config::resolve_nested_dataset(mount.to_str().unwrap()),
+            mount.join("redis/data").to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_on_the_mount_does_not_double_up() {
+        let mount = temp_mount("trailing");
+        touch(mount.join("redis/data/dump.rdb"));
+        let with_slash = format!("{}/", mount.to_str().unwrap());
+
+        assert_eq!(
+            Config::resolve_nested_dataset(&with_slash),
+            mount.join("redis/data").to_str().unwrap()
+        );
     }
 }
