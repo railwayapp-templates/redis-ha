@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use common::{ConfigExt, RailwayEnv};
+use std::env;
 
 pub struct Config {
     pub redis_password: String,
@@ -42,9 +43,41 @@ impl Config {
             sentinel_down_after_ms: u64::env_parse("SENTINEL_DOWN_AFTER_MS", 5000),
             sentinel_failover_timeout_ms: u64::env_parse("SENTINEL_FAILOVER_TIMEOUT_MS", 30000),
             health_port: u16::env_parse("HEALTH_PORT", 8080),
-            data_dir: String::env_or("DATA_DIR", "/data"),
+            data_dir: Self::resolve_data_dir(),
             private_domain: RailwayEnv::private_domain(),
         })
+    }
+
+    /// Where redis keeps its data.
+    ///
+    /// Follows the volume, rather than requiring the volume to follow us: an
+    /// explicit `DATA_DIR` wins, otherwise we use wherever Railway actually
+    /// mounted the volume, and `/data` is only the off-platform fallback.
+    ///
+    /// This matters for HA conversion. Adopting a live standalone service as
+    /// the cluster's primary keeps that service's existing volume and mount
+    /// path, which is `/data` only by coincidence of the Railway `redis`
+    /// template. A root of bitnami lineage (`railwayapp/redis`, Railway's
+    /// mirror) is mounted at `/bitnami/redis/data`, and any customer is free
+    /// to pick their own path. Hardcoding `/data` there meant redis started
+    /// against an empty directory on the container filesystem while the real
+    /// RDB/AOF sat unread on the volume.
+    ///
+    /// Mirrors postgres-patroni's `volume_root()`, which has always derived
+    /// its paths from `RAILWAY_VOLUME_MOUNT_PATH` — the reason the equivalent
+    /// postgres conversion was never exposed to this.
+    fn resolve_data_dir() -> String {
+        if let Ok(dir) = env::var("DATA_DIR") {
+            if !dir.is_empty() {
+                return dir;
+            }
+        }
+        if let Ok(mount) = env::var("RAILWAY_VOLUME_MOUNT_PATH") {
+            if !mount.is_empty() {
+                return mount;
+            }
+        }
+        "/data".to_string()
     }
 
     /// True if this node starts as the primary (REPLICA_OF is empty).

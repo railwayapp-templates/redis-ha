@@ -37,20 +37,33 @@ async fn main() -> Result<()> {
         "starting redis-wrapper"
     );
 
+    // The data dir now follows the volume (Config::resolve_data_dir), so the
+    // two only diverge when DATA_DIR was set explicitly. A subdirectory of the
+    // mount is a legitimate choice; a path outside it is not — the data would
+    // live on the container filesystem and vanish on redeploy.
+    //
+    // This used to `exit(1)` on any divergence, which turned a conversion that
+    // merely adopted a root mounted somewhere other than /data into a
+    // crashlooping primary. Warn instead: refusing to boot never protected the
+    // data, it only removed the node.
     if RailwayEnv::is_railway() {
         let mount = std::env::var("RAILWAY_VOLUME_MOUNT_PATH").unwrap_or_default();
-        if mount != config.data_dir {
-            tracing::error!(
-                expected = %config.data_dir,
-                got = %mount,
-                "volume not mounted at expected path"
+        let persisted = !mount.is_empty()
+            && (config.data_dir == mount || config.data_dir.starts_with(&format!("{}/", mount)));
+        if !persisted {
+            tracing::warn!(
+                data_dir = %config.data_dir,
+                volume_mount_path = %mount,
+                "data directory is outside the mounted volume — data will not persist across redeploys"
             );
             telemetry.send(TelemetryEvent::ComponentError {
                 component: "redis-wrapper".to_string(),
-                error: format!("volume at {} instead of {}", mount, config.data_dir),
+                error: format!(
+                    "data dir {} is outside volume mount {}",
+                    config.data_dir, mount
+                ),
                 context: "startup".to_string(),
             });
-            std::process::exit(1);
         }
     }
 
