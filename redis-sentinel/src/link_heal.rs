@@ -8,13 +8,21 @@
 //! seconds once the target is reachable again.
 //!
 //! ## The gap this module fills
-//! Two states a running Redis will not retry out of by itself:
+//! Three states a running Redis will not retry out of by itself:
 //!  - **Pinned to a dead master.** Sentinel reconfigures every replica's
 //!    `REPLICAOF` after a failover, but that update can fail to land on a
 //!    node that was partitioned during the switch. The node keeps retrying a
 //!    master that no longer exists.
 //!  - **Wedged on an unreadable partial-resync backlog**, with no sync
 //!    attempt in flight and the link simply staying down.
+//!  - **Elected but never told.** Sentinel picks this same node as the new
+//!    master and records that decision before its `REPLICAOF NO ONE` reaches
+//!    it — if that node is unreachable at that exact moment, Sentinel's
+//!    answer to `get-master-addr-by-name` already names it while its own
+//!    `INFO replication` still reads `role:slave`, replicating a master that
+//!    no longer exists as one. Reissuing `REPLICAOF` against that address
+//!    would just point it at itself; the correct action is `REPLICAOF NO
+//!    ONE`.
 //!
 //! Both are invisible to a redeploy-free wait: nothing on the node is going
 //! to change the target it is retrying, or nudge it into trying again.
@@ -38,7 +46,9 @@
 //! achieves by restarting the process, without the redeploy's cost or blast
 //! radius. Targeting Sentinel's answer (rather than replaying the replica's
 //! own possibly-stale config) fixes the pinned-to-dead-master case in the
-//! same action as the wedged-backlog case.
+//! same action as the wedged-backlog case. When Sentinel's answer names this
+//! node itself, the action is `REPLICAOF NO ONE` instead — completing the
+//! promotion it never received rather than replicating from itself.
 //!
 //! ## Safety
 //! - Never acts on a master role — it has no link to lose, and there is
@@ -148,6 +158,10 @@ struct LinkHealInputs {
     /// Sentinel's current answer for the master address. `None` when
     /// Sentinel is unreachable or gave no answer.
     target: Option<(String, u16)>,
+    /// This node's own private-network address, to detect when Sentinel's
+    /// answer names this same node — a promotion whose `REPLICAOF NO ONE`
+    /// never landed, not a repoint target.
+    own_private_domain: String,
     last_action_at: Option<i64>,
     action_attempts_in_window: u32,
     recovery_seen_after_action: bool,
@@ -159,6 +173,9 @@ enum LinkHealAction {
     NoOp,
     Wait,
     Reheal { attempt: u32, host: String, port: u16 },
+    /// Sentinel's answer is this node itself: complete the promotion via
+    /// `REPLICAOF NO ONE` rather than repointing at our own address.
+    PromoteSelf { attempt: u32 },
     EmitRecovered { recovered_in_secs: u64, attempts: u32 },
     EmitGaveUp { attempts: u32 },
 }
@@ -214,6 +231,12 @@ fn decide_link_heal(s: &LinkHealInputs) -> LinkHealAction {
         // wait rather than guess.
         return LinkHealAction::Wait;
     };
+
+    if host == s.own_private_domain {
+        return LinkHealAction::PromoteSelf {
+            attempt: s.action_attempts_in_window + 1,
+        };
+    }
 
     LinkHealAction::Reheal {
         attempt: s.action_attempts_in_window + 1,
@@ -306,6 +329,14 @@ async fn issue_replicaof(
     redis::cmd("REPLICAOF")
         .arg(host)
         .arg(port)
+        .query_async::<()>(conn)
+        .await
+}
+
+async fn issue_replicaof_no_one(conn: &mut MultiplexedConnection) -> Result<(), redis::RedisError> {
+    redis::cmd("REPLICAOF")
+        .arg("NO")
+        .arg("ONE")
         .query_async::<()>(conn)
         .await
 }
@@ -555,6 +586,7 @@ async fn iteration(
     }
 
     let recovery_seen_after_action = action_pending_recovery.is_some() && !snapshot.link_down;
+    let node = RailwayEnv::private_domain();
 
     let snapshot_inputs = LinkHealInputs {
         now,
@@ -563,13 +595,13 @@ async fn iteration(
         sync_in_progress: snapshot.sync_in_progress,
         stalled_for_secs,
         target,
+        own_private_domain: node.clone(),
         last_action_at,
         action_attempts_in_window,
         recovery_seen_after_action,
         thresholds: cfg.thresholds.clone(),
     };
     let action = decide_link_heal(&snapshot_inputs);
-    let node = RailwayEnv::private_domain();
 
     match action {
         LinkHealAction::NoOp | LinkHealAction::Wait => {}
@@ -598,6 +630,36 @@ async fn iteration(
                 }
                 Err(e) => {
                     warn!(error = %e, "link-heal: REPLICAOF call failed");
+                    telemetry.send(TelemetryEvent::LinkHealRequestFailed {
+                        node: node.clone(),
+                        attempt,
+                        master,
+                        error: e.to_string(),
+                    });
+                }
+            }
+        }
+        LinkHealAction::PromoteSelf { attempt } => {
+            info!(
+                attempt,
+                stalled_for_secs,
+                "link-heal: completing a promotion that never landed via REPLICAOF NO ONE"
+            );
+            let _ = write_state_field(state_path, "last_action_at", &now.to_string());
+            append_attempt(state_path, now);
+            *action_pending_recovery = Some(now);
+
+            let master = "NO ONE".to_string();
+            match issue_replicaof_no_one(&mut redis_conn).await {
+                Ok(()) => {
+                    telemetry.send(TelemetryEvent::LinkHealTriggered {
+                        node: node.clone(),
+                        attempt,
+                        master,
+                    });
+                }
+                Err(e) => {
+                    warn!(error = %e, "link-heal: REPLICAOF NO ONE call failed");
                     telemetry.send(TelemetryEvent::LinkHealRequestFailed {
                         node: node.clone(),
                         attempt,
@@ -722,6 +784,7 @@ mod decide_tests {
             sync_in_progress: false,
             stalled_for_secs: 9_999_999,
             target: Some(("master.railway.internal".to_string(), 6379)),
+            own_private_domain: "self.railway.internal".to_string(),
             last_action_at: None,
             action_attempts_in_window: 0,
             recovery_seen_after_action: false,
@@ -787,6 +850,24 @@ mod decide_tests {
                 port: 6379
             }
         );
+    }
+
+    #[test]
+    fn promotes_self_when_sentinel_names_this_node() {
+        let mut s = base();
+        s.target = Some((s.own_private_domain.clone(), 6379));
+        assert_eq!(
+            decide_link_heal(&s),
+            LinkHealAction::PromoteSelf { attempt: 1 }
+        );
+    }
+
+    #[test]
+    fn promote_self_still_respects_backoff() {
+        let mut s = base();
+        s.target = Some((s.own_private_domain.clone(), 6379));
+        s.last_action_at = Some(9_900);
+        assert_eq!(decide_link_heal(&s), LinkHealAction::Wait);
     }
 
     #[test]
