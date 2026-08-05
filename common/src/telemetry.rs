@@ -41,8 +41,35 @@ pub enum TelemetryEvent {
         error: String,
         context: String,
     },
+
+    /// link_heal reissued REPLICAOF against a durably broken replication link
+    LinkHealTriggered {
+        node: String,
+        attempt: u32,
+        master: String,
+    },
+
+    /// link_heal decided to act but the REPLICAOF call itself failed
+    LinkHealRequestFailed {
+        node: String,
+        attempt: u32,
+        master: String,
+        error: String,
+    },
+
+    /// A replica link_heal acted on recovered afterward
+    LinkHealRecovered {
+        node: String,
+        recovered_in_secs: u64,
+        attempts: u32,
+    },
+
+    /// link_heal hit its attempt cap and is leaving the node for a human (or
+    /// backboard's redis-ha monitor fallback)
+    LinkHealGaveUp { node: String, attempts: u32 },
 }
 
+#[derive(Clone)]
 pub struct Telemetry {
     client: Client,
     endpoint: String,

@@ -14,6 +14,7 @@ use common::{init_logging, RailwayEnv, Telemetry, TelemetryEvent};
 use redis_sentinel::{
     config::{data_dir_is_on_volume, Config},
     health_server::run_health_server,
+    link_heal,
     process_manager::{enable_aof_after_rdb_load, spawn_redis, spawn_sentinel, supervise},
     redis_conf::{
         generate_redis_conf, needs_rdb_to_aof_migration, quarantine_manifestless_aof_dir,
@@ -137,6 +138,7 @@ async fn main() -> Result<()> {
         let redis_port = config.redis_port;
         let redis_password = config.redis_password.clone();
         let data_dir = config.data_dir.clone();
+        let telemetry = telemetry.clone();
         tokio::spawn(async move {
             enable_aof_after_rdb_load(redis_port, &redis_password, &data_dir, &telemetry).await;
         });
@@ -148,6 +150,20 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // Local self-heal for a replica whose link to the master is durably down
+    // — only meaningful with Sentinel colocated, since it is Sentinel's
+    // answer that supplies the authoritative fix target.
+    if config.sentinel_enabled {
+        link_heal::spawn(
+            config.data_dir.clone(),
+            config.redis_port,
+            config.redis_password.clone(),
+            config.sentinel_port,
+            config.redis_master_name.clone(),
+            telemetry,
+        );
+    }
 
     // Block until a process exits or we receive a signal
     supervise(redis_proc, sentinel_proc).await

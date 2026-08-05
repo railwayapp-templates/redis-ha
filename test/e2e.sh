@@ -223,6 +223,19 @@ wait_for_role_master() { # wait_for_role_master NODE [timeout]
   return 1
 }
 
+link_status() { # link_status NODE  ->  "up" | "down" | ""
+  rcli "$1" INFO replication | tr -d '\r' | grep '^master_link_status:' | cut -d: -f2
+}
+
+wait_for_link_status() { # wait_for_link_status NODE up|down [timeout]
+  local i
+  for i in $(seq 1 "${3:-30}"); do
+    [ "$(link_status "$1")" = "$2" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
 # ----- scenarios --------------------------------------------------------------
 
 # A fresh volume boots straight into AOF with a Sentinel-confirmed master —
@@ -511,6 +524,44 @@ t_sentinel_failover() {
   ok "$t"
 }
 
+# A replica pinned to a host that can never answer never heals through
+# Redis's own retry loop — nothing changes what it's retrying. Only the
+# in-image link-heal watcher, which sources its fix target from Sentinel
+# rather than replaying the replica's own (now-wrong) config, can recover it.
+# LINK_HEAL_* thresholds are lowered so the dwell fits inside a test timeout.
+t_link_heal_recovers_broken_replica_link() {
+  local t=t_link_heal_recovers_broken_replica_link
+  local hosts="link-1:26379,link-2:26379"
+  local fast=(-e LINK_HEAL_POLL_SECONDS=1 -e LINK_HEAL_DWELL_SECONDS=5 -e LINK_HEAL_ACTION_BACKOFF_SECONDS=1)
+  mkvol link-vol-1; mkvol link-vol-2
+  seed_rdb_volume link-vol-1 /data linkkey linkvalue
+  start_node link-1 link-vol-1 /data -e SENTINEL_HOSTS="$hosts" "${fast[@]}"
+  start_node link-2 link-vol-2 /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=link-1:6379 "${fast[@]}"
+  wait_for_log_line link-1 "enabled AOF after loading adopted RDB" \
+    || { ko "$t" "primary never finished adoption" link-1; return; }
+  local i
+  for i in $(seq 1 60); do
+    [ "$(rcli link-2 GET linkkey)" = "linkvalue" ] && break
+    sleep 1
+  done
+  [ "$(rcli link-2 GET linkkey)" = "linkvalue" ] \
+    || { ko "$t" "replica never synced before the fault injection" link-1 link-2; return; }
+
+  rcli link-2 REPLICAOF nonexistent-host 6379 >/dev/null
+  wait_for_link_status link-2 down 15 \
+    || { ko "$t" "fault injection did not take (link never read down)" link-2; return; }
+
+  wait_for_log_line link-2 "reissuing REPLICAOF on a durably broken link" 60 \
+    || { ko "$t" "link-heal watcher never acted" link-2; return; }
+  wait_for_link_status link-2 up 30 \
+    || { ko "$t" "link never recovered after link-heal acted" link-1 link-2; return; }
+  [ "$(rcli link-2 GET linkkey)" = "linkvalue" ] \
+    || { ko "$t" "adopted key missing after link-heal recovery" link-2; return; }
+
+  docker rm -f link-1 link-2 >/dev/null 2>&1
+  ok "$t"
+}
+
 # ----- runner ------------------------------------------------------------------
 ALL_TESTS=(
   t_fresh_boot
@@ -523,6 +574,7 @@ ALL_TESTS=(
   t_rewrite_failure_recovers
   t_replication_of_adopted_data
   t_sentinel_failover
+  t_link_heal_recovers_broken_replica_link
 )
 
 setup
