@@ -18,6 +18,7 @@ use redis_sentinel::{
     redis_conf::{
         generate_redis_conf, needs_rdb_to_aof_migration, quarantine_manifestless_aof_dir,
     },
+    replication_reconciler,
     sentinel_conf::generate_sentinel_conf,
 };
 use std::fs;
@@ -148,6 +149,29 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // Keeps this node pointed at the master Sentinel actually elected, not
+    // whichever host REPLICA_OF named at boot — see replication_reconciler's
+    // module doc for why a redeploy (the platform-level fix tried first) is
+    // the wrong tool for this. Needs the local Sentinel as ground truth, so
+    // it only runs where one is colocated.
+    if config.sentinel_enabled {
+        let redis_port = config.redis_port;
+        let sentinel_port = config.sentinel_port;
+        let redis_password = config.redis_password.clone();
+        let redis_master_name = config.redis_master_name.clone();
+        let private_domain = config.private_domain.clone();
+        tokio::spawn(async move {
+            replication_reconciler::run_replication_reconciler(
+                redis_port,
+                sentinel_port,
+                redis_password,
+                redis_master_name,
+                private_domain,
+            )
+            .await;
+        });
+    }
 
     // Block until a process exits or we receive a signal
     supervise(redis_proc, sentinel_proc).await

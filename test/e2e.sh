@@ -213,6 +213,41 @@ dump_sentinel_view() { # dump_sentinel_view NODE...
   done
 }
 
+wait_for_partition() { # wait_for_partition FROM_NODE UNREACHABLE_NODE [timeout]
+  # `docker network disconnect` returning is not proof the partition already
+  # took effect network-wide — confirm it from another node's point of view
+  # (2 consecutive failures, not 1, to rule out a single dropped probe) before
+  # relying on it. Skipping this check once produced a false pass: Sentinel
+  # reconfigured the "partitioned" replica normally because it was, in fact,
+  # still reachable when the master died.
+  local i ok_count=0
+  for i in $(seq 1 "${3:-30}"); do
+    if docker exec "$1" sh -c "wget -qO- --timeout=2 http://$2:8080/health" >/dev/null 2>&1; then
+      ok_count=0
+    else
+      ok_count=$((ok_count + 1))
+      [ "$ok_count" -ge 2 ] && return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+wait_for_replica_repointed() { # wait_for_replica_repointed NODE EXPECTED_MASTER_HOST [timeout]
+  # Polls the node's OWN INFO replication — the reconciler's target signal —
+  # rather than the health server, so this proves the reconciler acted, not
+  # just that the cluster looks healthy from outside.
+  local i info host status
+  for i in $(seq 1 "${3:-150}"); do
+    info=$(rcli "$1" INFO replication)
+    host=$(echo "$info" | grep "^master_host:" | tr -d '\r')
+    status=$(echo "$info" | grep "^master_link_status:" | tr -d '\r')
+    [ "$host" = "master_host:$2" ] && [ "$status" = "master_link_status:up" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
 wait_for_role_master() { # wait_for_role_master NODE [timeout]
   local i
   for i in $(seq 1 "${2:-90}"); do
@@ -511,6 +546,130 @@ t_sentinel_failover() {
   ok "$t"
 }
 
+# The scenario the in-image reconciler exists for: a replica partitioned at
+# the EXACT moment of a failover never receives Sentinel's reconfiguration.
+# Once reachable again it must find its own way to the new master — no
+# redeploy, no external intervention — because a stale replica silently
+# serving pre-failover data is worse than one that is visibly down.
+t_replica_partitioned_during_failover_self_heals() {
+  local t=t_replica_partitioned_during_failover_self_heals
+  # 5 nodes, not fewer. Sentinel needs TWO separate majorities here, and
+  # losing the master's colocated sentinel plus the partitioned replica's
+  # takes out 2 of them at once:
+  #   - ODOWN quorum (2, the template default) — satisfiable with as few as
+  #     3 total nodes, since only the master needs to go down for that vote.
+  #   - Leader election to decide WHO performs the failover requires a
+  #     strict MAJORITY of ALL configured sentinels, independent of the
+  #     quorum setting. With N total and 2 gone, the survivors (N-2) must
+  #     reach floor(N/2)+1. N=4 gives 2 survivors needing 3 — impossible.
+  #     N=5 gives exactly 3 survivors needing 3 — exactly enough, since all
+  #     3 stay mutually reachable and can agree.
+  local hosts="part-1:26379,part-2:26379,part-3:26379,part-4:26379,part-5:26379"
+  mkvol part-vol-1; mkvol part-vol-2; mkvol part-vol-3; mkvol part-vol-4; mkvol part-vol-5
+  seed_rdb_volume part-vol-1 /data partkey partvalue
+  start_node part-1 part-vol-1 /data -e SENTINEL_HOSTS="$hosts"
+  start_node part-2 part-vol-2 /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=part-1:6379
+  start_node part-3 part-vol-3 /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=part-1:6379
+  start_node part-4 part-vol-4 /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=part-1:6379
+  start_node part-5 part-vol-5 /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=part-1:6379
+  wait_for_role_master part-1 \
+    || { ko "$t" "part-1 never became master" part-1 part-2 part-3 part-4 part-5; return; }
+  local i n
+  for i in $(seq 1 90); do
+    [ "$(rcli part-2 GET partkey)" = "partvalue" ] \
+      && [ "$(rcli part-3 GET partkey)" = "partvalue" ] \
+      && [ "$(rcli part-4 GET partkey)" = "partvalue" ] \
+      && [ "$(rcli part-5 GET partkey)" = "partvalue" ] && break
+    sleep 1
+  done
+  [ "$(rcli part-5 GET partkey)" = "partvalue" ] \
+    || { ko "$t" "part-5 never synced before the partition" part-1 part-5; return; }
+
+  # Every sentinel needs to see the other 4 and have a live view of all 4
+  # replicas BEFORE anything is disconnected — this is what lets part-2,
+  # part-3 and part-4 reach BOTH the ODOWN quorum and the leader-election
+  # majority on their own once part-1 is gone and part-5 is unreachable.
+  for n in part-2 part-3 part-4; do
+    wait_for_sentinel_peers "$n" 4 || { ko "$t" "$n sentinel never saw 4 peers" "$n"; return; }
+    wait_for_sentinel_slave_view "$n" 4 \
+      || { dump_sentinel_view "$n"; ko "$t" "$n sentinel never got a live view of all 4 replicas" "$n"; return; }
+  done
+
+  # Record identity before the repair window — proves what follows happens
+  # with no restart of part-5's container at all, only reconnecting its
+  # network. A redeploy or restart would change this.
+  local part5_started
+  part5_started=$(docker inspect -f '{{.State.StartedAt}}' part-5)
+
+  # Partition part-5 fully off the network BEFORE the master dies, so it is
+  # unreachable for the whole failover and cannot receive Sentinel's
+  # reconfiguration. part-2/3/4 stay mutually reachable, so together they
+  # still clear both the ODOWN quorum and the leader-election majority.
+  docker network disconnect "$NET" part-5 >/dev/null 2>&1
+  wait_for_partition part-2 part-5 \
+    || { ko "$t" "part-5 was not actually unreachable after disconnect — test setup race" part-2 part-5; return; }
+  docker pause part-1 >/dev/null 2>&1
+
+  local promoted=""
+  for i in $(seq 1 180); do
+    for n in part-2 part-3 part-4; do
+      docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
+        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+    done
+    sleep 1
+  done
+  [ -n "$promoted" ] || {
+    dump_sentinel_view part-2 part-3 part-4
+    ko "$t" "no reachable replica was promoted while part-5 stayed partitioned" part-2 part-3 part-4
+    return
+  }
+  note "promoted: ${promoted}"
+
+  # A write accepted only by the NEW master — part-5 cannot have this yet by
+  # any means other than correctly resyncing from it after rejoining. Retried,
+  # not fire-and-forget: right after SLAVEOF NO ONE the new master has ZERO
+  # connected replicas (Sentinel reconfigures survivors one at a time —
+  # REDIS_PARALLEL_SYNCS=1), so it is transiently subject to the SAME
+  # min-replicas-to-write fence t_fresh_boot asserts. Writing too early gets
+  # a silent -NOREPLICAS rejection that nothing will ever resync, which reads
+  # exactly like the reconciler failing when it is this setup step that did.
+  local write_result
+  for i in $(seq 1 30); do
+    write_result=$(rcli "$promoted" SET postfailoverkey postfailovervalue)
+    [ "$write_result" = "OK" ] && break
+    sleep 1
+  done
+  [ "$write_result" = "OK" ] \
+    || { ko "$t" "post-failover write never succeeded on $promoted (${write_result})" "$promoted"; return; }
+
+  # Reconnect part-5. Its boot-time REPLICA_OF still names part-1 (now
+  # paused/unreachable), so INFO replication will keep reading
+  # master_link_status:down until something repoints it — that something is
+  # the reconciler under test, not this script.
+  docker network connect "$NET" part-5 --alias part-5 >/dev/null 2>&1
+
+  wait_for_replica_repointed part-5 "$promoted" \
+    || { dump_sentinel_view part-5; ko "$t" "part-5 never repointed itself at $promoted" part-5; return; }
+
+  local part5_started_after
+  part5_started_after=$(docker inspect -f '{{.State.StartedAt}}' part-5)
+  [ "$part5_started" = "$part5_started_after" ] \
+    || { ko "$t" "part-5 was restarted — this must be fixed live, not by a redeploy" part-5; return; }
+
+  for i in $(seq 1 30); do
+    [ "$(rcli part-5 GET postfailoverkey)" = "postfailovervalue" ] && break
+    sleep 1
+  done
+  [ "$(rcli part-5 GET postfailoverkey)" = "postfailovervalue" ] \
+    || { ko "$t" "part-5 repointed but never actually resynced the post-failover write" part-5; return; }
+  [ "$(rcli part-5 GET partkey)" = "partvalue" ] \
+    || { ko "$t" "pre-failover data lost after self-healing the link" part-5; return; }
+
+  docker unpause part-1 >/dev/null 2>&1
+  docker rm -f part-1 part-2 part-3 part-4 part-5 >/dev/null 2>&1
+  ok "$t"
+}
+
 # ----- runner ------------------------------------------------------------------
 ALL_TESTS=(
   t_fresh_boot
@@ -523,6 +682,7 @@ ALL_TESTS=(
   t_rewrite_failure_recovers
   t_replication_of_adopted_data
   t_sentinel_failover
+  t_replica_partitioned_during_failover_self_heals
 )
 
 setup
