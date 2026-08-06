@@ -85,16 +85,24 @@ pub fn generate_redis_conf(config: &Config) -> String {
         format!("replica-announce-ip {}", config.private_domain),
         format!("replica-announce-port {}", config.redis_port),
         "cluster-preferred-endpoint-type hostname".to_string(),
+    ];
+
+    if config.sentinel_enabled {
         // Split-brain fence: master stops accepting writes when it loses contact
         // with all replicas for longer than min-replicas-max-lag seconds.
         // Bounds the split-brain window on network partition to this lag rather
         // than letting the isolated master accept writes indefinitely.
         // 1 replica required — self-fences only when fully isolated.
-        "min-replicas-to-write 1".to_string(),
+        //
+        // HA boots only: a standalone boot (SENTINEL_ENABLED unset — e.g. a
+        // root whose HA template was reverted, which keeps this image) has no
+        // replicas by definition, so the fence would permanently reject every
+        // write with NOREPLICAS.
+        lines.push("min-replicas-to-write 1".to_string());
         // Must be <= SENTINEL_DOWN_AFTER_MS (5s default) so the master goes
         // read-only around the same time Sentinel declares it ODOWN elsewhere.
-        "min-replicas-max-lag 10".to_string(),
-    ];
+        lines.push("min-replicas-max-lag 10".to_string());
+    }
 
     if !config.is_primary() {
         // Parse REPLICA_OF as "host:port"
@@ -286,5 +294,27 @@ mod tests {
         let conf = generate_redis_conf(&config);
         assert!(!conf.contains("replicaof"));
         assert!(conf.contains("masterauth pw"));
+    }
+
+    #[test]
+    fn ha_boot_keeps_the_split_brain_fence() {
+        let dir = tempdir().unwrap();
+        let conf = generate_redis_conf(&config_at(dir.path().to_str().unwrap()));
+        assert!(conf.contains("min-replicas-to-write 1"));
+        assert!(conf.contains("min-replicas-max-lag 10"));
+    }
+
+    // Regression: a standalone boot (SENTINEL_ENABLED unset — the state a
+    // root is left in after its HA template is reverted, still on this
+    // image) has no replicas, so the fence would reject every write with
+    // NOREPLICAS forever.
+    #[test]
+    fn standalone_boot_has_no_split_brain_fence() {
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path().to_str().unwrap());
+        config.sentinel_enabled = false;
+        let conf = generate_redis_conf(&config);
+        assert!(!conf.contains("min-replicas-to-write"));
+        assert!(!conf.contains("min-replicas-max-lag"));
     }
 }
