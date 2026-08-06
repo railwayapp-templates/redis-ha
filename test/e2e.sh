@@ -292,6 +292,25 @@ t_fresh_boot() {
   ok "$t"
 }
 
+# The reverted-root case: an HA revert leaves the root on this image with
+# SENTINEL_ENABLED stripped. A standalone boot has no replicas by definition,
+# so the split-brain fence must not apply — writes go through and the data
+# stays AOF-durable.
+t_standalone_boot_accepts_writes() {
+  local t=t_standalone_boot_accepts_writes n=solo-1
+  mkvol solo-vol
+  start_node "$n" solo-vol /data -e SENTINEL_ENABLED=
+  wait_for_ping "$n" || { ko "$t" "redis never answered PING" "$n"; return; }
+  [ "$(rcli "$n" SET k v)" = "OK" ] \
+    || { ko "$t" "standalone boot must accept writes (no min-replicas fence)" "$n"; return; }
+  [ "$(rcli "$n" GET k)" = "v" ] \
+    || { ko "$t" "written key must read back" "$n"; return; }
+  [ "$(rcli "$n" CONFIG GET appendonly | tail -1)" = "yes" ] \
+    || { ko "$t" "appendonly should be yes on a standalone boot" "$n"; return; }
+  docker rm -f "$n" >/dev/null 2>&1
+  ok "$t"
+}
+
 # The conversion case: a standalone (RDB-only) dataset is adopted, AOF is
 # enabled at runtime, and the manifest commit makes it durable.
 t_rdb_adoption() {
@@ -724,6 +743,7 @@ t_link_heal_recovers_from_partition_during_failover() {
 # ----- runner ------------------------------------------------------------------
 ALL_TESTS=(
   t_fresh_boot
+  t_standalone_boot_accepts_writes
   t_rdb_adoption
   t_adoption_survives_restart
   t_crash_window_recovery
