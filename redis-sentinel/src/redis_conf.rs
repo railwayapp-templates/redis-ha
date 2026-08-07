@@ -104,14 +104,22 @@ pub fn generate_redis_conf(config: &Config) -> String {
         lines.push("min-replicas-max-lag 10".to_string());
     }
 
+    // Every node carries the master password, not just the ones deployed as
+    // replicas: Sentinel demotes an old master into a replica in place, and a
+    // node that has no masterauth when that happens can never complete the
+    // handshake ("MASTER aborted replication with an error: NOAUTH
+    // Authentication required"). It keeps reporting role:slave while serving a
+    // dataset frozen at the moment it lost the master role — and stays
+    // eligible for a later promotion, which is how that stale dataset becomes
+    // the cluster's. Inert on a master, which never reads it.
+    lines.push(format!("masterauth {}", config.redis_password));
+
     if !config.is_primary() {
         // Parse REPLICA_OF as "host:port"
         let parts: Vec<&str> = config.replica_of.splitn(2, ':').collect();
         if parts.len() == 2 {
             lines.push(format!("replicaof {} {}", parts[0], parts[1]));
         }
-        // Replicas need the master password to authenticate
-        lines.push(format!("masterauth {}", config.redis_password));
     }
 
     lines.join("\n") + "\n"
@@ -269,11 +277,22 @@ mod tests {
     }
 
     #[test]
-    fn primary_has_no_replicaof_or_masterauth() {
+    fn primary_has_no_replicaof() {
         let dir = tempdir().unwrap();
         let conf = generate_redis_conf(&config_at(dir.path().to_str().unwrap()));
         assert!(!conf.contains("replicaof"));
-        assert!(!conf.contains("masterauth"));
+    }
+
+    // Sentinel demotes an old master in place, and the credential has to
+    // already be in its config when that happens — there is no second chance:
+    // the node reports role:slave, never syncs, and serves the dataset it had
+    // when it lost the master role.
+    #[test]
+    fn every_node_carries_masterauth_including_the_deployed_primary() {
+        let dir = tempdir().unwrap();
+        let config = config_at(dir.path().to_str().unwrap());
+        assert!(config.is_primary());
+        assert!(generate_redis_conf(&config).contains("masterauth pw"));
     }
 
     #[test]
