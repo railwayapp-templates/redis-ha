@@ -12,6 +12,7 @@
 use anyhow::{Context, Result};
 use common::{init_logging, RailwayEnv, Telemetry, TelemetryEvent};
 use redis_sentinel::{
+    boot_role::{boot_master_for_this_boot, BootMaster},
     config::{data_dir_is_on_volume, Config},
     health_server::run_health_server,
     link_heal,
@@ -71,9 +72,16 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&config.data_dir)
         .context("failed to create data directory")?;
 
+    // Who is master right now, according to the only local record of it that
+    // survives a restart: the sentinel.conf Sentinel itself rewrites after
+    // every failover. Read before the conf is regenerated, because the
+    // regenerated conf is what would otherwise re-impose the deploy-time
+    // topology on a node Sentinel has since promoted or demoted.
+    let boot_master = boot_master_for_this_boot(&config);
+
     // Always regenerate redis.conf so env-var changes take effect on restart.
     let redis_conf_path = format!("{}/redis.conf", config.data_dir);
-    let redis_conf = generate_redis_conf(&config);
+    let redis_conf = generate_redis_conf(&config, &boot_master);
     fs::write(&redis_conf_path, &redis_conf)
         .context("failed to write redis.conf")?;
     info!(path = %redis_conf_path, "wrote redis.conf");
@@ -101,7 +109,14 @@ async fn main() -> Result<()> {
         run_health_server(hp, rp, sp, pw, domain).await;
     });
 
-    let role = if config.is_primary() { "master" } else { "replica" };
+    // The role this boot actually starts in, which is the resolved one — not
+    // the env-declared one it can now contradict.
+    let role = match &boot_master {
+        BootMaster::SelfIsMaster => "master",
+        BootMaster::ReplicaOf(..) => "replica",
+        BootMaster::NoLocalState if config.is_primary() => "master",
+        BootMaster::NoLocalState => "replica",
+    };
     telemetry.send(TelemetryEvent::NodeStarted {
         node: RailwayEnv::private_domain(),
         role: role.to_string(),
