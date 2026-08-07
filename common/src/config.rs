@@ -46,6 +46,10 @@ impl RailwayEnv {
         env::var("RAILWAY_PROJECT_ID").unwrap_or_default()
     }
 
+    pub fn environment_id() -> String {
+        env::var("RAILWAY_ENVIRONMENT_ID").unwrap_or_default()
+    }
+
     pub fn graphql_endpoint() -> String {
         env::var("RAILWAY_GRAPHQL_ENDPOINT")
             .unwrap_or_else(|_| "https://backboard.railway.app/graphql/internal".to_string())
