@@ -203,30 +203,73 @@ impl Telemetry {
     pub fn send(&self, event: TelemetryEvent) {
         let payload = self.build_payload(&event);
 
-        match self
-            .client
-            .post(&self.endpoint)
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-        {
-            // A GraphQL error is a 200 with an `errors` array, so a status
-            // check alone would still hide a contract mismatch — the exact
-            // failure this commit fixes. Read the body.
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().unwrap_or_default();
-                if !status.is_success() {
-                    warn!(event = %event.event_type(), %status, body = %truncate(&body), "telemetry rejected");
-                } else if body.contains("\"errors\"") {
-                    warn!(event = %event.event_type(), body = %truncate(&body), "telemetry rejected by graphql");
-                } else {
-                    info!(event = %event.event_type(), "telemetry sent");
+        // The first event a node ever sends is NodeStarted, ~100ms into the
+        // container's life — and in production that one consistently fails
+        // with "error sending request": the container's egress isn't ready
+        // yet. Since most nodes never emit a second event, that made the
+        // whole telemetry stream empty in practice even after the contract
+        // was fixed. One delayed retry is enough to clear the startup race.
+        //
+        // ONLY transport errors are retried. A rejection is deterministic —
+        // retrying a bad contract just doubles the noise — and the retry is
+        // bounded to one because `send` is synchronous by design: callers
+        // like the boot guards emit an event and then exit(1), so the event
+        // has to be on the wire before the process goes away.
+        for attempt in 1..=SEND_ATTEMPTS {
+            match self
+                .client
+                .post(&self.endpoint)
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().unwrap_or_default();
+                    match classify(status.as_u16(), &body) {
+                        SendOutcome::Sent => {
+                            info!(event = %event.event_type(), attempt, "telemetry sent")
+                        }
+                        SendOutcome::Rejected(why) => {
+                            warn!(event = %event.event_type(), %status, reason = %why, body = %truncate(&body), "telemetry rejected")
+                        }
+                    }
+                    return;
+                }
+                Err(e) if attempt < SEND_ATTEMPTS => {
+                    warn!(event = %event.event_type(), attempt, error = %e, "telemetry send failed, retrying");
+                    std::thread::sleep(RETRY_DELAY);
+                }
+                Err(e) => {
+                    warn!(event = %event.event_type(), attempt, error = %e, "telemetry send failed")
                 }
             }
-            Err(e) => warn!(event = %event.event_type(), error = %e, "telemetry send failed"),
         }
     }
+}
+
+/// One retry: the failure this exists for is a startup race, not a flaky
+/// endpoint, and `send` blocks the caller.
+const SEND_ATTEMPTS: u32 = 2;
+const RETRY_DELAY: Duration = Duration::from_secs(2);
+
+#[derive(Debug, PartialEq, Eq)]
+enum SendOutcome {
+    Sent,
+    Rejected(&'static str),
+}
+
+/// A GraphQL error is a 200 with an `errors` array, so the status alone
+/// cannot tell success from a rejected request — reading only the status is
+/// what let a nonexistent mutation look like a successful send for months.
+fn classify(status: u16, body: &str) -> SendOutcome {
+    if !(200..300).contains(&status) {
+        return SendOutcome::Rejected("http status");
+    }
+    if body.contains("\"errors\"") {
+        return SendOutcome::Rejected("graphql errors");
+    }
+    SendOutcome::Sent
 }
 
 /// Keep a rejection body loggable without dumping a whole HTML error page.
@@ -371,6 +414,39 @@ mod tests {
         assert_eq!(parsed["type"], "LinkHealRecovered");
         assert_eq!(parsed["node"], "redis-3");
         assert_eq!(parsed["recovered_in_secs"], 42);
+    }
+
+    /// The exact confusion that hid the broken contract: GraphQL answers a
+    /// rejected request with HTTP 200 and an `errors` array.
+    #[test]
+    fn a_200_with_graphql_errors_is_a_rejection() {
+        assert_eq!(
+            classify(200, r#"{"errors":[{"message":"Cannot query field"}]}"#),
+            SendOutcome::Rejected("graphql errors")
+        );
+        assert_eq!(
+            classify(200, r#"{"data":{"telemetrySend":true}}"#),
+            SendOutcome::Sent
+        );
+        assert_eq!(classify(400, "bad request"), SendOutcome::Rejected("http status"));
+        assert_eq!(classify(503, ""), SendOutcome::Rejected("http status"));
+    }
+
+    /// A body that merely mentions the word must not be read as a rejection.
+    #[test]
+    fn success_bodies_are_not_misread_as_rejections() {
+        assert_eq!(
+            classify(200, r#"{"data":{"telemetrySend":true},"note":"no errors here"}"#),
+            SendOutcome::Sent
+        );
+    }
+
+    /// Retries exist for the boot-time egress race only, and `send` blocks
+    /// callers that exit(1) right after — so the budget stays at one retry.
+    #[test]
+    fn retry_budget_stays_bounded() {
+        assert_eq!(SEND_ATTEMPTS, 2);
+        assert!(RETRY_DELAY <= Duration::from_secs(3));
     }
 
     #[test]
