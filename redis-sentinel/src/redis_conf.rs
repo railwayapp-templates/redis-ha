@@ -1,3 +1,4 @@
+use crate::boot_role::BootMaster;
 use crate::config::Config;
 
 /// Whether this boot has to adopt an RDB-only dataset.
@@ -55,7 +56,37 @@ pub fn quarantine_manifestless_aof_dir(
     Ok(Some(orphaned))
 }
 
-pub fn generate_redis_conf(config: &Config) -> String {
+/// The master this boot replicates from, or `None` when it starts as one.
+///
+/// `boot_master` is Sentinel's own persisted answer, which wins over
+/// `REPLICA_OF` whenever it has one — see `crate::boot_role`. `NoLocalState`
+/// is the first-boot/fallback path and reproduces the env-only behavior
+/// exactly.
+fn replicate_from(config: &Config, boot_master: &BootMaster) -> Option<(String, u16)> {
+    match boot_master {
+        BootMaster::NoLocalState => {
+            if config.is_primary() {
+                return None;
+            }
+            // Parse REPLICA_OF as "host:port"
+            let parts: Vec<&str> = config.replica_of.splitn(2, ':').collect();
+            match (parts.first(), parts.get(1).and_then(|p| p.parse::<u16>().ok())) {
+                (Some(host), Some(port)) if !host.is_empty() => Some((host.to_string(), port)),
+                _ => None,
+            }
+        }
+        // Sentinel says this node is the master: no replicaof, whatever
+        // REPLICA_OF says. A promoted node that restarts must not demote
+        // itself back onto the node it was promoted over.
+        BootMaster::SelfIsMaster => None,
+        // Sentinel says someone else is: replicate from them, whatever
+        // REPLICA_OF says — including on a node deployed as the initial
+        // master, which is exactly the post-failover redeploy case.
+        BootMaster::ReplicaOf(host, port) => Some((host.clone(), *port)),
+    }
+}
+
+pub fn generate_redis_conf(config: &Config, boot_master: &BootMaster) -> String {
     let adopting_rdb = needs_rdb_to_aof_migration(&config.data_dir);
 
     let mut lines: Vec<String> = vec![
@@ -114,12 +145,8 @@ pub fn generate_redis_conf(config: &Config) -> String {
     // the cluster's. Inert on a master, which never reads it.
     lines.push(format!("masterauth {}", config.redis_password));
 
-    if !config.is_primary() {
-        // Parse REPLICA_OF as "host:port"
-        let parts: Vec<&str> = config.replica_of.splitn(2, ':').collect();
-        if parts.len() == 2 {
-            lines.push(format!("replicaof {} {}", parts[0], parts[1]));
-        }
+    if let Some((host, port)) = replicate_from(config, boot_master) {
+        lines.push(format!("replicaof {} {}", host, port));
     }
 
     lines.join("\n") + "\n"
@@ -244,7 +271,10 @@ mod tests {
     #[test]
     fn fresh_volume_boots_with_aof_on() {
         let dir = tempdir().unwrap();
-        let conf = generate_redis_conf(&config_at(dir.path().to_str().unwrap()));
+        let conf = generate_redis_conf(
+            &config_at(dir.path().to_str().unwrap()),
+            &BootMaster::NoLocalState,
+        );
         assert!(conf.contains("appendonly yes"));
         assert!(!conf.contains("appendonly no"));
     }
@@ -255,7 +285,10 @@ mod tests {
         // this one boot loads the RDB; AOF is enabled at runtime after.
         let dir = tempdir().unwrap();
         write_rdb(dir.path());
-        let conf = generate_redis_conf(&config_at(dir.path().to_str().unwrap()));
+        let conf = generate_redis_conf(
+            &config_at(dir.path().to_str().unwrap()),
+            &BootMaster::NoLocalState,
+        );
         assert!(conf.contains("appendonly no"));
     }
 
@@ -264,7 +297,10 @@ mod tests {
         let dir = tempdir().unwrap();
         write_rdb(dir.path());
         write_manifestless_aof_dir(dir.path());
-        let conf = generate_redis_conf(&config_at(dir.path().to_str().unwrap()));
+        let conf = generate_redis_conf(
+            &config_at(dir.path().to_str().unwrap()),
+            &BootMaster::NoLocalState,
+        );
         assert!(conf.contains("appendonly no"));
     }
 
@@ -272,14 +308,17 @@ mod tests {
     fn conf_points_redis_at_the_data_dir() {
         let dir = tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
-        let conf = generate_redis_conf(&config_at(path));
+        let conf = generate_redis_conf(&config_at(path), &BootMaster::NoLocalState);
         assert!(conf.contains(&format!("dir {}", path)));
     }
 
     #[test]
     fn primary_has_no_replicaof() {
         let dir = tempdir().unwrap();
-        let conf = generate_redis_conf(&config_at(dir.path().to_str().unwrap()));
+        let conf = generate_redis_conf(
+            &config_at(dir.path().to_str().unwrap()),
+            &BootMaster::NoLocalState,
+        );
         assert!(!conf.contains("replicaof"));
     }
 
@@ -292,7 +331,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = config_at(dir.path().to_str().unwrap());
         assert!(config.is_primary());
-        assert!(generate_redis_conf(&config).contains("masterauth pw"));
+        assert!(generate_redis_conf(&config, &BootMaster::NoLocalState).contains("masterauth pw"));
+        assert!(generate_redis_conf(&config, &BootMaster::SelfIsMaster).contains("masterauth pw"));
     }
 
     #[test]
@@ -300,7 +340,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut config = config_at(dir.path().to_str().unwrap());
         config.replica_of = "master-host:7000".to_string();
-        let conf = generate_redis_conf(&config);
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
         assert!(conf.contains("replicaof master-host 7000"));
         assert!(conf.contains("masterauth pw"));
     }
@@ -310,7 +350,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut config = config_at(dir.path().to_str().unwrap());
         config.replica_of = "master-host".to_string();
-        let conf = generate_redis_conf(&config);
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
         assert!(!conf.contains("replicaof"));
         assert!(conf.contains("masterauth pw"));
     }
@@ -318,7 +358,10 @@ mod tests {
     #[test]
     fn ha_boot_keeps_the_split_brain_fence() {
         let dir = tempdir().unwrap();
-        let conf = generate_redis_conf(&config_at(dir.path().to_str().unwrap()));
+        let conf = generate_redis_conf(
+            &config_at(dir.path().to_str().unwrap()),
+            &BootMaster::NoLocalState,
+        );
         assert!(conf.contains("min-replicas-to-write 1"));
         assert!(conf.contains("min-replicas-max-lag 10"));
     }
@@ -332,8 +375,77 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut config = config_at(dir.path().to_str().unwrap());
         config.sentinel_enabled = false;
-        let conf = generate_redis_conf(&config);
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
         assert!(!conf.contains("min-replicas-to-write"));
         assert!(!conf.contains("min-replicas-max-lag"));
+    }
+
+    // --- the resolved boot role overriding REPLICA_OF ---
+
+    // The data-loss case: this node was deployed as a replica of master-host,
+    // Sentinel promoted it, and it restarted. Regenerating `replicaof
+    // master-host` would demote it back onto the node it was promoted over and
+    // full-sync every write since the promotion away.
+    #[test]
+    fn a_promoted_node_restarting_does_not_demote_itself() {
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path().to_str().unwrap());
+        config.replica_of = "master-host:6379".to_string();
+        let conf = generate_redis_conf(&config, &BootMaster::SelfIsMaster);
+        assert!(!conf.contains("replicaof"));
+    }
+
+    // The dual-master case: deployed as the initial master (REPLICA_OF empty),
+    // restarted after a failover elected someone else.
+    #[test]
+    fn a_deployed_master_follows_sentinel_state_into_replica_role() {
+        let dir = tempdir().unwrap();
+        let config = config_at(dir.path().to_str().unwrap());
+        assert!(config.is_primary());
+        let conf = generate_redis_conf(
+            &config,
+            &BootMaster::ReplicaOf("redis-2.railway.internal".to_string(), 6379),
+        );
+        assert!(conf.contains("replicaof redis-2.railway.internal 6379"));
+        assert!(conf.contains("masterauth pw"));
+    }
+
+    #[test]
+    fn a_replica_follows_sentinel_state_to_the_new_master() {
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path().to_str().unwrap());
+        config.replica_of = "redis-1:6379".to_string();
+        let conf = generate_redis_conf(&config, &BootMaster::ReplicaOf("redis-3".to_string(), 6380));
+        assert!(conf.contains("replicaof redis-3 6380"));
+        assert!(!conf.contains("replicaof redis-1"));
+    }
+
+    // NoLocalState is the fallback path (first boot, unreadable state, kill
+    // switch) and must leave the env-derived topology exactly as it was.
+    #[test]
+    fn no_local_state_keeps_the_env_topology() {
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path().to_str().unwrap());
+        config.replica_of = "master-host:6379".to_string();
+        let as_replica = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(as_replica.contains("replicaof master-host 6379"));
+        assert!(as_replica.contains("masterauth pw"));
+
+        config.replica_of = String::new();
+        let as_primary = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(!as_primary.contains("replicaof"));
+    }
+
+    // An unparseable port used to be emitted verbatim (`replicaof host abc`),
+    // which redis refuses to parse — the node never starts at all. Dropping
+    // the directive at least boots it as a master Sentinel can then reconfigure.
+    #[test]
+    fn replica_of_with_an_unparseable_port_skips_replicaof() {
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path().to_str().unwrap());
+        config.replica_of = "master-host:abc".to_string();
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(!conf.contains("replicaof"));
+        assert!(conf.contains("masterauth pw"));
     }
 }

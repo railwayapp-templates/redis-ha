@@ -85,6 +85,15 @@ Key variables on the Redis nodes (set on Redis-1, referenced by replicas):
 | `REDIS_MIN_REPLICAS_TO_WRITE` | `1` | Master disables writes when fewer healthy replicas |
 | `REDIS_MIN_REPLICAS_MAX_LAG` | `10` | Replica lag threshold (seconds) |
 | `REDIS_APPENDONLY` | `yes` | AOF persistence (required — see notes) |
+| `BOOT_ROLE_FROM_SENTINEL_STATE` | `true` | Take the boot role from Sentinel's own `sentinel.conf` instead of `REPLICA_OF`. Set to `false` to pin every boot to the deploy-time topology |
+
+### Boot role
+
+`REPLICA_OF` describes the topology at *deploy* time, so regenerating `redis.conf` from it alone re-imposes that topology on every restart — a promoted node would demote itself back onto the node it was promoted over, and a cold restart would recreate the pre-failover cluster wholesale.
+
+Sentinel already records the current master on the same volume: it owns `sentinel.conf` after first boot and rewrites its `sentinel monitor` line after every failover. Each node reads that line at startup and boots into the role it names, falling back to `REPLICA_OF` when there is no readable local state (first boot, fresh volume). The decision is logged as a single `boot role:` line, which calls out an override of `REPLICA_OF` explicitly.
+
+A node that was down for the whole failover never saw the switch, so its `sentinel.conf` still names itself and it comes back as a master — Sentinel demotes it within one failover timeout, as it does today.
 
 ## Development
 

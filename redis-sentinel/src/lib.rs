@@ -1,3 +1,4 @@
+pub mod boot_role;
 pub mod config;
 pub mod health_server;
 pub mod link_heal;

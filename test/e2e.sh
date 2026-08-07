@@ -256,6 +256,90 @@ wait_for_partition() { # wait_for_partition FROM_NODE UNREACHABLE_NODE [timeout]
   return 1
 }
 
+redis_role() { # redis_role NODE  ->  "master" | "slave" | ""
+  rcli "$1" INFO replication | tr -d '\r' | awk -F: '/^role:/{print $2}'
+}
+
+master_host_of() { # master_host_of NODE  ->  the host this replica points at
+  rcli "$1" INFO replication | tr -d '\r' | awk -F: '/^master_host:/{print $2}'
+}
+
+# The host on the `sentinel monitor` line of a volume's sentinel.conf —
+# Sentinel's own record of who is master, rewritten after every failover, and
+# the state a node reads back at boot to pick its role.
+sentinel_conf_master_host() { # sentinel_conf_master_host VOLUME
+  docker run --rm -v "$1:/v" alpine:latest cat /v/sentinel.conf 2>/dev/null \
+    | awk '$1=="sentinel" && $2=="monitor" && $3=="mymaster" {print $4; exit}'
+}
+
+wait_for_sentinel_conf_master() { # wait_for_sentinel_conf_master VOLUME HOST [timeout]
+  local i
+  for i in $(seq 1 "${3:-90}"); do
+    [ "$(sentinel_conf_master_host "$1")" = "$2" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+write_key() { # write_key NODE KEY VALUE [timeout]
+  # Retried, not fire-and-forget: a master whose replicas have not (re)attached
+  # yet is fenced by min-replicas-to-write, and right after a promotion that
+  # state is transient. A single attempt would read as a silent -NOREPLICAS.
+  local i result
+  for i in $(seq 1 "${4:-30}"); do
+    result=$(rcli "$1" SET "$2" "$3")
+    [ "$result" = "OK" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+wait_for_key() { # wait_for_key NODE KEY VALUE [timeout]
+  local i
+  for i in $(seq 1 "${4:-60}"); do
+    [ "$(rcli "$1" GET "$2")" = "$3" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# A 3-node cluster (PREFIX-1..3 on PREFIX-vol-1..3), PREFIX-1 deployed as the
+# initial master, brought up to the point where a failover can actually
+# succeed: every survivor sees both sentinel peers and has a live view of both
+# replicas. Same sequence t_sentinel_failover performs inline.
+start_ha_trio() { # start_ha_trio PREFIX [extra -e args...]
+  local p="$1"; shift
+  local hosts="${p}-1:26379,${p}-2:26379,${p}-3:26379"
+  mkvol "${p}-vol-1"; mkvol "${p}-vol-2"; mkvol "${p}-vol-3"
+  start_node "${p}-1" "${p}-vol-1" /data -e SENTINEL_HOSTS="$hosts" "$@"
+  start_node "${p}-2" "${p}-vol-2" /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF="${p}-1:6379" "$@"
+  start_node "${p}-3" "${p}-vol-3" /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF="${p}-1:6379" "$@"
+  wait_for_role_master "${p}-1" || return 1
+  local n
+  for n in "${p}-2" "${p}-3"; do
+    wait_for_sentinel_peers "$n" 2 || return 1
+    wait_for_sentinel_slave_view "$n" 2 || return 1
+  done
+}
+
+# Pause a master (see t_sentinel_failover on why pause and not kill) and wait
+# for one of the candidates to take over. Echoes the promoted node's name.
+promote_by_pausing() { # promote_by_pausing MASTER CANDIDATE...
+  local master="$1"; shift
+  docker pause "$master" >/dev/null 2>&1
+  local i n
+  # 180s: sdown at ~5s, but a tied first election only retries after the
+  # template's 30s failover-timeout — room for two full retry cycles.
+  for i in $(seq 1 180); do
+    for n in "$@"; do
+      docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
+        | grep -q '"role":"master"' && { echo "$n"; return 0; }
+    done
+    sleep 1
+  done
+  return 1
+}
+
 wait_for_replica_repointed() { # wait_for_replica_repointed NODE EXPECTED_MASTER_HOST [timeout]
   # Polls the node's OWN INFO replication — the link-heal watcher's target
   # signal — rather than the health server, so this proves the watcher acted,
@@ -578,6 +662,172 @@ t_sentinel_failover() {
   ok "$t"
 }
 
+# `REPLICA_OF` is the topology at DEPLOY time. Redeploying the node that was
+# deployed as the initial master, after Sentinel has moved the master
+# elsewhere, used to regenerate `replicaof` from that env var alone and bring
+# it back declaring itself master — a second master for as long as Sentinel
+# takes to demote it. Its own sentinel.conf, which Sentinel rewrote when it
+# observed the switch, names the real master; that is what the boot role now
+# comes from, so the node rejoins as a replica from its very first answer.
+t_restart_old_master_rejoins_as_replica() {
+  local t=t_restart_old_master_rejoins_as_replica
+  local hosts="rejoin-1:26379,rejoin-2:26379,rejoin-3:26379"
+  start_ha_trio rejoin \
+    || { dump_sentinel_view rejoin-2 rejoin-3
+         ko "$t" "cluster never became failover-ready" rejoin-1 rejoin-2 rejoin-3; return; }
+  write_key rejoin-1 prekey prevalue \
+    || { ko "$t" "master never accepted the pre-failover write" rejoin-1; return; }
+  wait_for_key rejoin-2 prekey prevalue || { ko "$t" "rejoin-2 never synced" rejoin-1 rejoin-2; return; }
+  wait_for_key rejoin-3 prekey prevalue || { ko "$t" "rejoin-3 never synced" rejoin-1 rejoin-3; return; }
+
+  local promoted
+  promoted=$(promote_by_pausing rejoin-1 rejoin-2 rejoin-3) || {
+    dump_sentinel_view rejoin-2 rejoin-3
+    ko "$t" "no replica was promoted after pausing the master" rejoin-2 rejoin-3
+    return
+  }
+  note "promoted: ${promoted}"
+  # Only the new master has this write — the rejoined node cannot end up with
+  # it by any route other than syncing from the promoted node.
+  write_key "$promoted" postkey postvalue \
+    || { ko "$t" "post-failover write never succeeded on $promoted" "$promoted"; return; }
+
+  # The old master comes back and Sentinel demotes it live. That is the moment
+  # its own Sentinel records the new master on its volume — the state the
+  # redeploy below has to read back.
+  docker unpause rejoin-1 >/dev/null 2>&1
+  wait_for_sentinel_conf_master rejoin-vol-1 "$promoted" \
+    || { note "rejoin-vol-1 sentinel monitor host: '$(sentinel_conf_master_host rejoin-vol-1)'"
+         ko "$t" "rejoin-1's sentinel never recorded ${promoted} as master" rejoin-1; return; }
+
+  # The redeploy: same volume, same deploy-time env (REPLICA_OF still empty).
+  docker rm -f rejoin-1 >/dev/null 2>&1
+  start_node rejoin-1 rejoin-vol-1 /data -e SENTINEL_HOSTS="$hosts"
+  wait_for_ping rejoin-1 || { ko "$t" "rejoined node never answered PING" rejoin-1; return; }
+
+  # Asserted on the FIRST answer, not after a convergence wait: Sentinel would
+  # eventually demote a node that came back as a master, and waiting for that
+  # would pass with or without the boot-role fix. The role has to be right
+  # because redis.conf said so.
+  local role host
+  role=$(redis_role rejoin-1)
+  host=$(master_host_of rejoin-1)
+  [ "$role" = "slave" ] \
+    || { ko "$t" "rejoined node came back as '${role}', expected slave of ${promoted}" rejoin-1; return; }
+  [ "$host" = "$promoted" ] \
+    || { ko "$t" "rejoined node points at '${host}', expected ${promoted}" rejoin-1; return; }
+  # Not `grep -q`: under `pipefail` it exits on the first match, docker logs
+  # takes SIGPIPE while still writing, and the pipeline reports 141 — a false
+  # negative on a pattern that DID match.
+  docker logs rejoin-1 2>&1 \
+    | grep -F "boot role: replica of ${promoted}:6379 (from sentinel.conf" >/dev/null \
+    || { ko "$t" "boot role decision was not logged" rejoin-1; return; }
+
+  wait_for_link_status rejoin-1 up 60 \
+    || { ko "$t" "rejoined replica never linked to ${promoted}" rejoin-1 "$promoted"; return; }
+  wait_for_key rejoin-1 postkey postvalue \
+    || { ko "$t" "post-failover write never reached the rejoined node" rejoin-1 "$promoted"; return; }
+  wait_for_key rejoin-1 prekey prevalue 30 \
+    || { ko "$t" "pre-failover key missing after the rejoin" rejoin-1; return; }
+  # The promoted master keeps its dataset — the rejoining node syncs from it,
+  # never the other way round.
+  [ "$(rcli "$promoted" GET postkey)" = "postvalue" ] && [ "$(rcli "$promoted" GET prekey)" = "prevalue" ] \
+    || { ko "$t" "promoted master lost data when the old master rejoined" "$promoted"; return; }
+
+  docker rm -f rejoin-1 rejoin-2 rejoin-3 >/dev/null 2>&1
+  ok "$t"
+}
+
+# Deterministic cold-start bootstrap: the one failure mode Sentinel cannot
+# self-resolve. With every node's role coming from `REPLICA_OF`, restarting the
+# whole cluster recreates the DEPLOY-time topology — the promoted master
+# demotes itself back onto the node it was promoted over and the writes it took
+# after the failover are full-synced away. Each volume's sentinel.conf names the
+# promoted node, so the cluster has to come back around it.
+t_cold_restart_preserves_promoted_master() {
+  local t=t_cold_restart_preserves_promoted_master
+  local hosts="cold-1:26379,cold-2:26379,cold-3:26379"
+  start_ha_trio cold \
+    || { dump_sentinel_view cold-2 cold-3
+         ko "$t" "cluster never became failover-ready" cold-1 cold-2 cold-3; return; }
+  write_key cold-1 coldkey coldvalue \
+    || { ko "$t" "master never accepted the pre-failover write" cold-1; return; }
+  wait_for_key cold-2 coldkey coldvalue || { ko "$t" "cold-2 never synced" cold-1 cold-2; return; }
+  wait_for_key cold-3 coldkey coldvalue || { ko "$t" "cold-3 never synced" cold-1 cold-3; return; }
+
+  local promoted
+  promoted=$(promote_by_pausing cold-1 cold-2 cold-3) || {
+    dump_sentinel_view cold-2 cold-3
+    ko "$t" "no replica was promoted after pausing the master" cold-2 cold-3
+    return
+  }
+  note "promoted: ${promoted}"
+  # The write that only survives if the promoted node is still master after the
+  # cold restart.
+  write_key "$promoted" postcoldkey postcoldvalue \
+    || { ko "$t" "post-failover write never succeeded on $promoted" "$promoted"; return; }
+
+  # Every node must have observed the switch before the cluster goes down: a
+  # node that was down for the whole failover has no record of it and comes
+  # back as a master, which is a Sentinel problem, not a boot-role one.
+  docker unpause cold-1 >/dev/null 2>&1
+  local v
+  for v in cold-vol-1 cold-vol-2 cold-vol-3; do
+    wait_for_sentinel_conf_master "$v" "$promoted" \
+      || { note "${v} sentinel monitor host: '$(sentinel_conf_master_host "$v")'"
+           ko "$t" "${v} never recorded ${promoted} as master" cold-1 cold-2 cold-3; return; }
+  done
+
+  # Cold restart: every node destroyed and recreated with its original
+  # deploy-time env — cold-1 as the initial master, cold-2/3 as its replicas.
+  #
+  # The promoted node goes first and the others follow once it answers. A
+  # container start costs several seconds, so bringing it up last would leave
+  # its master address unreachable for longer than SENTINEL_DOWN_AFTER_MS and
+  # the sentinels that did come up would legitimately fail over to each other —
+  # a Sentinel scenario, not a boot-role one, and it would mask what this test
+  # asserts.
+  docker rm -f cold-1 cold-2 cold-3 >/dev/null 2>&1
+  local n order="$promoted"
+  for n in cold-1 cold-2 cold-3; do
+    [ "$n" = "$promoted" ] || order="${order} ${n}"
+  done
+  for n in $order; do
+    if [ "$n" = "cold-1" ]; then
+      start_node cold-1 cold-vol-1 /data -e SENTINEL_HOSTS="$hosts"
+    else
+      start_node "$n" "cold-vol-${n#cold-}" /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=cold-1:6379
+    fi
+    wait_for_ping "$n" || { ko "$t" "${n} never came back after the cold restart" cold-1 cold-2 cold-3; return; }
+  done
+
+  # Sampled as soon as all three answer, before Sentinel has had a chance to
+  # reconcile anything: the topology has to be right out of the generated
+  # confs. Deploy-time roles would show cold-1 as master here.
+  local masters=""
+  for n in cold-1 cold-2 cold-3; do
+    [ "$(redis_role "$n")" = "master" ] && masters="${masters}${masters:+ }${n}"
+  done
+  [ "$masters" = "$promoted" ] \
+    || { ko "$t" "expected exactly one master (${promoted}), got: [${masters}]" cold-1 cold-2 cold-3; return; }
+  docker logs "$promoted" 2>&1 \
+    | grep -F "boot role: master (sentinel.conf names this node" >/dev/null \
+    || { ko "$t" "${promoted} did not take its master role from sentinel.conf" "$promoted"; return; }
+
+  [ "$(rcli "$promoted" GET postcoldkey)" = "postcoldvalue" ] \
+    || { ko "$t" "post-failover write lost across the cold restart" "$promoted"; return; }
+  [ "$(rcli "$promoted" GET coldkey)" = "coldvalue" ] \
+    || { ko "$t" "pre-failover key lost across the cold restart" "$promoted"; return; }
+  for n in cold-1 cold-2 cold-3; do
+    [ "$n" = "$promoted" ] && continue
+    wait_for_key "$n" postcoldkey postcoldvalue \
+      || { ko "$t" "${n} never resynced the post-failover write from ${promoted}" "$n" "$promoted"; return; }
+  done
+
+  docker rm -f cold-1 cold-2 cold-3 >/dev/null 2>&1
+  ok "$t"
+}
+
 # A replica pinned to a host that can never answer never heals through
 # Redis's own retry loop — nothing changes what it's retrying. Only the
 # in-image link-heal watcher, which sources its fix target from Sentinel
@@ -753,6 +1003,8 @@ ALL_TESTS=(
   t_rewrite_failure_recovers
   t_replication_of_adopted_data
   t_sentinel_failover
+  t_restart_old_master_rejoins_as_replica
+  t_cold_restart_preserves_promoted_master
   t_link_heal_recovers_broken_replica_link
   t_link_heal_recovers_from_partition_during_failover
 )
