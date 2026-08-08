@@ -16,7 +16,17 @@
 //! This works in concert with min-replicas-to-write in redis.conf: the node
 //! self-fences at the Redis layer after min-replicas-max-lag seconds, while
 //! the Sentinel check fences it at the HAProxy layer immediately.
+//!
+//! ## Supervision
+//! `spawn` wraps the server in the same respawn shape as `link_heal`/
+//! `quorum`: an outer loop wraps each attempt in `tokio::task::spawn`, so a
+//! bind failure, a serve error, or a panic surfaces as a warn log (and,
+//! deduped, a `ComponentError` telemetry event) instead of silently leaving
+//! /health and /role unreachable forever — which would otherwise pull this
+//! node from BOTH HAProxy backends permanently, with nothing else watching
+//! this task (`supervise` only watches the redis and sentinel processes).
 
+use anyhow::Context;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -24,12 +34,14 @@ use axum::{
     routing::get,
     Router,
 };
+use common::{Telemetry, TelemetryEvent};
 use redis::{aio::MultiplexedConnection, Client};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
-use tokio::time::{timeout, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tracing::{info, warn};
 
 #[derive(Clone)]
@@ -190,13 +202,16 @@ async fn is_sentinel_confirmed_master(state: &AppState) -> bool {
     sentinel_confirms_master(state, "mymaster").await
 }
 
-pub async fn run_health_server(
+/// Bind and serve once. Returns `Err` on a bind failure or a serve error
+/// instead of `expect()`-ing — the caller (`spawn`) retries on `Err` rather
+/// than letting either kill the task permanently.
+async fn run_health_server(
     health_port: u16,
     redis_port: u16,
     sentinel_port: u16,
     redis_password: String,
     private_domain: String,
-) {
+) -> anyhow::Result<()> {
     // Sentinel has no auth by default; connect without password.
     let redis_url = format!("redis://:{}@127.0.0.1:{}", redis_password, redis_port);
     let sentinel_url = format!("redis://127.0.0.1:{}", sentinel_port);
@@ -216,9 +231,99 @@ pub async fn run_health_server(
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .expect("health server bind failed");
+        .context("health server bind failed")?;
 
     axum::serve(listener, app)
         .await
-        .expect("health server failed");
+        .context("health server failed")?;
+
+    Ok(())
+}
+
+// A task that stayed up at least this long before failing was healthy in
+// between — the next failure is a new incident, not a continuation of the
+// same crash loop, and earns its own telemetry event.
+const HEALTHY_RUN_THRESHOLD: Duration = Duration::from_secs(60);
+// Same respawn delay as link_heal/quorum.
+const RESPAWN_DELAY: Duration = Duration::from_secs(5);
+
+/// Spawn the health server as a supervised background task.
+///
+/// Mirrors `link_heal::spawn`/`quorum::spawn`: an outer loop wraps each
+/// attempt in `tokio::task::spawn` so a panic surfaces as a warn log instead
+/// of aborting redis-wrapper, and a bind or serve failure retries after
+/// `RESPAWN_DELAY` instead of leaving /health and /role gone for good. HAProxy
+/// treats a missing health server exactly like a down node — the target is
+/// pulled from BOTH backends — so an unsupervised task dying here is a
+/// silent, permanent outage for whatever this container happens to be at the
+/// time, worse than the redis-server/sentinel deaths `supervise` already
+/// watches for.
+///
+/// Failures are deduped via `HEALTHY_RUN_THRESHOLD` so a crash loop emits one
+/// `ComponentError` per incident instead of one every `RESPAWN_DELAY`.
+pub fn spawn(
+    health_port: u16,
+    redis_port: u16,
+    sentinel_port: u16,
+    redis_password: String,
+    private_domain: String,
+    telemetry: Telemetry,
+) {
+    tokio::spawn(async move {
+        // Whether the last failure already produced a ComponentError — reset
+        // once a subsequent attempt runs healthy for HEALTHY_RUN_THRESHOLD,
+        // so a later, unrelated failure gets reported too.
+        let mut alerted_for_current_incident = false;
+
+        loop {
+            let hp = health_port;
+            let rp = redis_port;
+            let sp = sentinel_port;
+            let pw = redis_password.clone();
+            let domain = private_domain.clone();
+
+            let started_at = Instant::now();
+            let handle =
+                tokio::task::spawn(async move { run_health_server(hp, rp, sp, pw, domain).await });
+            let outcome = handle.await;
+            let ran_for = started_at.elapsed();
+
+            let failure = match outcome {
+                Ok(Ok(())) => {
+                    // axum::serve only returns on a graceful-shutdown signal
+                    // we never send, so this is unexpected but not fatal.
+                    warn!("health-server: run loop returned cleanly — respawning in 5s");
+                    Some("run loop returned cleanly".to_string())
+                }
+                Ok(Err(e)) => {
+                    warn!(error = %e, "health-server: bind/serve failed — respawning in 5s");
+                    Some(format!("bind/serve failed: {e:#}"))
+                }
+                Err(e) if e.is_panic() => {
+                    warn!(panic = ?e, "health-server: task panicked — respawning in 5s");
+                    Some("task panicked".to_string())
+                }
+                Err(e) => {
+                    warn!(error = %e, "health-server: join error — respawning in 5s");
+                    Some(format!("join error: {e}"))
+                }
+            };
+
+            if let Some(error) = failure {
+                if ran_for >= HEALTHY_RUN_THRESHOLD {
+                    alerted_for_current_incident = false;
+                }
+                if !alerted_for_current_incident {
+                    telemetry.send(TelemetryEvent::ComponentError {
+                        component: "redis-wrapper".to_string(),
+                        error,
+                        context: "health-server".to_string(),
+                    });
+                    alerted_for_current_incident = true;
+                }
+            }
+
+            sleep(RESPAWN_DELAY).await;
+        }
+    });
 }
