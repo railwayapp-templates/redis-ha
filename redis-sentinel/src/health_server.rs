@@ -8,14 +8,25 @@
 //!                    2. local Sentinel confirms this node is the current master
 //!                  503 in all other cases, including when Sentinel is unreachable.
 //!
-//! The dual check on /role is the proxy-layer split-brain fence. An isolated
-//! master's local Sentinel loses quorum and can no longer confirm mastership,
-//! so /role returns 503 and HAProxy stops routing writes to it — even though
-//! the isolated Redis still thinks it is the master.
+//! ## What the /role dual check actually fences
+//! `SENTINEL get-master-addr-by-name` answers from the local Sentinel's own
+//! in-memory state, not a quorum vote — losing contact with the majority
+//! does not, by itself, make a Sentinel stop naming its current master. An
+//! isolated master's local Sentinel keeps answering with that master's own
+//! address for as long as it has not yet observed a newer epoch, so /role
+//! does not flip to 503 the instant a partition opens. It flips once this
+//! node's own Sentinel learns of the switch — typically after the partition
+//! heals and it resyncs with the majority, or once it observes the new
+//! master being announced through gossip.
 //!
-//! This works in concert with min-replicas-to-write in redis.conf: the node
-//! self-fences at the Redis layer after min-replicas-max-lag seconds, while
-//! the Sentinel check fences it at the HAProxy layer immediately.
+//! The write-safety backstop for the partition window itself is
+//! `min-replicas-to-write` in redis.conf: an isolated master loses its
+//! replica acks and Redis rejects writes on its own once
+//! min-replicas-max-lag seconds pass, independent of Sentinel or HAProxy.
+//! /role's job is narrower than fencing the partition immediately — it keeps
+//! HAProxy from continuing to route to a node once its own Sentinel has
+//! registered the demotion, closing the window where Redis would otherwise
+//! still answer role:master to a probe with nothing else checking it.
 //!
 //! ## Supervision
 //! `spawn` wraps the server in the same respawn shape as `link_heal`/
@@ -50,16 +61,26 @@ struct AppState {
     sentinel_url: String,
     /// Our own private hostname, used to verify Sentinel's master-addr answer.
     private_domain: String,
+    /// The Sentinel master name this cluster runs under (`REDIS_MASTER_NAME`,
+    /// default `mymaster`). A cluster with a custom name never matches a
+    /// hardcoded "mymaster", so this must come from config, not a literal.
+    redis_master_name: String,
     redis_conn: Arc<Mutex<Option<MultiplexedConnection>>>,
     sentinel_conn: Arc<Mutex<Option<MultiplexedConnection>>>,
 }
 
 impl AppState {
-    fn new(redis_url: String, sentinel_url: String, private_domain: String) -> Self {
+    fn new(
+        redis_url: String,
+        sentinel_url: String,
+        private_domain: String,
+        redis_master_name: String,
+    ) -> Self {
         Self {
             redis_url,
             sentinel_url,
             private_domain,
+            redis_master_name,
             redis_conn: Arc::new(Mutex::new(None)),
             sentinel_conn: Arc::new(Mutex::new(None)),
         }
@@ -109,11 +130,18 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 ///   2. Local Sentinel's `SENTINEL get-master-addr-by-name` confirms this
 ///      node's hostname as the current master.
 ///
-/// Condition (2) is the fence: if this node is network-partitioned from the
-/// rest of the cluster its local Sentinel loses quorum and can no longer
-/// authoritatively answer — we treat an unreachable Sentinel as 503 (fail-
-/// closed), ensuring HAProxy stops routing writes here even though the
-/// isolated Redis still believes it is master.
+/// Condition (2) is not a quorum check: `get-master-addr-by-name` answers
+/// from the local Sentinel's own state, and that state keeps naming this
+/// node for as long as this Sentinel has not itself observed a newer epoch —
+/// an isolated master's Sentinel does not necessarily flip that answer the
+/// moment a partition opens. We still treat an unreachable Sentinel as 503
+/// (fail-closed), which covers the case where this node cannot reach its own
+/// colocated Sentinel at all, but that is narrower than fencing every
+/// partition immediately. The write-safety backstop for the partition
+/// window is `min-replicas-to-write` at the Redis layer (see the module
+/// doc); this check's job is to stop HAProxy from routing here once this
+/// node's own Sentinel has registered the demotion, not to detect the
+/// partition itself.
 async fn role(State(state): State<AppState>) -> impl IntoResponse {
     match timeout(Duration::from_secs(2), is_sentinel_confirmed_master(&state)).await {
         Ok(true) => (StatusCode::OK, Json(json!({"role": "master"}))),
@@ -151,6 +179,18 @@ async fn local_role_is_master(state: &AppState) -> bool {
     info.lines().any(|l| l.trim() == "role:master")
 }
 
+/// Whether Sentinel's `get-master-addr-by-name` answer names this node,
+/// comparing hosts the same tolerant way every other node-identity check in
+/// this crate does (`boot_role::normalize_host`): case-insensitive and
+/// tolerant of a trailing root dot. Pure and zero-I/O so it can be
+/// unit-tested directly — a byte-exact comparison here would 503 this
+/// node's /role forever the moment DNS or Sentinel's own announce-hostnames
+/// gossip varies the case or trailing-dot shape of the hostname it reports,
+/// which nothing about this cluster's health actually depends on.
+fn answer_confirms_self(answer_host: &str, private_domain: &str) -> bool {
+    crate::boot_role::normalize_host(answer_host) == crate::boot_role::normalize_host(private_domain)
+}
+
 /// Check (2): Sentinel confirms this node is the current master.
 ///
 /// Fails closed: if Sentinel is unreachable, returns false.
@@ -170,7 +210,7 @@ async fn sentinel_confirms_master(state: &AppState, master_name: &str) -> bool {
     match result {
         Ok(parts) if parts.len() == 2 => {
             let master_host = &parts[0];
-            let confirmed = master_host == &state.private_domain;
+            let confirmed = answer_confirms_self(master_host, &state.private_domain);
             if !confirmed {
                 info!(
                     sentinel_master = %master_host,
@@ -199,7 +239,7 @@ async fn is_sentinel_confirmed_master(state: &AppState) -> bool {
         return false;
     }
     // Sentinel confirmation is the actual fence.
-    sentinel_confirms_master(state, "mymaster").await
+    sentinel_confirms_master(state, &state.redis_master_name).await
 }
 
 /// Bind and serve once. Returns `Err` on a bind failure or a serve error
@@ -211,11 +251,12 @@ async fn run_health_server(
     sentinel_port: u16,
     redis_password: String,
     private_domain: String,
+    redis_master_name: String,
 ) -> anyhow::Result<()> {
     // Sentinel has no auth by default; connect without password.
     let redis_url = format!("redis://:{}@127.0.0.1:{}", redis_password, redis_port);
     let sentinel_url = format!("redis://127.0.0.1:{}", sentinel_port);
-    let state = AppState::new(redis_url, sentinel_url, private_domain);
+    let state = AppState::new(redis_url, sentinel_url, private_domain, redis_master_name);
 
     let app = Router::new()
         .route("/health", get(health))
@@ -267,6 +308,7 @@ pub fn spawn(
     sentinel_port: u16,
     redis_password: String,
     private_domain: String,
+    redis_master_name: String,
     telemetry: Telemetry,
 ) {
     tokio::spawn(async move {
@@ -281,10 +323,12 @@ pub fn spawn(
             let sp = sentinel_port;
             let pw = redis_password.clone();
             let domain = private_domain.clone();
+            let mn = redis_master_name.clone();
 
             let started_at = Instant::now();
-            let handle =
-                tokio::task::spawn(async move { run_health_server(hp, rp, sp, pw, domain).await });
+            let handle = tokio::task::spawn(async move {
+                run_health_server(hp, rp, sp, pw, domain, mn).await
+            });
             let outcome = handle.await;
             let ran_for = started_at.elapsed();
 
@@ -326,4 +370,41 @@ pub fn spawn(
             sleep(RESPAWN_DELAY).await;
         }
     });
+}
+
+#[cfg(test)]
+mod answer_confirms_self_tests {
+    use super::*;
+
+    #[test]
+    fn identical_hosts_confirm() {
+        assert!(answer_confirms_self(
+            "redis-1.railway.internal",
+            "redis-1.railway.internal"
+        ));
+    }
+
+    #[test]
+    fn case_difference_still_confirms() {
+        assert!(answer_confirms_self(
+            "Redis-1.Railway.Internal",
+            "redis-1.railway.internal"
+        ));
+    }
+
+    #[test]
+    fn trailing_root_dot_still_confirms() {
+        assert!(answer_confirms_self(
+            "redis-1.railway.internal.",
+            "redis-1.railway.internal"
+        ));
+    }
+
+    #[test]
+    fn different_host_does_not_confirm() {
+        assert!(!answer_confirms_self(
+            "redis-2.railway.internal",
+            "redis-1.railway.internal"
+        ));
+    }
 }

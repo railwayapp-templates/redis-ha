@@ -111,6 +111,7 @@ async fn main() -> Result<()> {
         config.sentinel_port,
         config.redis_password.clone(),
         config.private_domain.clone(),
+        config.redis_master_name.clone(),
         telemetry.clone(),
     );
 
