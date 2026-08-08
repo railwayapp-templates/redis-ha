@@ -183,6 +183,41 @@ jobs:
           cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/redis-sentinel:${{ matrix.redis_major }}
           cache-to: type=inline
 
+      # The floating :<major> tags track redis:<major>-bookworm at BUILD time,
+      # so the bundled minor advances silently with each weekly rebuild. These
+      # :<major.minor> aliases are compatibility markers, not builds of their
+      # own: an alias existing proves every :<major> build published since is
+      # at least that minor. RDB streams are not backward-readable across
+      # minors (7.0=RDB10, 7.2=11, 7.4=12), so the platform's HA conversion
+      # pins the adopted service's own minor alias — a source newer than any
+      # published build fails at image pull, loudly and before any data is
+      # touched. Aliases freeze in place when upstream moves to the next
+      # minor; that is deliberate (freshness comes from the floating tags,
+      # never from rebuilding an old minor).
+      - name: Publish bundled-minor alias tags
+        run: |
+          img="${{ env.IMAGE_PREFIX }}/redis-sentinel:${{ matrix.redis_major }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}"
+          version=$(docker run --rm --entrypoint redis-server "$img" --version)
+          echo "bundled: $version"
+          minor=$(echo "$version" | sed -nE 's/.*v=([0-9]+\.[0-9]+).*/\1/p')
+          if [ -z "$minor" ]; then
+            echo "could not parse a major.minor out of redis-server --version" >&2
+            exit 1
+          fi
+          # A mis-matched alias would poison the compatibility proof — refuse
+          # to publish rather than tag a :7.x alias onto an :8 build.
+          case "$minor" in
+            "${{ matrix.redis_major }}".*) ;;
+            *)
+              echo "bundled minor $minor does not belong to major ${{ matrix.redis_major }}" >&2
+              exit 1
+              ;;
+          esac
+          docker buildx imagetools create \
+            -t "${{ env.IMAGE_PREFIX }}/redis-sentinel:${minor}${{ env.BETA_SUFFIX }}" \
+            -t "${{ env.IMAGE_PREFIX }}/redis-sentinel:${minor}-${{ env.REDIS_DISTRO }}${{ env.BETA_SUFFIX }}" \
+            "$img"
+
   # Build haproxy image for AMD64
   build-haproxy-amd64:
     needs: [changes, build-rust-binaries-haproxy-amd64]
