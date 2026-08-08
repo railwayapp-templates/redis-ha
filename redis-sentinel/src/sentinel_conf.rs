@@ -53,6 +53,16 @@ pub fn generate_sentinel_conf(config: &Config, boot_master: &BootMaster) -> Stri
         // Resolve peers by DNS hostname so Railway's internal DNS works
         "sentinel resolve-hostnames yes".to_string(),
         "sentinel announce-hostnames yes".to_string(),
+        // Announce this Sentinel under the node's stable private hostname,
+        // exactly like redis.conf's replica-announce-ip does for the data
+        // side. Without it announce-hostnames only formats what Sentinel
+        // knows — it still gossips its raw container IP, which changes on
+        // every redeploy and, worse, is what peers would hand to the
+        // deletion probe (an IP is not a resolvable name, so a peer known
+        // only by IP could never be proven deleted). Peers key sentinels by
+        // runid, so existing clusters absorb the address switch in place.
+        format!("sentinel announce-ip {}", config.private_domain),
+        format!("sentinel announce-port {}", config.sentinel_port),
         // Monitor the master set
         format!(
             "sentinel monitor {} {} {} {}",

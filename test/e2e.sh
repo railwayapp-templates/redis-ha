@@ -1069,6 +1069,12 @@ t_link_heal_repoints_wrong_master_attachment() {
 # keeps each local sentinel at a strict majority of the sentinels it
 # actually gossips with, so the whole cluster converges on 3 here even
 # though every node was SEEDED with the stale template default of 2.
+#
+# The split-brain fence must converge with it: every node here booted with
+# min-replicas-to-write 1 (the stale SENTINEL_QUORUM=2 stamp), which on a
+# 5-node cluster only fences a FULLY isolated master — a partition trapping
+# one replica with the old master would leave two writers. The watcher must
+# raise every node to majority − 1 = 2.
 t_quorum_follows_registered_membership() {
   local t=t_quorum_follows_registered_membership
   local fast=(-e QUORUM_SYNC_POLL_SECONDS=2 -e QUORUM_SYNC_DWELL_SECONDS=5)
@@ -1092,6 +1098,18 @@ t_quorum_follows_registered_membership() {
       sleep 1
     done
     [ -n "$converged" ] || { ko "$t" "${n} quorum never converged to 3 (got '\''${q}'\'')" "$n"; return; }
+  done
+
+  local f
+  for n in quor-1 quor-2 quor-3 quor-4 quor-5; do
+    converged=""
+    for i in $(seq 1 120); do
+      f=$(rcli "$n" CONFIG GET min-replicas-to-write | tail -1)
+      [ "$f" = "2" ] && { converged=1; break; }
+      sleep 1
+    done
+    [ -n "$converged" ] \
+      || { ko "$t" "${n} fence never converged to 2 (got '\''${f}'\'')" "$n"; return; }
   done
 
   docker rm -f quor-1 quor-2 quor-3 quor-4 quor-5 >/dev/null 2>&1
@@ -1131,7 +1149,8 @@ t_scale_down_prunes_dead_sentinels() {
 
   # Each survivor independently: marks the two dead sentinels s_down, serves
   # the 10s prune dwell, RESETs its local view, and the membership-majority
-  # quorum then converges to majority(3) = 2.
+  # quorum then converges to majority(3) = 2. The 3 survivors are a live
+  # majority of the 5 known, so the prune's partition gate lets this pass.
   local q peers converged
   for n in prune-1 prune-2 prune-3; do
     converged=""
@@ -1149,7 +1168,167 @@ t_scale_down_prunes_dead_sentinels() {
       || { ko "$t" "${n} converged without the prune log line" "$n"; return; }
   done
 
+  # The fence shrinks with the membership: majority(3) − 1 = 1. Without
+  # this a 5→3 scale-down leaves the master demanding 2 acking replicas of
+  # the single one it has left, fencing every write on a healthy cluster.
+  local f
+  for n in prune-1 prune-2 prune-3; do
+    converged=""
+    for i in $(seq 1 180); do
+      f=$(rcli "$n" CONFIG GET min-replicas-to-write | tail -1)
+      [ "$f" = "1" ] && { converged=1; break; }
+      sleep 1
+    done
+    [ -n "$converged" ] \
+      || { ko "$t" "${n} fence never shrank to 1 (got '\''${f}'\'')" "$n"; return; }
+  done
+
   docker rm -f prune-1 prune-2 prune-3 >/dev/null 2>&1
+  ok "$t"
+}
+
+# A multi-pair scale-down (7→3 in one jump) deletes a MAJORITY of the
+# cluster at once, so the survivors can never satisfy the prune's
+# live-majority gate — and without pruning, the fence denominator never
+# shrinks and the master rejects writes forever. Deletion is the one case
+# the DNS probe can prove: a removed service's name stops resolving
+# (NXDOMAIN), while a partitioned peer's record stays. Every s_down peer
+# answering NXDOMAIN for the whole prune dwell waives the majority gate.
+# Modeled here as 5→2: delete 3 of 5 services outright, leaving the master
+# plus one replica — a live minority of the known membership.
+t_deleted_majority_unfences_via_nxdomain() {
+  local t=t_deleted_majority_unfences_via_nxdomain
+  local fast=(-e QUORUM_SYNC_POLL_SECONDS=2 -e QUORUM_SYNC_DWELL_SECONDS=5 -e SENTINEL_PRUNE_DWELL_SECONDS=10 -e SENTINEL_PRUNE_BACKOFF_SECONDS=5)
+  local hosts="gone-1:26379,gone-2:26379,gone-3:26379,gone-4:26379,gone-5:26379"
+  local i
+  for i in 1 2 3 4 5; do mkvol "gone-vol-${i}"; done
+  start_node gone-1 gone-vol-1 /data -e SENTINEL_HOSTS="$hosts" "${fast[@]}"
+  for i in 2 3 4 5; do
+    start_node "gone-${i}" "gone-vol-${i}" /data \
+      -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=gone-1:6379 "${fast[@]}"
+  done
+  wait_for_role_master gone-1 || { ko "$t" "gone-1 never became master" gone-1; return; }
+
+  # The 5-node fence must be up first, or the test proves nothing.
+  local f
+  for i in $(seq 1 120); do
+    f=$(rcli gone-1 CONFIG GET min-replicas-to-write | tail -1)
+    [ "$f" = "2" ] && break
+    sleep 1
+  done
+  [ "$f" = "2" ] || { ko "$t" "fence never reached 2 before the deletion (got '\''${f}'\'')" gone-1; return; }
+
+  # Delete the majority, DNS names and all.
+  docker rm -f gone-3 gone-4 gone-5 >/dev/null 2>&1
+  docker volume rm -f gone-vol-3 gone-vol-4 gone-vol-5 >/dev/null 2>&1
+
+  # One acking replica < fence 2: the master must reject writes first —
+  # this is the wedge the waiver exists to resolve.
+  local fenced=""
+  for i in $(seq 1 60); do
+    rcli gone-1 SET gonekey gonevalue | grep -q NOREPLICAS && { fenced=1; break; }
+    sleep 1
+  done
+  [ -n "$fenced" ] || { ko "$t" "master never fenced after losing the majority" gone-1; return; }
+
+  # Both survivors independently: serve the sdown dwell, observe continuous
+  # NXDOMAIN for the deleted three, waive the majority gate, RESET, and the
+  # fence follows the shrunken membership back to 1. Writes resume.
+  local n converged
+  for n in gone-1 gone-2; do
+    wait_for_log_line "$n" "reset the local sentinel to forget peers down past the dwell" 120 \
+      || { ko "$t" "${n} never pruned the deleted majority" "$n"; return; }
+    converged=""
+    for i in $(seq 1 120); do
+      f=$(rcli "$n" CONFIG GET min-replicas-to-write | tail -1)
+      [ "$f" = "1" ] && { converged=1; break; }
+      sleep 1
+    done
+    [ -n "$converged" ] \
+      || { ko "$t" "${n} fence never shrank to 1 after the prune (got '\''${f}'\'')" "$n"; return; }
+  done
+  local write_ok=""
+  for i in $(seq 1 60); do
+    [ "$(rcli gone-1 SET gonekey gonevalue)" = "OK" ] && { write_ok=1; break; }
+    sleep 1
+  done
+  [ -n "$write_ok" ] || { ko "$t" "writes never resumed after the fence shrank" gone-1; return; }
+
+  docker rm -f gone-1 gone-2 >/dev/null 2>&1
+  ok "$t"
+}
+
+# The other side of the waiver: a majority that is merely UNREACHABLE — a
+# partition, modeled with docker pause so the containers keep their DNS
+# records exactly like a partitioned Railway service keeps its private
+# domain — must never be pruned by the minority. The names still resolve,
+# the NXDOMAIN windows never open, and the master stays fenced: on a real
+# partition the paused side may be electing a new master right now, and an
+# unfenced old master would be the second writer.
+t_paused_majority_keeps_the_fence() {
+  local t=t_paused_majority_keeps_the_fence
+  local fast=(-e QUORUM_SYNC_POLL_SECONDS=2 -e QUORUM_SYNC_DWELL_SECONDS=5 -e SENTINEL_PRUNE_DWELL_SECONDS=10 -e SENTINEL_PRUNE_BACKOFF_SECONDS=5)
+  local hosts="hold-1:26379,hold-2:26379,hold-3:26379,hold-4:26379,hold-5:26379"
+  local i
+  for i in 1 2 3 4 5; do mkvol "hold-vol-${i}"; done
+  start_node hold-1 hold-vol-1 /data -e SENTINEL_HOSTS="$hosts" "${fast[@]}"
+  for i in 2 3 4 5; do
+    start_node "hold-${i}" "hold-vol-${i}" /data \
+      -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=hold-1:6379 "${fast[@]}"
+  done
+  wait_for_role_master hold-1 || { ko "$t" "hold-1 never became master" hold-1; return; }
+
+  local f
+  for i in $(seq 1 120); do
+    f=$(rcli hold-1 CONFIG GET min-replicas-to-write | tail -1)
+    [ "$f" = "2" ] && break
+    sleep 1
+  done
+  [ "$f" = "2" ] || { ko "$t" "fence never reached 2 before the pause (got '\''${f}'\'')" hold-1; return; }
+
+  docker pause hold-3 hold-4 hold-5 >/dev/null 2>&1
+
+  local fenced=""
+  for i in $(seq 1 60); do
+    rcli hold-1 SET holdkey holdvalue | grep -q NOREPLICAS && { fenced=1; break; }
+    sleep 1
+  done
+  [ -n "$fenced" ] || {
+    docker unpause hold-3 hold-4 hold-5 >/dev/null 2>&1
+    ko "$t" "master never fenced after losing contact with the majority" hold-1; return;
+  }
+
+  # Serve out the sdown dwell (10s), the would-be waiver dwell (10s) and a
+  # few poll cycles on top: long enough that a wrongly-granted waiver WOULD
+  # have pruned and unfenced by now (the deletion test above converges well
+  # inside this window).
+  sleep 45
+
+  if docker logs hold-1 2>&1 | grep -q "reset the local sentinel to forget peers down past the dwell"; then
+    docker unpause hold-3 hold-4 hold-5 >/dev/null 2>&1
+    ko "$t" "the minority pruned a majority that still resolves" hold-1; return;
+  fi
+  f=$(rcli hold-1 CONFIG GET min-replicas-to-write | tail -1)
+  [ "$f" = "2" ] || {
+    docker unpause hold-3 hold-4 hold-5 >/dev/null 2>&1
+    ko "$t" "fence dropped to '\''${f}'\'' while the majority was only unreachable" hold-1; return;
+  }
+  rcli hold-1 SET holdkey holdvalue | grep -q NOREPLICAS || {
+    docker unpause hold-3 hold-4 hold-5 >/dev/null 2>&1
+    ko "$t" "master accepted a write while fenced off from the majority" hold-1; return;
+  }
+
+  # Heal: the paused side comes back, replicas re-ack, writes resume with
+  # the fence untouched.
+  docker unpause hold-3 hold-4 hold-5 >/dev/null 2>&1
+  local write_ok=""
+  for i in $(seq 1 60); do
+    [ "$(rcli hold-1 SET holdkey holdvalue)" = "OK" ] && { write_ok=1; break; }
+    sleep 1
+  done
+  [ -n "$write_ok" ] || { ko "$t" "writes never resumed after the heal" hold-1; return; }
+
+  docker rm -f hold-1 hold-2 hold-3 hold-4 hold-5 >/dev/null 2>&1
   ok "$t"
 }
 
@@ -1242,6 +1421,8 @@ ALL_TESTS=(
   t_link_heal_repoints_wrong_master_attachment
   t_quorum_follows_registered_membership
   t_scale_down_prunes_dead_sentinels
+  t_deleted_majority_unfences_via_nxdomain
+  t_paused_majority_keeps_the_fence
   t_scaled_member_master_is_preserved_at_boot
   t_foreign_host_reusing_member_name_is_quarantined
 )

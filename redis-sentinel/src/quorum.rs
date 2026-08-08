@@ -46,6 +46,28 @@
 //! - Never sets a quorum below 2 — quorum 1 lets a single isolated Sentinel
 //!   declare odown on its own say-so.
 //!
+//! ## Syncing the split-brain fence (`min-replicas-to-write`)
+//! The fence in redis.conf is stamped at boot from `SENTINEL_QUORUM` and
+//! goes stale exactly the way the sentinel quorum does: after a 3→5 scale
+//! the founding nodes still require 1 acking replica, which only fences a
+//! FULLY isolated master — a partition that traps one replica with the old
+//! master leaves both sides writable until the network heals. The watcher
+//! converges the local Redis to majority − 1 via `CONFIG SET`, behind the
+//! same dwell.
+//!
+//! One deliberate asymmetry: the odown quorum follows the LIVE count (the
+//! sdown filter is what lets scale-downs shrink it, and a wrong quorum is
+//! harmless — failover still needs a majority of all known Sentinels), but
+//! the fence follows the KNOWN count, sdown peers included. On the minority
+//! side of a partition every lost peer reads `s_down`; a live-count fence
+//! would lower itself after one dwell and re-admit writes on exactly the
+//! master the majority side is failing over past. Known membership only
+//! shrinks through the prune below, which refuses to run on a minority.
+//!
+//! `CONFIG SET` does not persist, and does not need to: redis.conf is
+//! regenerated from env on every boot, and the watcher re-converges a node
+//! whose env stamp is stale after one dwell.
+//!
 //! ## Pruning dead Sentinels (`SENTINEL RESET`)
 //! The quorum above is safe against scale-downs because of the sdown
 //! filter, but Sentinel's **failover-leader majority** is not: it counts
@@ -60,6 +82,19 @@
 //! within seconds). So the prune fires only when every one of these holds:
 //!  - some known peer has been continuously `s_down` for the prune dwell
 //!    (default 30 minutes — no redeploy or restart explains that), and
+//!  - the live members still form a strict majority of everything this
+//!    Sentinel knows, OR every s_down peer's announced hostname has answered
+//!    authoritative NXDOMAIN on every probe for the whole dwell (see
+//!    `crate::dns_probe`). A scale-down leaving a live majority passes the
+//!    first arm; a multi-pair scale-down that deletes a majority at once
+//!    (7→3) passes the second, because on Railway NXDOMAIN means the
+//!    control plane affirms nothing runs behind that name — a partition
+//!    yields answers or SERVFAIL, never NXDOMAIN, so the minority side of
+//!    one can never satisfy either arm and keeps its fence up while the
+//!    other side fails over. A majority that NXDOMAINed continuously for
+//!    the whole dwell ran no containers for all of it: there was no second
+//!    writer to protect against, and a node that later returns rejoins as
+//!    a replica through boot-role resolution, and
 //!  - the master reads healthy from here (no `s_down`/`o_down`/
 //!    `failover_in_progress` flag) — never during an incident, when the
 //!    wiped state would be needed most, and
@@ -86,6 +121,9 @@ const DEFAULT_DWELL_SECONDS: u64 = 5 * 60;
 const DEFAULT_PRUNE_DWELL_SECONDS: u64 = 30 * 60;
 const DEFAULT_PRUNE_BACKOFF_SECONDS: u64 = 60 * 60;
 const CALL_DEADLINE: Duration = Duration::from_secs(5);
+// DNS probes are loopback-to-local-resolver; anything slower than this is
+// "no answer", which the verdict already treats as "keep the fence".
+const PROBE_DEADLINE: Duration = Duration::from_secs(3);
 
 /// The strict majority of a membership of `live_other_sentinels + 1`, or
 /// `None` when this node knows no live peer and must not act.
@@ -95,6 +133,28 @@ fn desired_quorum(live_other_sentinels: u32) -> Option<u32> {
         return None;
     }
     Some((n / 2 + 1).max(2))
+}
+
+/// The split-brain fence a membership of `known_other_sentinels + 1`
+/// requires: majority − 1 over the KNOWN membership, sdown peers included —
+/// see the module doc for why the fence must not follow the live count.
+/// `None` when this node knows no peer at all: a boot transient or not a
+/// cluster, and in both cases whatever redis.conf stamped stays put.
+fn desired_fence(known_other_sentinels: u32) -> Option<u32> {
+    let n = known_other_sentinels + 1;
+    if n < 2 {
+        return None;
+    }
+    Some(crate::redis_conf::min_replicas_to_write((n / 2 + 1).max(2)))
+}
+
+/// Whether the live members (this node plus every non-sdown peer) still
+/// form a strict majority of everything this Sentinel knows — the gate that
+/// keeps the minority side of a partition from pruning the majority.
+fn live_is_majority_of_known(peers: &[PeerSentinel]) -> bool {
+    let known = peers.len() as u32 + 1;
+    let live = peers.iter().filter(|peer| !peer.s_down).count() as u32 + 1;
+    live * 2 > known
 }
 
 /// A quorum disagreement being watched across the dwell.
@@ -155,24 +215,30 @@ struct PeerSentinel {
     /// hypothetical flag containing the substring from counting as down. A
     /// missing flags field counts as down — never treat unparseable as alive.
     s_down: bool,
+    /// The address the peer announced itself under — a hostname, since every
+    /// node runs `sentinel announce-hostnames yes`. This is the name the
+    /// deletion probe resolves; empty when Sentinel reported none, which
+    /// simply means that peer can never be proven Gone.
+    host: String,
 }
 
 fn parse_peer_sentinels(entries: &[Vec<String>]) -> Vec<PeerSentinel> {
     entries
         .iter()
         .map(|entry| {
+            let host = field_value(entry, "ip").unwrap_or_default();
             let id = field_value(entry, "runid")
                 .filter(|runid| !runid.is_empty())
                 .unwrap_or_else(|| {
                     format!(
                         "{}:{}",
-                        field_value(entry, "ip").unwrap_or_default(),
+                        host,
                         field_value(entry, "port").unwrap_or_default()
                     )
                 });
             let s_down = !field_value(entry, "flags")
                 .is_some_and(|flags| !flags.split(',').any(|flag| flag == "s_down"));
-            PeerSentinel { id, s_down }
+            PeerSentinel { id, s_down, host }
         })
         .collect()
 }
@@ -209,6 +275,46 @@ fn step_prune(
         .any(|since| now.saturating_sub(*since) >= dwell_secs as i64)
 }
 
+/// Advance the per-peer continuous-NXDOMAIN windows from this poll's probe
+/// verdicts, which cover exactly the currently-`s_down` peers. A window
+/// survives only while its peer stays in that set AND this poll's verdict is
+/// Gone again — any recovery, ambiguity, or disappearance deletes it.
+fn step_gone(
+    verdicts: &[(String, crate::dns_probe::NameVerdict)],
+    gone_since: &mut std::collections::HashMap<String, i64>,
+    now: i64,
+) {
+    use crate::dns_probe::NameVerdict::Gone;
+    gone_since.retain(|id, _| verdicts.iter().any(|(vid, v)| vid == id && *v == Gone));
+    for (id, verdict) in verdicts {
+        if *verdict == Gone {
+            gone_since.entry(id.clone()).or_insert(now);
+        }
+    }
+}
+
+/// The minority-prune waiver: every peer currently `s_down` has answered
+/// authoritative NXDOMAIN on every probe for the whole prune dwell. That is
+/// the one state where "the majority is missing" cannot be a partition —
+/// the missing services no longer exist — so forgetting them un-fences a
+/// cluster whose other side is provably not there. A single s_down peer
+/// that still resolves (or merely fails to answer) vetoes the waiver: it
+/// may be the majority side of a partition, mid-failover past this master.
+fn all_sdown_peers_gone_past_dwell(
+    peers: &[PeerSentinel],
+    gone_since: &std::collections::HashMap<String, i64>,
+    now: i64,
+    dwell_secs: u64,
+) -> bool {
+    let sdown: Vec<&PeerSentinel> = peers.iter().filter(|p| p.s_down).collect();
+    !sdown.is_empty()
+        && sdown.iter().all(|peer| {
+            gone_since
+                .get(&peer.id)
+                .is_some_and(|since| now.saturating_sub(*since) >= dwell_secs as i64)
+        })
+}
+
 fn now_epoch() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -235,21 +341,37 @@ struct WatcherConfig {
 #[derive(Debug, Default)]
 struct WatcherState {
     drift: Option<Drift>,
+    fence_drift: Option<Drift>,
     down_since: std::collections::HashMap<String, i64>,
+    /// Per-peer continuous-NXDOMAIN windows, keyed like `down_since`. An
+    /// entry exists only while every consecutive probe of that peer's
+    /// hostname came back authoritatively Gone — any other verdict (records,
+    /// NODATA, SERVFAIL, timeout) deletes it, so unobserved or ambiguous
+    /// time never counts toward the deletion dwell.
+    gone_since: std::collections::HashMap<String, i64>,
     last_reset_at: Option<i64>,
 }
 
 impl WatcherState {
     fn clear_observations(&mut self) {
         self.drift = None;
+        self.fence_drift = None;
         self.down_since.clear();
+        self.gone_since.clear();
     }
 }
 
 /// Spawn the quorum-sync watcher as a long-running background task. Only
 /// meaningful on a Sentinel-managed node — the caller gates on
-/// `sentinel_enabled`.
-pub fn spawn(sentinel_port: u16, master_name: String) {
+/// `sentinel_enabled`. Talks to the colocated Sentinel for the quorum and to
+/// the colocated Redis for the fence, both over loopback.
+pub fn spawn(
+    sentinel_port: u16,
+    redis_port: u16,
+    redis_password: String,
+    master_name: String,
+    private_domain: String,
+) {
     if disabled() {
         info!("quorum-sync: QUORUM_SYNC_DISABLED=1, watcher inactive");
         return;
@@ -279,12 +401,15 @@ pub fn spawn(sentinel_port: u16, master_name: String) {
 
     // Sentinel has no auth by default.
     let sentinel_url = format!("redis://127.0.0.1:{sentinel_port}");
+    let redis_url = format!("redis://:{redis_password}@127.0.0.1:{redis_port}");
 
     tokio::spawn(async move {
         loop {
-            let url = sentinel_url.clone();
+            let surl = sentinel_url.clone();
+            let rurl = redis_url.clone();
             let name = master_name.clone();
-            let handle = tokio::task::spawn(async move { run(url, name, cfg).await });
+            let domain = private_domain.clone();
+            let handle = tokio::task::spawn(async move { run(surl, rurl, name, domain, cfg).await });
             match handle.await {
                 Ok(()) => warn!("quorum-sync: run loop returned cleanly — respawning in 5s"),
                 Err(e) if e.is_panic() => {
@@ -297,19 +422,58 @@ pub fn spawn(sentinel_port: u16, master_name: String) {
     });
 }
 
-async fn run(sentinel_url: String, master_name: String, cfg: WatcherConfig) {
+/// Retrofit a preserved sentinel.conf (written by an image predating
+/// `sentinel announce-ip`, and never regenerated — Sentinel owns the file
+/// after first boot) at runtime: without it this Sentinel keeps gossiping
+/// its container IP, which changes on every redeploy and can never satisfy
+/// the deletion probe on peers. `SENTINEL CONFIG SET` is persisted by
+/// Sentinel's own conf rewrite, peers absorb the address switch keyed by
+/// runid, and on a fresh conf that already carries both directives this is
+/// a literal no-op. Best-effort: a failure leaves the probe's IP-literal
+/// guard as the backstop.
+async fn ensure_announce_identity(sentinel_url: &str, private_domain: &str) {
+    let Some(mut conn) = crate::sentinel_query::connect(sentinel_url, CALL_DEADLINE).await else {
+        warn!("quorum-sync: sentinel unreachable for the announce-identity retrofit");
+        return;
+    };
+    for (key, value) in [
+        ("announce-hostnames", "yes"),
+        ("announce-ip", private_domain),
+    ] {
+        if let Err(e) = redis::cmd("SENTINEL")
+            .arg("CONFIG")
+            .arg("SET")
+            .arg(key)
+            .arg(value)
+            .query_async::<()>(&mut conn)
+            .await
+        {
+            warn!(error = %e, key, "quorum-sync: SENTINEL CONFIG SET failed");
+        }
+    }
+}
+
+async fn run(
+    sentinel_url: String,
+    redis_url: String,
+    master_name: String,
+    private_domain: String,
+    cfg: WatcherConfig,
+) {
     let mut state = WatcherState::default();
     // Give Sentinel its startup head start instead of logging a guaranteed
     // connection failure on the first poll.
     sleep(Duration::from_secs(cfg.poll_secs)).await;
+    ensure_announce_identity(&sentinel_url, &private_domain).await;
     loop {
-        iteration(&sentinel_url, &master_name, &mut state, &cfg).await;
+        iteration(&sentinel_url, &redis_url, &master_name, &mut state, &cfg).await;
         sleep(Duration::from_secs(cfg.poll_secs)).await;
     }
 }
 
 async fn iteration(
     sentinel_url: &str,
+    redis_url: &str,
     master_name: &str,
     state: &mut WatcherState,
     cfg: &WatcherConfig,
@@ -378,7 +542,88 @@ async fn iteration(
         set_quorum(&mut conn, master_name, current_quorum, new_quorum, live_others, state).await;
     }
 
+    sync_fence(redis_url, peers.len() as u32, state, cfg, now).await;
+
     prune_dead_sentinels(&mut conn, master_name, &peers, &master_fields, state, cfg, now).await;
+}
+
+/// Converge the local Redis's `min-replicas-to-write` to majority − 1 of the
+/// KNOWN membership, behind the same dwell as the quorum. Runs on every node
+/// — the fence is inert on a replica and live the moment Sentinel promotes
+/// it, the same reason every node carries masterauth.
+async fn sync_fence(
+    redis_url: &str,
+    known_others: u32,
+    state: &mut WatcherState,
+    cfg: &WatcherConfig,
+    now: i64,
+) {
+    let Some(mut conn) = crate::sentinel_query::connect(redis_url, CALL_DEADLINE).await else {
+        // No Redis, no opinion — and no stale window either.
+        state.fence_drift = None;
+        return;
+    };
+
+    let reply: Vec<String> = match redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("min-replicas-to-write")
+        .query_async(&mut conn)
+        .await
+    {
+        Ok(reply) => reply,
+        Err(e) => {
+            warn!(error = %e, "quorum-sync: CONFIG GET min-replicas-to-write failed");
+            state.fence_drift = None;
+            return;
+        }
+    };
+    let Some(current) = field_value(&reply, "min-replicas-to-write").and_then(|v| v.parse().ok())
+    else {
+        warn!("quorum-sync: no min-replicas-to-write in CONFIG GET reply");
+        state.fence_drift = None;
+        return;
+    };
+
+    let desired = desired_fence(known_others);
+
+    let had_drift = state.fence_drift.is_some();
+    let (next_drift, set_now) =
+        step_drift(current, desired, state.fence_drift, now, cfg.dwell_secs);
+    state.fence_drift = next_drift;
+
+    if let (false, Some(d)) = (had_drift, state.fence_drift.as_ref()) {
+        info!(
+            current_fence = current,
+            desired = d.desired,
+            known_sentinels = known_others + 1,
+            dwell_secs = cfg.dwell_secs,
+            "quorum-sync: fence is not majority − 1 of the known sentinels — dwell started"
+        );
+    }
+
+    let Some(new_fence) = set_now else { return };
+    match redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("min-replicas-to-write")
+        .arg(new_fence)
+        .query_async::<()>(&mut conn)
+        .await
+    {
+        Ok(()) => {
+            info!(
+                old = current,
+                new = new_fence,
+                known_sentinels = known_others + 1,
+                "quorum-sync: updated min-replicas-to-write to majority − 1 of the known sentinels"
+            );
+            state.fence_drift = None;
+        }
+        Err(e) => {
+            // Keep the window: the next poll retries immediately, dwell
+            // already served.
+            warn!(error = %e, "quorum-sync: CONFIG SET min-replicas-to-write failed");
+        }
+    }
 }
 
 async fn set_quorum(
@@ -431,7 +676,35 @@ async fn prune_dead_sentinels(
         return;
     }
     let due = step_prune(peers, &mut state.down_since, now, cfg.prune_dwell_secs);
+
+    // Probe every s_down peer's announced hostname and advance the
+    // continuous-NXDOMAIN windows on every poll, not just once the sdown
+    // dwell is served — deletion evidence accumulates in parallel with it.
+    let mut verdicts = Vec::new();
+    for peer in peers.iter().filter(|p| p.s_down) {
+        let verdict = if peer.host.is_empty() {
+            crate::dns_probe::NameVerdict::ExistsOrUnknown
+        } else {
+            crate::dns_probe::probe_name(&peer.host, PROBE_DEADLINE).await
+        };
+        verdicts.push((peer.id.clone(), verdict));
+    }
+    step_gone(&verdicts, &mut state.gone_since, now);
+
     if !due {
+        return;
+    }
+    if !live_is_majority_of_known(peers)
+        && !all_sdown_peers_gone_past_dwell(peers, &state.gone_since, now, cfg.prune_dwell_secs)
+    {
+        // The peers due for pruning may be the majority side of a partition,
+        // not removed nodes — forgetting them would shrink the fence until
+        // this node's master re-admitted writes the other side has already
+        // failed over past. The windows stay open; a real scale-down passes
+        // this gate as soon as the survivors are the majority of what's left,
+        // and a deleted majority (a multi-pair scale-down like 7→3) passes
+        // once every missing peer has answered NXDOMAIN for the whole dwell —
+        // the one proof that there is no other side to fail over to.
         return;
     }
     if !master_is_healthy(master_fields) {
@@ -469,6 +742,7 @@ async fn prune_dead_sentinels(
             // stays forgotten, one that was merely slow re-registers via
             // gossip within seconds and never re-enters a window.
             state.down_since.clear();
+            state.gone_since.clear();
         }
         Err(e) => {
             warn!(error = %e, "quorum-sync: SENTINEL RESET failed");
@@ -492,6 +766,156 @@ mod desired_tests {
         assert_eq!(desired_quorum(3), Some(3)); // 4 sentinels
         assert_eq!(desired_quorum(4), Some(3)); // 5 sentinels
         assert_eq!(desired_quorum(6), Some(4)); // 7 sentinels
+    }
+
+    #[test]
+    fn fence_alone_means_no_opinion() {
+        assert_eq!(desired_fence(0), None);
+    }
+
+    #[test]
+    fn fence_is_majority_minus_one_of_the_known_membership() {
+        assert_eq!(desired_fence(1), Some(1)); // 2 known
+        assert_eq!(desired_fence(2), Some(1)); // 3 known
+        assert_eq!(desired_fence(4), Some(2)); // 5 known
+        assert_eq!(desired_fence(6), Some(3)); // 7 known
+    }
+}
+
+#[cfg(test)]
+mod prune_gate_tests {
+    use super::*;
+
+    fn peer(id: &str, s_down: bool) -> PeerSentinel {
+        PeerSentinel {
+            id: id.to_string(),
+            s_down,
+            host: format!("{id}.railway.internal"),
+        }
+    }
+
+    // 5→3 scale-down: 3 live of 5 known — a real removal may be forgotten.
+    #[test]
+    fn a_live_majority_may_prune() {
+        let peers = [
+            peer("a", false),
+            peer("b", false),
+            peer("c", true),
+            peer("d", true),
+        ];
+        assert!(live_is_majority_of_known(&peers));
+    }
+
+    // The minority side of a 5-node partition (this node + one peer): the
+    // sdown peers are the live majority, not removed nodes.
+    #[test]
+    fn a_live_minority_may_not_prune() {
+        let peers = [
+            peer("a", false),
+            peer("b", true),
+            peer("c", true),
+            peer("d", true),
+        ];
+        assert!(!live_is_majority_of_known(&peers));
+    }
+
+    // A fully isolated node (every peer sdown) must never forget the cluster.
+    #[test]
+    fn an_isolated_node_may_not_prune() {
+        let peers = [peer("a", true), peer("b", true)];
+        assert!(!live_is_majority_of_known(&peers));
+    }
+
+    // Exactly half is not a majority: 2 live of 4 known blocks.
+    #[test]
+    fn exactly_half_is_not_a_majority() {
+        let peers = [peer("a", false), peer("b", true), peer("c", true)];
+        assert!(!live_is_majority_of_known(&peers));
+    }
+}
+
+#[cfg(test)]
+mod gone_waiver_tests {
+    use super::*;
+    use crate::dns_probe::NameVerdict::{ExistsOrUnknown, Gone};
+    use std::collections::HashMap;
+
+    const DWELL: u64 = 1800;
+
+    fn peer(id: &str, s_down: bool) -> PeerSentinel {
+        PeerSentinel {
+            id: id.to_string(),
+            s_down,
+            host: format!("{id}.railway.internal"),
+        }
+    }
+
+    #[test]
+    fn a_gone_verdict_opens_and_keeps_a_window() {
+        let mut gone = HashMap::new();
+        step_gone(&[("a".into(), Gone)], &mut gone, 1000);
+        step_gone(&[("a".into(), Gone)], &mut gone, 2000);
+        assert_eq!(gone.get("a"), Some(&1000));
+    }
+
+    #[test]
+    fn any_other_verdict_deletes_the_window() {
+        let mut gone = HashMap::from([("a".to_string(), 1000_i64)]);
+        step_gone(&[("a".into(), ExistsOrUnknown)], &mut gone, 2000);
+        assert!(gone.is_empty());
+        // And so does dropping out of the s_down set entirely.
+        let mut gone = HashMap::from([("a".to_string(), 1000_i64)]);
+        step_gone(&[], &mut gone, 2000);
+        assert!(gone.is_empty());
+    }
+
+    // The 7→3 case: every missing peer NXDOMAIN for the whole dwell.
+    #[test]
+    fn waiver_passes_when_every_sdown_peer_is_gone_past_the_dwell() {
+        let peers = [
+            peer("live", false),
+            peer("b", true),
+            peer("c", true),
+            peer("d", true),
+        ];
+        let gone = HashMap::from([
+            ("b".to_string(), 1000_i64),
+            ("c".to_string(), 1200_i64),
+            ("d".to_string(), 1400_i64),
+        ]);
+        assert!(all_sdown_peers_gone_past_dwell(
+            &peers,
+            &gone,
+            1400 + DWELL as i64,
+            DWELL
+        ));
+        // One window still short of the dwell blocks it.
+        assert!(!all_sdown_peers_gone_past_dwell(
+            &peers,
+            &gone,
+            1200 + DWELL as i64,
+            DWELL
+        ));
+    }
+
+    // The partition case: one missing peer still resolves — it may be the
+    // majority side mid-failover, so the waiver must veto.
+    #[test]
+    fn waiver_fails_while_any_sdown_peer_still_resolves() {
+        let peers = [peer("live", false), peer("b", true), peer("c", true)];
+        let gone = HashMap::from([("b".to_string(), 1000_i64)]);
+        assert!(!all_sdown_peers_gone_past_dwell(&peers, &gone, 999_999, DWELL));
+    }
+
+    #[test]
+    fn waiver_needs_at_least_one_sdown_peer() {
+        let peers = [peer("live", false)];
+        assert!(!all_sdown_peers_gone_past_dwell(
+            &peers,
+            &HashMap::new(),
+            999_999,
+            DWELL
+        ));
     }
 }
 
@@ -634,6 +1058,7 @@ mod prune_tests {
         PeerSentinel {
             id: id.to_string(),
             s_down,
+            host: format!("{id}.railway.internal"),
         }
     }
 

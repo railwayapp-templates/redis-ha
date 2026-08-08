@@ -86,6 +86,20 @@ fn replicate_from(config: &Config, boot_master: &BootMaster) -> Option<(String, 
     }
 }
 
+/// The split-brain fence for a cluster whose sentinel majority is `quorum`:
+/// majority − 1, floored at 1 so the fence never switches itself off.
+///
+/// Why majority − 1 is exactly the safe value: in a partition, only the side
+/// holding a sentinel majority can elect a new master. The old master's side
+/// then holds at most (membership − majority) other nodes, i.e. at most
+/// majority − 2 replicas (odd membership) — strictly fewer than this fence
+/// requires, so it stops accepting writes. Any lower value re-opens the
+/// two-writer window; any higher value fences the master on replica crashes
+/// a failover could never be elected from anyway.
+pub fn min_replicas_to_write(sentinel_quorum: u32) -> u32 {
+    sentinel_quorum.saturating_sub(1).max(1)
+}
+
 pub fn generate_redis_conf(config: &Config, boot_master: &BootMaster) -> String {
     let adopting_rdb = needs_rdb_to_aof_migration(&config.data_dir);
 
@@ -119,17 +133,24 @@ pub fn generate_redis_conf(config: &Config, boot_master: &BootMaster) -> String 
     ];
 
     if config.sentinel_enabled {
-        // Split-brain fence: master stops accepting writes when it loses contact
-        // with all replicas for longer than min-replicas-max-lag seconds.
-        // Bounds the split-brain window on network partition to this lag rather
-        // than letting the isolated master accept writes indefinitely.
-        // 1 replica required — self-fences only when fully isolated.
+        // Split-brain fence: master stops accepting writes when the replicas
+        // still acking it drop below the count a majority-side partition
+        // would leave it. Sized from the stamped quorum (majority − 1): 1 on
+        // a 3-node cluster, 2 on 5, 3 on 7. A fixed 1 only fences a FULLY
+        // isolated master — on a 5-node cluster a partition that traps one
+        // replica with the old master leaves both sides writable until the
+        // network heals, and everything the old side accepted is discarded.
+        // The quorum-sync watcher keeps this converged with the live
+        // membership at runtime; this is the boot-time stamp.
         //
         // HA boots only: a standalone boot (SENTINEL_ENABLED unset — e.g. a
         // root whose HA template was reverted, which keeps this image) has no
         // replicas by definition, so the fence would permanently reject every
         // write with NOREPLICAS.
-        lines.push("min-replicas-to-write 1".to_string());
+        lines.push(format!(
+            "min-replicas-to-write {}",
+            min_replicas_to_write(config.sentinel_quorum)
+        ));
         // Must be <= SENTINEL_DOWN_AFTER_MS (5s default) so the master goes
         // read-only around the same time Sentinel declares it ODOWN elsewhere.
         lines.push("min-replicas-max-lag 10".to_string());
@@ -364,6 +385,28 @@ mod tests {
         );
         assert!(conf.contains("min-replicas-to-write 1"));
         assert!(conf.contains("min-replicas-max-lag 10"));
+    }
+
+    // The fence follows the stamped quorum (majority − 1): a 5-node boot
+    // (SENTINEL_QUORUM=3) must require 2 acking replicas, or a partition
+    // that traps one replica with the old master leaves two writers.
+    #[test]
+    fn fence_scales_with_the_stamped_quorum() {
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path().to_str().unwrap());
+        config.sentinel_quorum = 3;
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(conf.contains("min-replicas-to-write 2"));
+    }
+
+    #[test]
+    fn min_replicas_is_majority_minus_one_floored_at_one() {
+        assert_eq!(min_replicas_to_write(2), 1); // 3-node cluster
+        assert_eq!(min_replicas_to_write(3), 2); // 5-node cluster
+        assert_eq!(min_replicas_to_write(4), 3); // 7-node cluster
+        // Degenerate stamps never disable the fence outright.
+        assert_eq!(min_replicas_to_write(1), 1);
+        assert_eq!(min_replicas_to_write(0), 1);
     }
 
     // Regression: a standalone boot (SENTINEL_ENABLED unset — the state a
