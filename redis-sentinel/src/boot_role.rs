@@ -119,6 +119,37 @@ fn addr_is_self(config: &Config, host: &str, port: u16) -> bool {
     port == config.redis_port && normalize_host(host) == normalize_host(&config.private_domain)
 }
 
+/// Hostnames the current deployment declares as cluster members: every
+/// `SENTINEL_HOSTS` entry, this node itself, and the env-declared initial
+/// master.
+///
+/// This is the boundary of the world that exists NOW. Persisted or gossiped
+/// state naming a master outside it describes a topology that is gone — a
+/// volume reused across a template revert, scale-down, or re-conversion
+/// still carries sentinel state for nodes that were deleted, and resuming it
+/// makes every node a replica of a ghost. A real failover can only ever
+/// promote a declared member, so a member master is always preserved.
+pub(crate) fn declared_hosts(config: &Config) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    let candidates = config
+        .sentinel_hosts
+        .split(',')
+        .map(|peer| peer.trim().split(':').next().unwrap_or("").to_string())
+        .chain([config.private_domain.clone(), config.initial_master_host()]);
+    for candidate in candidates {
+        let normalized = normalize_host(&candidate);
+        if !normalized.is_empty() && !hosts.contains(&normalized) {
+            hosts.push(normalized);
+        }
+    }
+    hosts
+}
+
+/// Whether a recorded master host is a member of the declared topology.
+pub(crate) fn master_is_declared(config: &Config, host: &str) -> bool {
+    declared_hosts(config).contains(&normalize_host(host))
+}
+
 /// Read `<data_dir>/sentinel.conf` and turn its `sentinel monitor` line into
 /// the role this boot has to start in.
 pub fn resolve_boot_master(config: &Config) -> BootMaster {
@@ -151,6 +182,37 @@ pub fn resolve_boot_master(config: &Config) -> BootMaster {
     } else {
         BootMaster::ReplicaOf(host, port)
     }
+}
+
+/// [`resolve_boot_master`] plus the declared-topology validation: local state
+/// whose master isn't any declared member is state from a dead world, so it
+/// is quarantined (renamed aside, never deleted) and this boot proceeds as if
+/// it had none — the peer query / env fallback re-anchor the node to the
+/// topology that actually exists. With the stale file moved aside, the
+/// wrapper's write-if-absent regenerates a fresh sentinel.conf, so the local
+/// Sentinel doesn't resume monitoring the ghost either.
+pub(crate) fn local_boot_master(config: &Config) -> BootMaster {
+    let resolved = resolve_boot_master(config);
+    let BootMaster::ReplicaOf(host, port) = &resolved else {
+        // Self is a declared member by definition; no-state has nothing to
+        // validate.
+        return resolved;
+    };
+    if master_is_declared(config, host) {
+        return resolved;
+    }
+    warn!(
+        master = %format!("{host}:{port}"),
+        declared = ?declared_hosts(config),
+        "sentinel.conf names a master outside the declared topology — \
+         quarantining the stale state and re-resolving"
+    );
+    match crate::sentinel_conf::quarantine_ghost_sentinel_conf(&config.data_dir) {
+        Ok(Some(ghost)) => info!(to = %ghost.display(), "moved ghost sentinel.conf aside"),
+        Ok(None) => {}
+        Err(err) => warn!(error = %err, "failed to move ghost sentinel.conf aside"),
+    }
+    BootMaster::NoLocalState
 }
 
 /// True when the resolved role contradicts what `REPLICA_OF` alone would have
@@ -293,7 +355,11 @@ async fn query_peer_sentinels(config: &Config) -> Option<(String, u16)> {
 ///
 /// Resolution order:
 ///  1. Local `sentinel.conf` — the last thing this node's own Sentinel
-///     observed. Survives restarts; wins whenever it exists.
+///     observed. Survives restarts; wins whenever it exists AND its master
+///     is a declared member ([`master_is_declared`]). A master outside the
+///     declared topology is state from a dead world — a volume reused
+///     across a revert/scale-down/re-conversion — and is quarantined
+///     instead of resumed (see [`local_boot_master`]).
 ///  2. Peer Sentinels — a node with no local state (first boot: a fresh
 ///     volume, a node newly added by a scale-up) asks the cluster it is
 ///     joining instead of trusting the env topology, which names whoever was
@@ -314,7 +380,7 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootMaster {
         info!("boot role: from env topology ({}=false)", BOOT_ROLE_ENV);
         return BootMaster::NoLocalState;
     }
-    let resolved = resolve_boot_master(config);
+    let resolved = local_boot_master(config);
     if !matches!(resolved, BootMaster::NoLocalState) {
         info!("{}", boot_role_log_line(config, &resolved));
         return resolved;
@@ -322,17 +388,32 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootMaster {
 
     if enabled(std::env::var(PEER_BOOT_ENV).ok().as_deref()) {
         if let Some((host, port)) = query_peer_sentinels(config).await {
-            match boot_master_from_peer_answer(config, host, port) {
-                Some(resolved) => {
-                    if let BootMaster::ReplicaOf(host, port) = &resolved {
-                        info!("boot role: replica of {}:{} (from peer sentinels)", host, port);
+            // A peer can be resuming the same dead world this node just
+            // refused (mid scale-down, or a whole cluster rebooting on
+            // reused volumes) — its answer gets the same declared-topology
+            // bar as local state.
+            if !master_is_declared(config, &host) {
+                info!(
+                    "peer sentinels name {}:{} as master — outside the declared topology; \
+                     falling back to the env topology",
+                    host, port
+                );
+            } else {
+                match boot_master_from_peer_answer(config, host, port) {
+                    Some(resolved) => {
+                        if let BootMaster::ReplicaOf(host, port) = &resolved {
+                            info!(
+                                "boot role: replica of {}:{} (from peer sentinels)",
+                                host, port
+                            );
+                        }
+                        return resolved;
                     }
-                    return resolved;
+                    None => info!(
+                        "peer sentinels name this node as master, but this is a first boot with no \
+                         local dataset — falling back to the env topology rather than self-promoting"
+                    ),
                 }
-                None => info!(
-                    "peer sentinels name this node as master, but this is a first boot with no \
-                     local dataset — falling back to the env topology rather than self-promoting"
-                ),
             }
         } else {
             info!("no peer sentinel answered — falling back to the env topology");
@@ -677,6 +758,106 @@ mod tests {
             resolve_boot_master(&config),
             BootMaster::ReplicaOf("redis-2".to_string(), 6379)
         );
+    }
+
+    // --- declared_hosts / master_is_declared ---
+
+    fn cluster_config_at(dir: &std::path::Path) -> Config {
+        let mut config = config_at(dir);
+        config.private_domain = "redis-1.railway.internal".to_string();
+        config.sentinel_hosts = concat!(
+            "redis-1.railway.internal:26379,",
+            "redis-2.railway.internal:26379,",
+            "redis-3.railway.internal:26379"
+        )
+        .to_string();
+        config
+    }
+
+    #[test]
+    fn declared_hosts_cover_peers_self_and_the_env_master() {
+        let dir = tempdir().unwrap();
+        let mut config = cluster_config_at(dir.path());
+        config.replica_of = "Redis-9.railway.internal.:6379".to_string();
+        let hosts = declared_hosts(&config);
+        assert!(hosts.contains(&"redis-1.railway.internal".to_string()));
+        assert!(hosts.contains(&"redis-2.railway.internal".to_string()));
+        assert!(hosts.contains(&"redis-3.railway.internal".to_string()));
+        // The env-declared master counts even when SENTINEL_HOSTS omits it.
+        assert!(hosts.contains(&"redis-9.railway.internal".to_string()));
+        assert_eq!(hosts.len(), 4);
+    }
+
+    #[test]
+    fn membership_is_normalized() {
+        let dir = tempdir().unwrap();
+        let config = cluster_config_at(dir.path());
+        assert!(master_is_declared(&config, "Redis-2.Railway.Internal."));
+        assert!(!master_is_declared(&config, "redis-4.railway.internal"));
+    }
+
+    // --- local_boot_master: the declared-topology bar ---
+
+    #[test]
+    fn a_declared_master_is_preserved_along_with_the_conf() {
+        // A real failover target is always a declared member — the
+        // validation must never touch that state.
+        let dir = tempdir().unwrap();
+        let config = cluster_config_at(dir.path());
+        write_sentinel_conf(
+            dir.path(),
+            "sentinel monitor mymaster redis-2.railway.internal 6379 2\n",
+        );
+        assert_eq!(
+            local_boot_master(&config),
+            BootMaster::ReplicaOf("redis-2.railway.internal".to_string(), 6379)
+        );
+        assert!(dir.path().join("sentinel.conf").exists());
+    }
+
+    #[test]
+    fn a_ghost_master_is_refused_and_the_conf_quarantined() {
+        // The reused-volume case: sentinel state from a deleted world (a
+        // scale-up later reverted) names a master no declared member ever
+        // heard of. Resuming it would strand the node as a replica of a
+        // ghost; instead the state is moved aside — preserved, not deleted —
+        // and this boot proceeds with no local state.
+        let dir = tempdir().unwrap();
+        let config = cluster_config_at(dir.path());
+        write_sentinel_conf(
+            dir.path(),
+            "sentinel monitor mymaster redis-4.railway.internal 6379 2\n",
+        );
+        assert_eq!(local_boot_master(&config), BootMaster::NoLocalState);
+        assert!(!dir.path().join("sentinel.conf").exists());
+        let quarantined: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("sentinel.conf.ghost-")
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(
+            fs::read_to_string(quarantined[0].path()).unwrap(),
+            "sentinel monitor mymaster redis-4.railway.internal 6379 2\n"
+        );
+    }
+
+    #[test]
+    fn self_and_no_state_pass_through_untouched() {
+        let dir = tempdir().unwrap();
+        let config = cluster_config_at(dir.path());
+        assert_eq!(local_boot_master(&config), BootMaster::NoLocalState);
+
+        write_sentinel_conf(
+            dir.path(),
+            "sentinel monitor mymaster redis-1.railway.internal 6379 2\n",
+        );
+        assert_eq!(local_boot_master(&config), BootMaster::SelfIsMaster);
+        assert!(dir.path().join("sentinel.conf").exists());
     }
 
     // --- overrides_env_topology / log line ---
