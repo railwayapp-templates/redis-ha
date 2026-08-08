@@ -33,10 +33,15 @@
 //! only local answer that survives a cold start.
 //!
 //! ## Fallbacks
-//! Missing, unreadable or unparseable file → [`BootMaster::NoLocalState`], and
-//! the env topology is used exactly as before. That is the first-boot path
-//! (the file we are about to write carries the env-declared master anyway), so
-//! fresh clusters are unaffected.
+//! Missing, unreadable or unparseable file → [`BootMaster::NoLocalState`].
+//! That is the first-boot path — but "first boot" does not mean "fresh
+//! cluster": a node added by a scale-up, or one whose volume was replaced,
+//! first-boots into a cluster that may have failed over long ago, and the
+//! env topology would attach it to a demoted ex-master no Sentinel would
+//! ever repoint (Sentinel only learns replicas from the master's INFO). So
+//! a first boot asks the peer Sentinels from `SENTINEL_HOSTS` who the
+//! master currently is, and only a cluster where no peer answers — a
+//! genuinely fresh one — falls back to the env topology.
 //!
 //! ## Limits
 //! This is local state, not consensus. A node that was *down* for the whole
@@ -101,7 +106,7 @@ pub fn parse_sentinel_monitor(contents: &str, master_name: &str) -> Option<(Stri
 /// DNS names are case-insensitive and a fully-qualified name may carry a
 /// trailing root dot; `redis-2.railway.internal.` and `Redis-2.railway.internal`
 /// are the same host.
-fn normalize_host(host: &str) -> String {
+pub(crate) fn normalize_host(host: &str) -> String {
     host.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
@@ -191,9 +196,117 @@ fn enabled(raw: Option<&str>) -> bool {
     !matches!(raw.map(|v| v.trim().to_ascii_lowercase()), Some(v) if v == "false")
 }
 
-/// Resolve the role this boot starts in, honoring the kill switch, and log the
-/// decision. Standalone boots (no Sentinel) have no Sentinel state to consult.
-pub fn boot_master_for_this_boot(config: &Config) -> BootMaster {
+// ====================================================================
+// Peer-Sentinel boot query
+// ====================================================================
+
+/// Kill switch for the peer-Sentinel query on first boot. Same semantics as
+/// [`BOOT_ROLE_ENV`]: only the literal `false` disables it.
+pub const PEER_BOOT_ENV: &str = "BOOT_ROLE_FROM_PEER_SENTINELS";
+
+const DEFAULT_PEER_QUERY_TIMEOUT_MS: u64 = 2000;
+
+/// The Sentinel peers worth asking at boot: every `host:port` in
+/// `SENTINEL_HOSTS` except this node's own — its Sentinel is not running yet,
+/// and a self-answer would be circular anyway.
+pub(crate) fn peer_sentinel_addrs(config: &Config) -> Vec<(String, u16)> {
+    config
+        .sentinel_hosts
+        .split(',')
+        .filter_map(|peer| {
+            let peer = peer.trim();
+            let (host, port) = peer.split_once(':')?;
+            let port = port.parse::<u16>().ok()?;
+            if host.is_empty() || normalize_host(host) == normalize_host(&config.private_domain) {
+                return None;
+            }
+            Some((host.to_string(), port))
+        })
+        .collect()
+}
+
+/// Pick the answer most peers agree on. Hosts are compared normalized so
+/// `Redis-2.railway.internal.` and `redis-2.railway.internal` count as one
+/// vote; a tie keeps the earliest-seen answer, which is as good as any —
+/// disagreement here means a failover is mid-flight and the topology heal
+/// converges whichever side we land on.
+pub(crate) fn majority_answer(answers: &[(String, u16)]) -> Option<(String, u16)> {
+    let mut tally: Vec<((String, u16), u32, &(String, u16))> = Vec::new();
+    for answer in answers {
+        let key = (normalize_host(&answer.0), answer.1);
+        match tally.iter_mut().find(|(k, _, _)| *k == key) {
+            Some((_, count, _)) => *count += 1,
+            None => tally.push((key, 1, answer)),
+        }
+    }
+    // Strictly-greater keeps the earliest-seen answer on a tie (`max_by_key`
+    // would keep the last).
+    let mut best: Option<(u32, &(String, u16))> = None;
+    for (_, count, original) in &tally {
+        if best.is_none_or(|(best_count, _)| *count > best_count) {
+            best = Some((*count, original));
+        }
+    }
+    best.map(|(_, original)| original.clone())
+}
+
+/// Ask every peer Sentinel who the master currently is, concurrently, each
+/// attempt bounded by `PEER_BOOT_QUERY_TIMEOUT_MS` (so boot stalls by at most
+/// one timeout even when every peer is down — the whole-cluster-first-boot
+/// case). Returns the majority answer, or `None` when no peer answered.
+async fn query_peer_sentinels(config: &Config) -> Option<(String, u16)> {
+    use common::ConfigExt;
+
+    let peers = peer_sentinel_addrs(config);
+    if peers.is_empty() {
+        return None;
+    }
+    let deadline = std::time::Duration::from_millis(u64::env_parse(
+        "PEER_BOOT_QUERY_TIMEOUT_MS",
+        DEFAULT_PEER_QUERY_TIMEOUT_MS,
+    ));
+    let master_name = config.redis_master_name.clone();
+
+    let mut set = tokio::task::JoinSet::new();
+    for (host, port) in peers {
+        let master_name = master_name.clone();
+        set.spawn(async move {
+            // Sentinel has no auth by default.
+            let url = format!("redis://{host}:{port}");
+            let mut conn = crate::sentinel_query::connect(&url, deadline).await?;
+            crate::sentinel_query::get_master_addr(&mut conn, &master_name, deadline).await
+        });
+    }
+
+    let mut answers: Vec<(String, u16)> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok(Some(answer)) = joined {
+            answers.push(answer);
+        }
+    }
+    majority_answer(&answers)
+}
+
+/// Resolve the role this boot starts in, honoring the kill switches, and log
+/// the decision. Standalone boots (no Sentinel) have no Sentinel state to
+/// consult.
+///
+/// Resolution order:
+///  1. Local `sentinel.conf` — the last thing this node's own Sentinel
+///     observed. Survives restarts; wins whenever it exists.
+///  2. Peer Sentinels — a node with no local state (first boot: a fresh
+///     volume, a node newly added by a scale-up) asks the cluster it is
+///     joining instead of trusting the env topology, which names whoever was
+///     master when the template was stamped, not whoever is master now. A
+///     node that attaches to a demoted ex-master never appears in the real
+///     master's INFO, so Sentinel never learns it exists and can never
+///     `+fix-slave-config` it — the one wrong turn here that nothing
+///     downstream un-does (link_heal's wrong-master watch is the backstop).
+///     A peer answer naming THIS node is refused rather than obeyed — see
+///     [`boot_master_from_peer_answer`].
+///  3. Env topology — a genuinely fresh cluster where no peer answers, or a
+///     refused self-answer.
+pub async fn boot_master_for_this_boot(config: &Config) -> BootMaster {
     if !config.sentinel_enabled {
         return BootMaster::NoLocalState;
     }
@@ -202,8 +315,54 @@ pub fn boot_master_for_this_boot(config: &Config) -> BootMaster {
         return BootMaster::NoLocalState;
     }
     let resolved = resolve_boot_master(config);
+    if !matches!(resolved, BootMaster::NoLocalState) {
+        info!("{}", boot_role_log_line(config, &resolved));
+        return resolved;
+    }
+
+    if enabled(std::env::var(PEER_BOOT_ENV).ok().as_deref()) {
+        if let Some((host, port)) = query_peer_sentinels(config).await {
+            match boot_master_from_peer_answer(config, host, port) {
+                Some(resolved) => {
+                    if let BootMaster::ReplicaOf(host, port) = &resolved {
+                        info!("boot role: replica of {}:{} (from peer sentinels)", host, port);
+                    }
+                    return resolved;
+                }
+                None => info!(
+                    "peer sentinels name this node as master, but this is a first boot with no \
+                     local dataset — falling back to the env topology rather than self-promoting"
+                ),
+            }
+        } else {
+            info!("no peer sentinel answered — falling back to the env topology");
+        }
+    }
+
     info!("{}", boot_role_log_line(config, &resolved));
     resolved
+}
+
+/// What a peer answer means for the boot role. A peer naming another node is
+/// a replication target; a peer naming THIS node is refused (`None`).
+///
+/// Self-promotion off a peer answer would be actively dangerous: a first
+/// boot named master by its peers is the incumbent master coming back on a
+/// wiped or replaced volume, and `REPLICAOF NO ONE` there boots an EMPTY
+/// master that every data-bearing replica then full-syncs from — a
+/// cluster-wide wipe. The env fallback preserves today's behavior instead:
+/// a stale replica (or the env-declared master) that Sentinel's
+/// master-in-slave-role handling fails over to a replica that still has the
+/// data.
+pub(crate) fn boot_master_from_peer_answer(
+    config: &Config,
+    host: String,
+    port: u16,
+) -> Option<BootMaster> {
+    if addr_is_self(config, &host, port) {
+        return None;
+    }
+    Some(BootMaster::ReplicaOf(host, port))
 }
 
 #[cfg(test)]
@@ -211,6 +370,119 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    // --- peer_sentinel_addrs ---
+
+    #[test]
+    fn peer_addrs_exclude_self_and_junk() {
+        let mut config = Config::for_tests();
+        config.private_domain = "redis-1.railway.internal".to_string();
+        config.sentinel_hosts = concat!(
+            "redis-1.railway.internal:26379,",  // self — excluded
+            "Redis-2.railway.internal.:26379,", // normalization is on the self-check only
+            "redis-3.railway.internal:26379,",
+            "not-a-pair,",
+            ":26379,",
+            "redis-4.railway.internal:not-a-port,",
+            " "
+        )
+        .to_string();
+        assert_eq!(
+            peer_sentinel_addrs(&config),
+            vec![
+                ("Redis-2.railway.internal.".to_string(), 26379),
+                ("redis-3.railway.internal".to_string(), 26379),
+            ]
+        );
+    }
+
+    #[test]
+    fn self_exclusion_is_normalized() {
+        let mut config = Config::for_tests();
+        config.private_domain = "redis-1.railway.internal".to_string();
+        config.sentinel_hosts = "Redis-1.railway.internal.:26379".to_string();
+        assert_eq!(peer_sentinel_addrs(&config), vec![]);
+    }
+
+    // --- majority_answer ---
+
+    #[test]
+    fn majority_wins() {
+        let answers = vec![
+            ("redis-2.railway.internal".to_string(), 6379),
+            ("redis-1.railway.internal".to_string(), 6379),
+            ("redis-2.railway.internal".to_string(), 6379),
+        ];
+        assert_eq!(
+            majority_answer(&answers),
+            Some(("redis-2.railway.internal".to_string(), 6379))
+        );
+    }
+
+    #[test]
+    fn votes_are_counted_normalized() {
+        let answers = vec![
+            ("Redis-2.railway.internal.".to_string(), 6379),
+            ("redis-2.railway.internal".to_string(), 6379),
+            ("redis-1.railway.internal".to_string(), 6379),
+        ];
+        assert_eq!(
+            majority_answer(&answers),
+            Some(("Redis-2.railway.internal.".to_string(), 6379))
+        );
+    }
+
+    #[test]
+    fn a_tie_keeps_the_earliest_answer() {
+        let answers = vec![
+            ("redis-1.railway.internal".to_string(), 6379),
+            ("redis-2.railway.internal".to_string(), 6379),
+        ];
+        assert_eq!(
+            majority_answer(&answers),
+            Some(("redis-1.railway.internal".to_string(), 6379))
+        );
+    }
+
+    #[test]
+    fn no_answers_is_none() {
+        assert_eq!(majority_answer(&[]), None);
+    }
+
+    // --- boot_master_from_peer_answer ---
+
+    #[test]
+    fn a_peer_answer_naming_another_node_is_a_replication_target() {
+        let config = Config::for_tests(); // self = redis-1.railway.internal:6379
+        assert_eq!(
+            boot_master_from_peer_answer(&config, "redis-2.railway.internal".to_string(), 6379),
+            Some(BootMaster::ReplicaOf(
+                "redis-2.railway.internal".to_string(),
+                6379
+            ))
+        );
+    }
+
+    #[test]
+    fn a_peer_answer_naming_this_node_is_refused() {
+        let config = Config::for_tests();
+        assert_eq!(
+            boot_master_from_peer_answer(&config, "Redis-1.railway.internal.".to_string(), 6379),
+            None
+        );
+    }
+
+    #[test]
+    fn a_peer_answer_naming_this_host_on_another_port_is_still_a_target() {
+        let config = Config::for_tests();
+        assert_eq!(
+            boot_master_from_peer_answer(&config, "redis-1.railway.internal".to_string(), 6380),
+            Some(BootMaster::ReplicaOf(
+                "redis-1.railway.internal".to_string(),
+                6380
+            ))
+        );
+    }
 
     // --- parse_sentinel_monitor ---
 

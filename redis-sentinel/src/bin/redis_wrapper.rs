@@ -17,6 +17,7 @@ use redis_sentinel::{
     health_server::run_health_server,
     link_heal,
     process_manager::{enable_aof_after_rdb_load, spawn_redis, spawn_sentinel, supervise},
+    quorum,
     redis_conf::{
         generate_redis_conf, needs_rdb_to_aof_migration, quarantine_manifestless_aof_dir,
     },
@@ -72,12 +73,13 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&config.data_dir)
         .context("failed to create data directory")?;
 
-    // Who is master right now, according to the only local record of it that
-    // survives a restart: the sentinel.conf Sentinel itself rewrites after
-    // every failover. Read before the conf is regenerated, because the
-    // regenerated conf is what would otherwise re-impose the deploy-time
-    // topology on a node Sentinel has since promoted or demoted.
-    let boot_master = boot_master_for_this_boot(&config);
+    // Who is master right now, according to the best record available at
+    // boot: the sentinel.conf Sentinel itself rewrites after every failover,
+    // or — on a first boot with no local state — the answer of the peer
+    // Sentinels this node is joining. Read before the conf is regenerated,
+    // because the regenerated conf is what would otherwise re-impose the
+    // deploy-time topology on a node Sentinel has since promoted or demoted.
+    let boot_master = boot_master_for_this_boot(&config).await;
 
     // Always regenerate redis.conf so env-var changes take effect on restart.
     let redis_conf_path = format!("{}/redis.conf", config.data_dir);
@@ -89,7 +91,7 @@ async fn main() -> Result<()> {
     // Only write sentinel.conf on first boot — Sentinel owns it after that.
     let sentinel_conf_path = format!("{}/sentinel.conf", config.data_dir);
     if config.sentinel_enabled && !Path::new(&sentinel_conf_path).exists() {
-        let sentinel_conf = generate_sentinel_conf(&config);
+        let sentinel_conf = generate_sentinel_conf(&config, &boot_master);
         fs::write(&sentinel_conf_path, &sentinel_conf)
             .context("failed to write sentinel.conf")?;
         fs::set_permissions(&sentinel_conf_path, fs::Permissions::from_mode(0o600))
@@ -166,9 +168,10 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Local self-heal for a replica whose link to the master is durably down
-    // — only meaningful with Sentinel colocated, since it is Sentinel's
-    // answer that supplies the authoritative fix target.
+    // Local self-heal for a replica whose replication link is durably down
+    // or durably attached to the wrong master — only meaningful with
+    // Sentinel colocated, since it is Sentinel's answer that supplies the
+    // authoritative fix target.
     if config.sentinel_enabled {
         link_heal::spawn(
             config.data_dir.clone(),
@@ -178,6 +181,9 @@ async fn main() -> Result<()> {
             config.redis_master_name.clone(),
             telemetry,
         );
+        // Keep this Sentinel's odown quorum a majority of the Sentinels it
+        // actually knows, so scale changes converge without a conf rewrite.
+        quorum::spawn(config.sentinel_port, config.redis_master_name.clone());
     }
 
     // Block until a process exits or we receive a signal

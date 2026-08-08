@@ -79,13 +79,16 @@ Key variables on the Redis nodes (set on Redis-1, referenced by replicas):
 |---|---|---|
 | `REDIS_PASSWORD` | `${{secret(64)}}` | Auth — applied to requirepass, masterauth, sentinel auth-pass |
 | `REDIS_MASTER_NAME` | `mymaster` | Sentinel master set name |
-| `SENTINEL_QUORUM` | `2` | Votes needed to elect a new master |
+| `SENTINEL_QUORUM` | `2` | Seed for the odown quorum on first boot. At runtime each node keeps its own Sentinel's quorum at a strict majority of the Sentinels it actually knows (see Self-healing), so this only matters until gossip discovery settles |
 | `SENTINEL_DOWN_AFTER_MS` | `5000` | MS before a node is considered down |
 | `SENTINEL_FAILOVER_TIMEOUT_MS` | `30000` | Failover abort timeout |
 | `REDIS_MIN_REPLICAS_TO_WRITE` | `1` | Master disables writes when fewer healthy replicas |
 | `REDIS_MIN_REPLICAS_MAX_LAG` | `10` | Replica lag threshold (seconds) |
 | `REDIS_APPENDONLY` | `yes` | AOF persistence (required — see notes) |
 | `BOOT_ROLE_FROM_SENTINEL_STATE` | `true` | Take the boot role from Sentinel's own `sentinel.conf` instead of `REPLICA_OF`. Set to `false` to pin every boot to the deploy-time topology |
+| `BOOT_ROLE_FROM_PEER_SENTINELS` | `true` | On a first boot (no local Sentinel state), ask the peer Sentinels in `SENTINEL_HOSTS` who the master currently is before trusting `REPLICA_OF`. Set to `false` to disable the query |
+| `QUORUM_SYNC_DISABLED` | unset | Set to `1` to stop the watcher that keeps the local Sentinel's quorum at a majority of the known Sentinels |
+| `LINK_HEAL_DISABLED` | unset | Set to `1` to stop the replication-link self-heal watcher |
 
 ### Boot role
 
@@ -94,6 +97,15 @@ Key variables on the Redis nodes (set on Redis-1, referenced by replicas):
 Sentinel already records the current master on the same volume: it owns `sentinel.conf` after first boot and rewrites its `sentinel monitor` line after every failover. Each node reads that line at startup and boots into the role it names, falling back to `REPLICA_OF` when there is no readable local state (first boot, fresh volume). The decision is logged as a single `boot role:` line, which calls out an override of `REPLICA_OF` explicitly.
 
 A node that was down for the whole failover never saw the switch, so its `sentinel.conf` still names itself and it comes back as a master — Sentinel demotes it within one failover timeout, as it does today.
+
+A node with no local state at all — a scale-up addition, a replaced volume — asks the peer Sentinels in `SENTINEL_HOSTS` who the master currently is (`BOOT_ROLE_FROM_PEER_SENTINELS`) before falling back to `REPLICA_OF`. The env topology names whoever was master when the template was stamped; a cluster that failed over since would otherwise receive the new node as an invisible chained sub-replica of a demoted ex-master. The answer is only ever used as a replication target: a peer answer naming the booting node itself (the incumbent master coming back on a wiped volume) is refused, because self-promoting an empty dataset would make every data-bearing replica full-sync from it.
+
+## Self-healing
+
+Beyond boot-time role resolution, two watchers run on every Sentinel-managed node:
+
+- **link-heal** repoints a replica whose replication link is durably broken (`REPLICAOF` reissued at Sentinel's answer), completes a promotion whose `REPLICAOF NO ONE` never landed, and — the case Sentinel structurally cannot fix — repoints a replica attached to the *wrong* master over a healthy link. Sentinel only learns replicas from the master's `INFO`, so a node chained behind a demoted ex-master is invisible to it forever; the watcher compares the replica's own attachment against `SENTINEL get-master-addr-by-name` and acts once the disagreement outlives `LINK_HEAL_WRONG_MASTER_DWELL_SECONDS` (default 300).
+- **quorum-sync** keeps the local Sentinel's odown quorum at a strict majority of the Sentinels it actually gossips with (peers flagged `s_down` don't count, so scale-downs shrink it back). `sentinel.conf` otherwise freezes the first-boot quorum forever — after a 3→5 scale-up the original nodes would keep quorum 2 while the new ones write 3. Quorum only gates odown; failover authorization always needs a majority of all known Sentinels, so a transiently low value cannot enable a unilateral failover.
 
 ## Development
 
