@@ -1052,4 +1052,60 @@ mod tests {
         assert!(!enabled(Some(" false ")));
         assert!(!enabled(Some("False")));
     }
+
+    // --- standalone boots (SENTINEL_ENABLED unset) ---
+    //
+    // The state a root is left in after its HA template is reverted: still on
+    // this image, its volume still carrying sentinel.conf from the cluster
+    // days — possibly naming a node that is mid-teardown and, sharing the
+    // cluster's password, would even pass the membership probe. A boot that
+    // is declared standalone must not take a replication topology from any
+    // of it: no local-state read, no peer query, no quarantine.
+
+    #[tokio::test]
+    async fn standalone_boot_ignores_persisted_sentinel_state() {
+        let dir = tempdir().unwrap();
+        let mut config = Config::for_tests();
+        config.sentinel_enabled = false;
+        config.data_dir = dir.path().to_str().unwrap().to_string();
+        // A leftover peer list makes the persisted master a DECLARED member,
+        // which a sentinel-enabled boot would obey with no probe and no env
+        // read — so a regression here fails deterministically, without
+        // touching the network or the process environment.
+        config.sentinel_hosts = "redis-2.railway.internal:26379".to_string();
+        fs::write(
+            dir.path().join("sentinel.conf"),
+            "sentinel monitor mymaster redis-2.railway.internal 6379 2\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            boot_master_for_this_boot(&config).await,
+            BootMaster::NoLocalState
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_boot_leaves_dead_world_state_untouched() {
+        let dir = tempdir().unwrap();
+        let mut config = Config::for_tests();
+        config.sentinel_enabled = false;
+        config.data_dir = dir.path().to_str().unwrap().to_string();
+        config.sentinel_hosts = String::new();
+        // An undeclared master would be probed and then quarantined on an HA
+        // boot. The standalone gate returns before any of that machinery, so
+        // the file must survive byte-for-byte — it is still the cluster's
+        // last known state, and a later re-conversion is entitled to find it.
+        fs::write(
+            dir.path().join("sentinel.conf"),
+            "sentinel monitor mymaster redis-9.dead-world.invalid 6379 2\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            boot_master_for_this_boot(&config).await,
+            BootMaster::NoLocalState
+        );
+        assert!(dir.path().join("sentinel.conf").exists());
+    }
 }
