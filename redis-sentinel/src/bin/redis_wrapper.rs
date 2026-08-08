@@ -14,7 +14,7 @@ use common::{init_logging, RailwayEnv, Telemetry, TelemetryEvent};
 use redis_sentinel::{
     boot_role::{boot_master_for_this_boot, BootMaster},
     config::{data_dir_is_on_volume, Config},
-    health_server::run_health_server,
+    health_server,
     link_heal,
     process_manager::{enable_aof_after_rdb_load, spawn_redis, spawn_sentinel, supervise},
     quorum,
@@ -125,16 +125,20 @@ async fn main() -> Result<()> {
         String::new()
     };
 
-    // Start health HTTP server (non-blocking — runs in background)
-    let hp = config.health_port;
-    let rp = config.redis_port;
-    let sp = config.sentinel_port;
-    let pw = config.redis_password.clone();
-    let domain = config.private_domain.clone();
-    let hsp = local_sentinel_password.clone();
-    tokio::spawn(async move {
-        run_health_server(hp, rp, sp, pw, domain, hsp).await;
-    });
+    // Supervised health HTTP server: HAProxy's only signal for routing reads
+    // and writes, so an unsupervised task dying here silently pulls this
+    // node from BOTH backends forever (see health_server module docs).
+    // Mirrors link_heal/quorum's respawn shape rather than a bare spawn.
+    health_server::spawn(
+        config.health_port,
+        config.redis_port,
+        config.sentinel_port,
+        config.redis_password.clone(),
+        config.private_domain.clone(),
+        config.redis_master_name.clone(),
+        local_sentinel_password.clone(),
+        telemetry.clone(),
+    );
 
     // The role this boot actually starts in, which is the resolved one — not
     // the env-declared one it can now contradict.
