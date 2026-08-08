@@ -12,7 +12,10 @@
 use anyhow::{Context, Result};
 use common::{init_logging, RailwayEnv, Telemetry, TelemetryEvent};
 use redis_sentinel::{
-    boot_role::{boot_master_for_this_boot, BootMaster},
+    boot_role::{
+        boot_master_for_this_boot, empty_primary_boot_guard, BootMaster, EmptyPrimaryBoot,
+        EMPTY_PRIMARY_GUARD_ENV,
+    },
     config::{data_dir_is_on_volume, Config},
     health_server::run_health_server,
     link_heal,
@@ -79,7 +82,36 @@ async fn main() -> Result<()> {
     // Sentinels this node is joining. Read before the conf is regenerated,
     // because the regenerated conf is what would otherwise re-impose the
     // deploy-time topology on a node Sentinel has since promoted or demoted.
-    let boot_master = boot_master_for_this_boot(&config).await;
+    let resolution = boot_master_for_this_boot(&config).await;
+
+    // Fail-stop guard, checked before anything is written to the volume: an
+    // env-primary booting with no loadable dataset into a live cluster whose
+    // Sentinels still name it master must not fall back to the env topology.
+    // No failover ever repointed the replicas, so they reconnect and ack —
+    // min-replicas-to-write is satisfied — and then full-resync the empty
+    // dataset: the documented replication wipe Sentinel does not protect
+    // against. Exiting leaves the master down instead; the peers fail over
+    // to a replica that still holds the data, and this node's next boot
+    // joins the new master as a replica through the peer query.
+    if empty_primary_boot_guard(&config, &resolution) == EmptyPrimaryBoot::Refuse {
+        let error = format!(
+            "refusing to boot as an empty master: the peer sentinels name this node ({}) as \
+             the current master, but {} holds no loadable dataset — the volume was wiped or \
+             replaced. Booting would have every replica full-resync the empty dataset and \
+             destroy the cluster's data. This container exits so Sentinel fails over to a \
+             data-bearing replica; this node then rejoins as a replica on a later boot. Set \
+             {}=false to override.",
+            config.private_domain, config.data_dir, EMPTY_PRIMARY_GUARD_ENV
+        );
+        tracing::error!("{error}");
+        telemetry.send(TelemetryEvent::ComponentError {
+            component: "redis-wrapper".to_string(),
+            error,
+            context: "startup".to_string(),
+        });
+        std::process::exit(1);
+    }
+    let boot_master = resolution.master;
 
     // Always regenerate redis.conf so env-var changes take effect on restart.
     let redis_conf_path = format!("{}/redis.conf", config.data_dir);

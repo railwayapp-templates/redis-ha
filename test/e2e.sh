@@ -1400,6 +1400,92 @@ t_foreign_host_reusing_member_name_is_quarantined() {
   ok "$t"
 }
 
+# The empty-master wipe: the env-primary comes back on a wiped/replaced
+# volume before any failover happened, so every peer sentinel still names it
+# master. The env fallback would boot it as an EMPTY master; its replicas
+# were never repointed, so they reconnect, ack (min-replicas-to-write is
+# satisfied — the fence does not protect here) and full-resync the empty
+# dataset: the whole cluster's data gone. The boot guard must refuse — exit
+# before redis ever listens, volume untouched — so Sentinel fails over to a
+# data-bearing replica, and the wiped node's next boot joins it as a
+# replica through the peer query.
+t_wiped_master_volume_does_not_wipe_cluster() {
+  local t=t_wiped_master_volume_does_not_wipe_cluster
+  local hosts="wipe-1:26379,wipe-2:26379,wipe-3:26379"
+  # A longer down-after keeps the peers naming wipe-1 master while the wiped
+  # boot runs its peer query — the real trigger (a redeploy replacing the
+  # volume) has the same shape: the node is back well before sdown.
+  local slow=(-e SENTINEL_DOWN_AFTER_MS=15000)
+  start_ha_trio wipe "${slow[@]}" \
+    || { dump_sentinel_view wipe-2 wipe-3
+         ko "$t" "cluster never became failover-ready" wipe-1 wipe-2 wipe-3; return; }
+  write_key wipe-1 wipekey wipevalue \
+    || { ko "$t" "master never accepted the marker write" wipe-1; return; }
+  wait_for_key wipe-2 wipekey wipevalue || { ko "$t" "wipe-2 never synced" wipe-1 wipe-2; return; }
+  wait_for_key wipe-3 wipekey wipevalue || { ko "$t" "wipe-3 never synced" wipe-1 wipe-3; return; }
+
+  # The volume replacement: same service, same deploy-time env (REPLICA_OF
+  # still empty), nothing left on the volume.
+  docker rm -f wipe-1 >/dev/null 2>&1
+  docker run --rm -v wipe-vol-1:/v alpine:latest sh -c \
+    'rm -rf /v/* /v/.[!.]* /v/..?* 2>/dev/null; chown 999:999 /v' >/dev/null 2>&1
+  start_node wipe-1 wipe-vol-1 /data -e SENTINEL_HOSTS="$hosts" "${slow[@]}"
+
+  wait_for_log_line wipe-1 "refusing to boot as an empty master" 30 \
+    || { ko "$t" "guard never refused the empty-master boot" wipe-1; return; }
+  local i state=""
+  for i in $(seq 1 30); do
+    state=$(docker inspect -f '{{.State.Status}}:{{.State.ExitCode}}' wipe-1 2>/dev/null)
+    [ "$state" = "exited:1" ] && break
+    sleep 1
+  done
+  [ "$state" = "exited:1" ] \
+    || { ko "$t" "guard logged but the container did not exit(1) (state=${state})" wipe-1; return; }
+  # Fail-stop means hands off the volume: nothing written, nothing quarantined.
+  docker run --rm -v wipe-vol-1:/v alpine:latest sh -c 'ls -A /v' 2>/dev/null | grep -q . \
+    && { ko "$t" "the refused boot wrote to the wiped volume" wipe-1; return; }
+
+  # An exited container drops its DNS record and Sentinel spins on NXDOMAIN
+  # instead of counting the node down (see t_sentinel_failover on kill vs
+  # pause). A crashlooping Railway service keeps its private domain, so hold
+  # the name with an idle container while the failover runs.
+  docker run -d --name wipe-1-dns --label "$LABEL" --network "$NET" \
+    --network-alias wipe-1 alpine:latest sleep 600 >/dev/null
+
+  local promoted="" n
+  for i in $(seq 1 180); do
+    for n in wipe-2 wipe-3; do
+      docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
+        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+    done
+    sleep 1
+  done
+  [ -n "$promoted" ] || {
+    dump_sentinel_view wipe-2 wipe-3
+    ko "$t" "no replica was promoted after the wiped master refused to boot" wipe-2 wipe-3
+    return
+  }
+  note "promoted: ${promoted}"
+  [ "$(rcli "$promoted" GET wipekey)" = "wipevalue" ] \
+    || { ko "$t" "marker data lost on the promoted master" "$promoted"; return; }
+
+  # The next boot of the wiped node (Railway's restart policy; same env,
+  # same empty volume): the peers now name the promoted node, so it joins
+  # as a replica and resyncs the dataset — the normal first-boot path.
+  docker rm -f wipe-1-dns >/dev/null 2>&1
+  docker start wipe-1 >/dev/null 2>&1
+  wait_for_ping wipe-1 || { ko "$t" "wiped node never came back as a replica" wipe-1; return; }
+  wait_for_replica_repointed wipe-1 "$promoted" 90 \
+    || { ko "$t" "wiped node never attached to ${promoted}" wipe-1 "$promoted"; return; }
+  wait_for_key wipe-1 wipekey wipevalue \
+    || { ko "$t" "marker data never resynced to the rejoined node" wipe-1 "$promoted"; return; }
+  [ "$(rcli "$promoted" GET wipekey)" = "wipevalue" ] \
+    || { ko "$t" "promoted master lost data when the wiped node rejoined" "$promoted"; return; }
+
+  docker rm -f wipe-1 wipe-2 wipe-3 >/dev/null 2>&1
+  ok "$t"
+}
+
 # ----- runner ------------------------------------------------------------------
 ALL_TESTS=(
   t_fresh_boot
@@ -1425,6 +1511,7 @@ ALL_TESTS=(
   t_paused_majority_keeps_the_fence
   t_scaled_member_master_is_preserved_at_boot
   t_foreign_host_reusing_member_name_is_quarantined
+  t_wiped_master_volume_does_not_wipe_cluster
 )
 
 setup
