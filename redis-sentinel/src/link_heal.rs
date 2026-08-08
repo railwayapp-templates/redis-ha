@@ -1,5 +1,6 @@
 //! In-container self-heal for a replica whose link to the master is durably
-//! down — the redis-ha analogue of postgres-patroni's `self_heal` watcher.
+//! down, or durably attached to the wrong master — the redis-ha analogue of
+//! postgres-patroni's `self_heal` watcher.
 //!
 //! ## What Redis already handles (we do NOT duplicate)
 //! A dropped replication link is normal and Redis retries it on its own — a
@@ -8,7 +9,7 @@
 //! seconds once the target is reachable again.
 //!
 //! ## The gap this module fills
-//! Three states a running Redis will not retry out of by itself:
+//! Four states a running Redis will not retry out of by itself:
 //!  - **Pinned to a dead master.** Sentinel reconfigures every replica's
 //!    `REPLICAOF` after a failover, but that update can fail to land on a
 //!    node that was partitioned during the switch. The node keeps retrying a
@@ -23,21 +24,35 @@
 //!    no longer exists as one. Reissuing `REPLICAOF` against that address
 //!    would just point it at itself; the correct action is `REPLICAOF NO
 //!    ONE`.
+//!  - **Attached to the wrong master, link healthy.** A replica that
+//!    completed its sync against a node that had just been demoted — a first
+//!    boot racing a failover is how it happens in practice. Sentinel builds
+//!    its slave table from the *master's* INFO, and a node chained under a
+//!    demoted ex-master never appears there, so Sentinel never learns it
+//!    exists and `+fix-slave-config` can never fire. The link is up, data
+//!    flows through the chained ex-master, every health probe passes — and
+//!    the node is silently outside the failover topology forever.
 //!
-//! Both are invisible to a redeploy-free wait: nothing on the node is going
-//! to change the target it is retrying, or nudge it into trying again.
+//! All are invisible to a redeploy-free wait: nothing on the node is going
+//! to change the target it is attached to, or nudge it into trying again.
 //!
 //! ## Detection
 //! Poll local `INFO replication` (link status, whether a sync is currently in
-//! flight) plus local Sentinel's `SENTINEL get-master-addr-by-name` — the
-//! authoritative current master. Reading the replica's own `master_host`
-//! instead would just echo the stale value in the pinned-to-dead-master case,
-//! so the fix target always comes from Sentinel.
+//! flight, and which master this replica is attached to) plus local
+//! Sentinel's `SENTINEL get-master-addr-by-name` — the authoritative current
+//! master. The link states are judged from the link fields alone; the
+//! wrong-master state is the replica's own `master_host`/`master_port`
+//! disagreeing with Sentinel's answer. The fix target always comes from
+//! Sentinel — the replica's own config is exactly what's suspect here.
 //!
-//! "Durable" means the link has read down, with no sync in flight, on every
-//! poll across a dwell window — not a stale first-seen. A node that is
-//! actively (re)attempting a sync never accrues the dwell, so this only ever
-//! fires on a replica that has stopped trying.
+//! "Durable" means the broken observation repeated on every poll across a
+//! dwell window — not a stale first-seen. The two failure families accrue
+//! separate windows: a stalled link must stay stalled (down, no sync in
+//! flight) for `LINK_HEAL_DWELL_SECONDS`; a wrong-master attachment must
+//! disagree with Sentinel's answer for `LINK_HEAL_WRONG_MASTER_DWELL_SECONDS`
+//! — long enough that "Sentinel is mid-failover and hasn't repointed us yet"
+//! never qualifies, since Sentinel repoints the replicas it knows about
+//! within seconds of a switch.
 //!
 //! ## Action
 //! `REPLICAOF <sentinel_host> <sentinel_port>` on the local connection.
@@ -94,6 +109,12 @@ const DEFAULT_DWELL_SECONDS: u64 = 20 * 60;
 const DEFAULT_ACTION_BACKOFF_SECONDS: u64 = 5 * 60;
 const DEFAULT_MAX_ATTEMPTS_PER_WINDOW: u32 = 5;
 const DEFAULT_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+// Sentinel repoints the replicas it knows about within seconds of a
+// switch-master, so a mismatch that survives five minutes of consecutive
+// polls is a replica Sentinel does not know exists — not a failover in
+// flight. Shorter than the stalled-link dwell because a healthy-looking
+// wrong attachment has no self-recovery to wait out.
+const DEFAULT_WRONG_MASTER_DWELL_SECONDS: u64 = 5 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -102,13 +123,16 @@ enum Role {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ReplicationSnapshot {
     role: Role,
     /// Only meaningful when `role == Replica`.
     link_down: bool,
     /// Only meaningful when `role == Replica`.
     sync_in_progress: bool,
+    /// The master this replica is attached to (`master_host`/`master_port`).
+    /// Only meaningful when `role == Replica`.
+    master_addr: Option<(String, u16)>,
 }
 
 /// Parse the fields we need out of `INFO replication`. Real Redis output is
@@ -117,6 +141,8 @@ fn parse_replication_info(info: &str) -> ReplicationSnapshot {
     let mut role = Role::Unknown;
     let mut link_down = false;
     let mut sync_in_progress = false;
+    let mut master_host: Option<String> = None;
+    let mut master_port: Option<u16> = None;
     for line in info.lines() {
         let line = line.trim_end();
         if let Some(v) = line.strip_prefix("role:") {
@@ -129,18 +155,46 @@ fn parse_replication_info(info: &str) -> ReplicationSnapshot {
             link_down = v == "down";
         } else if let Some(v) = line.strip_prefix("master_sync_in_progress:") {
             sync_in_progress = v == "1";
+        } else if let Some(v) = line.strip_prefix("master_host:") {
+            let v = v.trim();
+            if !v.is_empty() {
+                master_host = Some(v.to_string());
+            }
+        } else if let Some(v) = line.strip_prefix("master_port:") {
+            master_port = v.trim().parse::<u16>().ok();
         }
     }
     ReplicationSnapshot {
         role,
         link_down,
         sync_in_progress,
+        master_addr: match (master_host, master_port) {
+            (Some(host), Some(port)) => Some((host, port)),
+            _ => None,
+        },
+    }
+}
+
+/// Whether the master this replica is attached to disagrees with Sentinel's
+/// answer. Indeterminable (`None` on either side) is never a disagreement —
+/// acting on a maybe is how a transient becomes an outage.
+fn attached_to_wrong_master(
+    master_addr: &Option<(String, u16)>,
+    target: &Option<(String, u16)>,
+) -> bool {
+    match (master_addr, target) {
+        (Some((mh, mp)), Some((th, tp))) => {
+            crate::boot_role::normalize_host(mh) != crate::boot_role::normalize_host(th)
+                || mp != tp
+        }
+        _ => false,
     }
 }
 
 #[derive(Debug, Clone)]
 struct Thresholds {
     dwell_secs: u64,
+    wrong_master_dwell_secs: u64,
     action_backoff_secs: u64,
     max_attempts_per_window: u32,
     window_secs: u64,
@@ -155,6 +209,11 @@ struct LinkHealInputs {
     /// Seconds this node has read (Replica, link down, no sync in flight) on
     /// every consecutive poll. `0` when not currently stalled.
     stalled_for_secs: u64,
+    /// Whether the attached master disagrees with Sentinel's answer.
+    wrong_master: bool,
+    /// Seconds the disagreement has held on every consecutive poll. `0` when
+    /// not currently disagreeing.
+    mismatch_for_secs: u64,
     /// Sentinel's current answer for the master address. `None` when
     /// Sentinel is unreachable or gave no answer.
     target: Option<(String, u16)>,
@@ -168,14 +227,22 @@ struct LinkHealInputs {
     thresholds: Thresholds,
 }
 
+/// Which durable failure the action is answering — for the log line and for
+/// tests; the corrective command is the same either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealReason {
+    StalledLink,
+    WrongMaster,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum LinkHealAction {
     NoOp,
     Wait,
-    Reheal { attempt: u32, host: String, port: u16 },
+    Reheal { attempt: u32, host: String, port: u16, reason: HealReason },
     /// Sentinel's answer is this node itself: complete the promotion via
     /// `REPLICAOF NO ONE` rather than repointing at our own address.
-    PromoteSelf { attempt: u32 },
+    PromoteSelf { attempt: u32, reason: HealReason },
     EmitRecovered { recovered_in_secs: u64, attempts: u32 },
     EmitGaveUp { attempts: u32 },
 }
@@ -189,7 +256,8 @@ fn decide_link_heal(s: &LinkHealInputs) -> LinkHealAction {
         return LinkHealAction::NoOp;
     }
 
-    // Recovery transition: we acted, and the link is back up now.
+    // Recovery transition: we acted, and the replica reads healthy now —
+    // link up AND attached to the master Sentinel names.
     if s.recovery_seen_after_action {
         let recovered_in_secs = s
             .last_action_at
@@ -218,23 +286,45 @@ fn decide_link_heal(s: &LinkHealInputs) -> LinkHealAction {
 
     // Safety: never act while a sync is already in flight — that IS the
     // recovery attempt, whether it's a natural retry or one we triggered.
-    if s.sync_in_progress || !s.link_down {
+    // The dwell windows keep accruing meanwhile, so a replica syncing from
+    // the wrong master gets acted on the moment the sync lands.
+    if s.sync_in_progress {
         return LinkHealAction::NoOp;
     }
 
-    if s.stalled_for_secs < s.thresholds.dwell_secs {
-        return LinkHealAction::Wait;
+    let stalled_fired = s.link_down && s.stalled_for_secs >= s.thresholds.dwell_secs;
+    let wrong_master_fired =
+        s.wrong_master && s.mismatch_for_secs >= s.thresholds.wrong_master_dwell_secs;
+
+    if !stalled_fired && !wrong_master_fired {
+        // Broken but still inside a dwell → keep watching. Healthy → nothing.
+        return if s.link_down || s.wrong_master {
+            LinkHealAction::Wait
+        } else {
+            LinkHealAction::NoOp
+        };
     }
 
+    // A down link is the stronger observation: when both fired, report the
+    // stall — the wrong-master mismatch may just be its consequence.
+    let reason = if stalled_fired {
+        HealReason::StalledLink
+    } else {
+        HealReason::WrongMaster
+    };
+
     let Some((host, port)) = s.target.clone() else {
-        // Durably stalled but no safe target to reissue REPLICAOF against —
+        // Durably broken but no safe target to reissue REPLICAOF against —
         // wait rather than guess.
         return LinkHealAction::Wait;
     };
 
-    if host == s.own_private_domain {
+    if crate::boot_role::normalize_host(&host)
+        == crate::boot_role::normalize_host(&s.own_private_domain)
+    {
         return LinkHealAction::PromoteSelf {
             attempt: s.action_attempts_in_window + 1,
+            reason,
         };
     }
 
@@ -242,6 +332,7 @@ fn decide_link_heal(s: &LinkHealInputs) -> LinkHealAction {
         attempt: s.action_attempts_in_window + 1,
         host,
         port,
+        reason,
     }
 }
 
@@ -439,6 +530,10 @@ impl WatcherConfig {
             poll_secs: u64::env_parse("LINK_HEAL_POLL_SECONDS", DEFAULT_POLL_SECONDS),
             thresholds: Thresholds {
                 dwell_secs: u64::env_parse("LINK_HEAL_DWELL_SECONDS", DEFAULT_DWELL_SECONDS),
+                wrong_master_dwell_secs: u64::env_parse(
+                    "LINK_HEAL_WRONG_MASTER_DWELL_SECONDS",
+                    DEFAULT_WRONG_MASTER_DWELL_SECONDS,
+                ),
                 action_backoff_secs: u64::env_parse(
                     "LINK_HEAL_ACTION_BACKOFF_SECONDS",
                     DEFAULT_ACTION_BACKOFF_SECONDS,
@@ -473,6 +568,7 @@ pub fn spawn(
     info!(
         poll_secs = cfg.poll_secs,
         dwell_secs = cfg.thresholds.dwell_secs,
+        wrong_master_dwell_secs = cfg.thresholds.wrong_master_dwell_secs,
         action_backoff_secs = cfg.thresholds.action_backoff_secs,
         max_attempts_per_window = cfg.thresholds.max_attempts_per_window,
         window_secs = cfg.thresholds.window_secs,
@@ -514,6 +610,7 @@ async fn run(
     cfg: WatcherConfig,
 ) {
     let mut stall_window: Option<StallWindow> = None;
+    let mut mismatch_window: Option<StallWindow> = None;
     // Rebuilt from disk so a container restart between an action and
     // stabilization still emits LinkHealRecovered when the link comes back.
     let mut action_pending_recovery: Option<i64> =
@@ -529,6 +626,7 @@ async fn run(
             &master_name,
             &state_path,
             &mut stall_window,
+            &mut mismatch_window,
             &mut action_pending_recovery,
             &mut gave_up_emitted,
             &telemetry,
@@ -545,6 +643,7 @@ async fn iteration(
     master_name: &str,
     state_path: &str,
     stall_window: &mut Option<StallWindow>,
+    mismatch_window: &mut Option<StallWindow>,
     action_pending_recovery: &mut Option<i64>,
     gave_up_emitted: &mut bool,
     telemetry: &Telemetry,
@@ -561,6 +660,7 @@ async fn iteration(
 
     if !matches!(snapshot.role, Role::Replica) {
         *stall_window = None;
+        *mismatch_window = None;
         return;
     }
 
@@ -578,6 +678,15 @@ async fn iteration(
         None => None,
     };
 
+    // The wrong-master window accrues even while a sync is in flight — a
+    // replica syncing FROM the wrong master is still wrong — but the decision
+    // function refuses to act until the sync lands.
+    let wrong_master = attached_to_wrong_master(&snapshot.master_addr, &target);
+    *mismatch_window = accrue_stall_window(wrong_master, *mismatch_window, now);
+    let mismatch_for_secs = mismatch_window
+        .map(|w| now.saturating_sub(w.since).max(0) as u64)
+        .unwrap_or(0);
+
     let last_action_at =
         read_state_field(state_path, "last_action_at").and_then(|s| s.parse::<i64>().ok());
     let action_attempts_in_window = recent_action_count(state_path, now, cfg.thresholds.window_secs);
@@ -585,7 +694,11 @@ async fn iteration(
         *gave_up_emitted = false;
     }
 
-    let recovery_seen_after_action = action_pending_recovery.is_some() && !snapshot.link_down;
+    // Recovered means healthy, not merely connected: the link is up AND the
+    // attachment agrees with Sentinel. A wrong-master heal starts with the
+    // link already up, so link state alone would declare victory instantly.
+    let recovery_seen_after_action =
+        action_pending_recovery.is_some() && !snapshot.link_down && !wrong_master;
     let node = RailwayEnv::private_domain();
 
     let snapshot_inputs = LinkHealInputs {
@@ -594,6 +707,8 @@ async fn iteration(
         link_down: snapshot.link_down,
         sync_in_progress: snapshot.sync_in_progress,
         stalled_for_secs,
+        wrong_master,
+        mismatch_for_secs,
         target,
         own_private_domain: node.clone(),
         last_action_at,
@@ -605,14 +720,24 @@ async fn iteration(
 
     match action {
         LinkHealAction::NoOp | LinkHealAction::Wait => {}
-        LinkHealAction::Reheal { attempt, host, port } => {
-            info!(
-                host = %host,
-                port,
-                attempt,
-                stalled_for_secs,
-                "link-heal: reissuing REPLICAOF on a durably broken link"
-            );
+        LinkHealAction::Reheal { attempt, host, port, reason } => {
+            match reason {
+                HealReason::StalledLink => info!(
+                    host = %host,
+                    port,
+                    attempt,
+                    stalled_for_secs,
+                    "link-heal: reissuing REPLICAOF on a durably broken link"
+                ),
+                HealReason::WrongMaster => info!(
+                    host = %host,
+                    port,
+                    attempt,
+                    mismatch_for_secs,
+                    attached_to = ?snapshot.master_addr,
+                    "link-heal: repointing a replica durably attached to the wrong master"
+                ),
+            }
             // Persist before the call so backoff/cap apply even if the
             // REPLICAOF call itself hangs or fails.
             let _ = write_state_field(state_path, "last_action_at", &now.to_string());
@@ -639,10 +764,12 @@ async fn iteration(
                 }
             }
         }
-        LinkHealAction::PromoteSelf { attempt } => {
+        LinkHealAction::PromoteSelf { attempt, reason } => {
             info!(
                 attempt,
                 stalled_for_secs,
+                mismatch_for_secs,
+                ?reason,
                 "link-heal: completing a promotion that never landed via REPLICAOF NO ONE"
             );
             let _ = write_state_field(state_path, "last_action_at", &now.to_string());
@@ -745,6 +872,72 @@ mod parse_tests {
         let s = parse_replication_info("# Replication\r\nconnected_slaves:0\r\n");
         assert_eq!(s.role, Role::Unknown);
     }
+
+    #[test]
+    fn replica_reports_its_attached_master() {
+        let s = parse_replication_info(&info(
+            "slave",
+            "master_host:redis-1.railway.internal\r\nmaster_port:6379\r\nmaster_link_status:up\r\n",
+        ));
+        assert_eq!(
+            s.master_addr,
+            Some(("redis-1.railway.internal".to_string(), 6379))
+        );
+    }
+
+    #[test]
+    fn master_addr_needs_both_fields() {
+        let s = parse_replication_info(&info("slave", "master_host:redis-1\r\n"));
+        assert_eq!(s.master_addr, None);
+    }
+}
+
+#[cfg(test)]
+mod wrong_master_tests {
+    use super::*;
+
+    fn addr(host: &str, port: u16) -> Option<(String, u16)> {
+        Some((host.to_string(), port))
+    }
+
+    #[test]
+    fn agreement_is_not_wrong() {
+        assert!(!attached_to_wrong_master(
+            &addr("redis-2.railway.internal", 6379),
+            &addr("redis-2.railway.internal", 6379)
+        ));
+    }
+
+    #[test]
+    fn host_comparison_is_normalized() {
+        assert!(!attached_to_wrong_master(
+            &addr("Redis-2.railway.internal.", 6379),
+            &addr("redis-2.railway.internal", 6379)
+        ));
+    }
+
+    #[test]
+    fn different_host_is_wrong() {
+        assert!(attached_to_wrong_master(
+            &addr("redis-1.railway.internal", 6379),
+            &addr("redis-2.railway.internal", 6379)
+        ));
+    }
+
+    #[test]
+    fn different_port_is_wrong() {
+        assert!(attached_to_wrong_master(
+            &addr("redis-2.railway.internal", 6380),
+            &addr("redis-2.railway.internal", 6379)
+        ));
+    }
+
+    #[test]
+    fn indeterminable_is_never_wrong() {
+        assert!(!attached_to_wrong_master(&None, &addr("redis-2", 6379)));
+        assert!(!attached_to_wrong_master(&addr("redis-1", 6379), &None));
+        assert!(!attached_to_wrong_master(&None, &None));
+    }
 }
 
 #[cfg(test)]
@@ -783,6 +976,8 @@ mod decide_tests {
             link_down: true,
             sync_in_progress: false,
             stalled_for_secs: 9_999_999,
+            wrong_master: false,
+            mismatch_for_secs: 0,
             target: Some(("master.railway.internal".to_string(), 6379)),
             own_private_domain: "self.railway.internal".to_string(),
             last_action_at: None,
@@ -790,11 +985,23 @@ mod decide_tests {
             recovery_seen_after_action: false,
             thresholds: Thresholds {
                 dwell_secs: 1200,
+                wrong_master_dwell_secs: 300,
                 action_backoff_secs: 300,
                 max_attempts_per_window: 5,
                 window_secs: 86400,
             },
         }
+    }
+
+    /// A wrong-master state: link healthy, attached master disagreeing with
+    /// Sentinel past its dwell.
+    fn wrong_master_base() -> LinkHealInputs {
+        let mut s = base();
+        s.link_down = false;
+        s.stalled_for_secs = 0;
+        s.wrong_master = true;
+        s.mismatch_for_secs = 9_999_999;
+        s
     }
 
     #[test]
@@ -847,7 +1054,8 @@ mod decide_tests {
             LinkHealAction::Reheal {
                 attempt: 1,
                 host: "master.railway.internal".to_string(),
-                port: 6379
+                port: 6379,
+                reason: HealReason::StalledLink
             }
         );
     }
@@ -858,7 +1066,10 @@ mod decide_tests {
         s.target = Some((s.own_private_domain.clone(), 6379));
         assert_eq!(
             decide_link_heal(&s),
-            LinkHealAction::PromoteSelf { attempt: 1 }
+            LinkHealAction::PromoteSelf {
+                attempt: 1,
+                reason: HealReason::StalledLink
+            }
         );
     }
 
@@ -887,9 +1098,90 @@ mod decide_tests {
             LinkHealAction::Reheal {
                 attempt: 2,
                 host: "master.railway.internal".to_string(),
-                port: 6379
+                port: 6379,
+                reason: HealReason::StalledLink
             }
         );
+    }
+
+    // --- wrong-master (healthy link, wrong attachment) ---
+
+    #[test]
+    fn wrong_master_reheals_with_the_link_up() {
+        let s = wrong_master_base();
+        assert_eq!(
+            decide_link_heal(&s),
+            LinkHealAction::Reheal {
+                attempt: 1,
+                host: "master.railway.internal".to_string(),
+                port: 6379,
+                reason: HealReason::WrongMaster
+            }
+        );
+    }
+
+    #[test]
+    fn wrong_master_waits_out_its_own_dwell() {
+        let mut s = wrong_master_base();
+        s.mismatch_for_secs = 60;
+        assert_eq!(decide_link_heal(&s), LinkHealAction::Wait);
+    }
+
+    #[test]
+    fn wrong_master_never_acts_while_a_sync_is_in_flight() {
+        let mut s = wrong_master_base();
+        s.sync_in_progress = true;
+        assert_eq!(decide_link_heal(&s), LinkHealAction::NoOp);
+    }
+
+    #[test]
+    fn wrong_master_promotes_self_when_sentinel_names_this_node() {
+        let mut s = wrong_master_base();
+        s.target = Some((s.own_private_domain.clone(), 6379));
+        assert_eq!(
+            decide_link_heal(&s),
+            LinkHealAction::PromoteSelf {
+                attempt: 1,
+                reason: HealReason::WrongMaster
+            }
+        );
+    }
+
+    #[test]
+    fn wrong_master_respects_backoff_and_cap() {
+        let mut s = wrong_master_base();
+        s.last_action_at = Some(9_900);
+        assert_eq!(decide_link_heal(&s), LinkHealAction::Wait);
+
+        let mut s = wrong_master_base();
+        s.action_attempts_in_window = 5;
+        assert_eq!(
+            decide_link_heal(&s),
+            LinkHealAction::EmitGaveUp { attempts: 5 }
+        );
+    }
+
+    #[test]
+    fn a_down_link_wins_the_reason_when_both_fired() {
+        let mut s = base();
+        s.wrong_master = true;
+        s.mismatch_for_secs = 9_999_999;
+        assert_eq!(
+            decide_link_heal(&s),
+            LinkHealAction::Reheal {
+                attempt: 1,
+                host: "master.railway.internal".to_string(),
+                port: 6379,
+                reason: HealReason::StalledLink
+            }
+        );
+    }
+
+    #[test]
+    fn healthy_and_agreeing_is_a_noop_even_past_dwells() {
+        let mut s = wrong_master_base();
+        s.wrong_master = false;
+        assert_eq!(decide_link_heal(&s), LinkHealAction::NoOp);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::boot_role::BootMaster;
 use crate::config::Config;
 
 /// Generate sentinel.conf content from environment configuration.
@@ -5,9 +6,18 @@ use crate::config::Config;
 /// This file is only written on first boot. After Sentinel runs a failover it
 /// rewrites the file with the new master address, so we preserve whatever is
 /// already on disk across restarts.
-pub fn generate_sentinel_conf(config: &Config) -> String {
-    let master_host = config.initial_master_host();
-    let master_port = config.initial_master_port();
+///
+/// The monitor line follows the resolved boot master, not the raw env
+/// topology: a node whose first boot learned the current master from peer
+/// Sentinels must start monitoring that master, or its own Sentinel would
+/// begin life believing the stamped-at-deploy topology the rest of the
+/// cluster has already failed over from.
+pub fn generate_sentinel_conf(config: &Config, boot_master: &BootMaster) -> String {
+    let (master_host, master_port) = match boot_master {
+        BootMaster::SelfIsMaster => (config.private_domain.clone(), config.redis_port),
+        BootMaster::ReplicaOf(host, port) => (host.clone(), *port),
+        BootMaster::NoLocalState => (config.initial_master_host(), config.initial_master_port()),
+    };
 
     let mut lines: Vec<String> = vec![
         format!("port {}", config.sentinel_port),
