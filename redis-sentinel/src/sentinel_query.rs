@@ -23,6 +23,22 @@ pub async fn connect(url: &str, deadline: Duration) -> Option<MultiplexedConnect
     }
 }
 
+/// Authenticated PING against a Redis data endpoint, bounded by `deadline`.
+/// True only when the whole handshake — TCP, AUTH from the URL's password,
+/// and the PING itself — succeeds. Callers use this as proof that the
+/// address hosts a live instance that accepts this cluster's credentials:
+/// a deleted host (no DNS), a wedged one (timeout), and a foreign service
+/// reusing the hostname (AUTH refused) all come back `false`.
+pub async fn authenticated_ping(url: &str, deadline: Duration) -> bool {
+    let Some(mut conn) = connect(url, deadline).await else {
+        return false;
+    };
+    matches!(
+        timeout(deadline, redis::cmd("PING").query_async::<String>(&mut conn)).await,
+        Ok(Ok(reply)) if reply.eq_ignore_ascii_case("pong")
+    )
+}
+
 /// `SENTINEL get-master-addr-by-name <master_name>`, bounded by `deadline`.
 /// `None` when the Sentinel is unreachable, answers nil (it does not know the
 /// master set), or the reply has an unexpected shape.
