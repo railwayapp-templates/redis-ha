@@ -11,6 +11,11 @@ pub struct Config {
     /// that replica stops counting toward min-replicas-to-write. Must not
     /// exceed sentinel_down_after_ms — see redis_conf's module docs.
     pub min_replicas_max_lag_secs: u64,
+    /// Passthrough value for `repl-backlog-size` (e.g. "64mb").
+    pub repl_backlog_size: String,
+    /// The three-value tail of `client-output-buffer-limit replica <hard>
+    /// <soft> <soft-seconds>` (e.g. "512mb 128mb 120").
+    pub client_output_buffer_limit_replica: String,
     pub sentinel_enabled: bool,
     pub sentinel_port: u16,
     pub sentinel_quorum: u32,
@@ -44,6 +49,11 @@ impl Config {
             redis_port: u16::env_parse("REDIS_PORT", 6379),
             replica_of: String::env_or("REPLICA_OF", ""),
             min_replicas_max_lag_secs: u64::env_parse("MIN_REPLICAS_MAX_LAG", 5),
+            repl_backlog_size: String::env_or("REPL_BACKLOG_SIZE", "64mb"),
+            client_output_buffer_limit_replica: String::env_or(
+                "CLIENT_OUTPUT_BUFFER_LIMIT_REPLICA",
+                "512mb 128mb 120",
+            ),
             sentinel_enabled,
             sentinel_port: u16::env_parse("SENTINEL_PORT", 26379),
             sentinel_quorum: u32::env_parse("SENTINEL_QUORUM", 2),
@@ -183,6 +193,8 @@ impl Config {
             redis_port: 6379,
             replica_of: String::new(),
             min_replicas_max_lag_secs: 5,
+            repl_backlog_size: "64mb".to_string(),
+            client_output_buffer_limit_replica: "512mb 128mb 120".to_string(),
             sentinel_enabled: true,
             sentinel_port: 26379,
             sentinel_quorum: 2,
