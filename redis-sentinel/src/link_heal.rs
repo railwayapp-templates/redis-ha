@@ -551,6 +551,14 @@ impl WatcherConfig {
 /// Spawn the link-heal watcher as a long-running background task. Honors
 /// `LINK_HEAL_DISABLED=1` as an operator kill switch. Only meaningful on a
 /// Sentinel-managed node — the caller gates on `sentinel_enabled`.
+///
+/// `local_sentinel_password` is `""` unless the co-located Sentinel's
+/// on-disk conf currently carries `requirepass` — resolved by the caller
+/// from the file (see `sentinel_conf::conf_requires_auth`), not from
+/// `SENTINEL_PASSWORD` directly, since a preserved conf that predates the
+/// var has no `requirepass` regardless of what the env now says, and
+/// authenticating against a Sentinel that requires none is a hard
+/// connection failure, not a no-op.
 pub fn spawn(
     data_dir: String,
     redis_port: u16,
@@ -558,6 +566,7 @@ pub fn spawn(
     sentinel_port: u16,
     master_name: String,
     telemetry: Telemetry,
+    local_sentinel_password: String,
 ) {
     if disabled() {
         info!("link-heal: LINK_HEAL_DISABLED=1, watcher inactive");
@@ -576,8 +585,8 @@ pub fn spawn(
     );
 
     let redis_url = format!("redis://:{redis_password}@127.0.0.1:{redis_port}");
-    // Sentinel has no auth by default.
-    let sentinel_url = format!("redis://127.0.0.1:{sentinel_port}");
+    let sentinel_url =
+        crate::sentinel_query::sentinel_url("127.0.0.1", sentinel_port, &local_sentinel_password);
     let state_path = format!("{data_dir}/{STATE_FILENAME}");
 
     tokio::spawn(async move {

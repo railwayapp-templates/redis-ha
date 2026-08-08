@@ -25,7 +25,7 @@ use redis_sentinel::{
     redis_conf::{
         generate_redis_conf, needs_rdb_to_aof_migration, quarantine_manifestless_aof_dir,
     },
-    sentinel_conf::generate_sentinel_conf,
+    sentinel_conf::{conf_requires_auth, generate_sentinel_conf},
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -123,16 +123,40 @@ async fn main() -> Result<()> {
 
     // Only write sentinel.conf on first boot — Sentinel owns it after that.
     let sentinel_conf_path = format!("{}/sentinel.conf", config.data_dir);
-    if config.sentinel_enabled && !Path::new(&sentinel_conf_path).exists() {
+    let local_sentinel_requires_auth = if config.sentinel_enabled
+        && !Path::new(&sentinel_conf_path).exists()
+    {
         let sentinel_conf = generate_sentinel_conf(&config, &boot_master);
         fs::write(&sentinel_conf_path, &sentinel_conf)
             .context("failed to write sentinel.conf")?;
         fs::set_permissions(&sentinel_conf_path, fs::Permissions::from_mode(0o600))
             .context("failed to set sentinel.conf permissions")?;
         info!(path = %sentinel_conf_path, "wrote sentinel.conf (first boot)");
+        conf_requires_auth(&sentinel_conf)
     } else if config.sentinel_enabled {
         info!(path = %sentinel_conf_path, "sentinel.conf exists, preserving");
-    }
+        fs::read_to_string(&sentinel_conf_path)
+            .map(|existing| conf_requires_auth(&existing))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    // The password to use for THIS wrapper's own connections to the
+    // co-located Sentinel — gated on the file, not on SENTINEL_PASSWORD
+    // directly. A preserved conf from before the var was ever set has no
+    // `requirepass` (it cannot be retrofitted at runtime — see
+    // quorum::ensure_announce_identity's doc comment), and AUTHing against
+    // a Sentinel that requires none is a hard connection failure in Redis
+    // ("Client sent AUTH, but no password is set"), not a harmless no-op.
+    // Trusting the env here would turn enabling SENTINEL_PASSWORD on an
+    // already-running cluster into an outage of every local watcher
+    // (health server, link-heal, quorum-sync) on top of not even closing
+    // the auth gap on that node.
+    let local_sentinel_password = if local_sentinel_requires_auth {
+        config.sentinel_password.clone()
+    } else {
+        String::new()
+    };
 
     // Supervised health HTTP server: HAProxy's only signal for routing reads
     // and writes, so an unsupervised task dying here silently pulls this
@@ -145,6 +169,7 @@ async fn main() -> Result<()> {
         config.redis_password.clone(),
         config.private_domain.clone(),
         config.redis_master_name.clone(),
+        local_sentinel_password.clone(),
         telemetry.clone(),
     );
 
@@ -217,6 +242,7 @@ async fn main() -> Result<()> {
             config.sentinel_port,
             config.redis_master_name.clone(),
             telemetry,
+            local_sentinel_password.clone(),
         );
         // Keep this Sentinel's odown quorum a majority of the Sentinels it
         // actually knows — and the local Redis's split-brain fence at
@@ -228,6 +254,8 @@ async fn main() -> Result<()> {
             config.redis_password.clone(),
             config.redis_master_name.clone(),
             config.private_domain.clone(),
+            local_sentinel_password,
+            config.sentinel_password.clone(),
         );
     }
 

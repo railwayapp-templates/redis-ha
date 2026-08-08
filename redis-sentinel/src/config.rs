@@ -19,6 +19,16 @@ pub struct Config {
     pub data_dir: String,
     /// The hostname of this service's private domain (used to derive master host for sentinels).
     pub private_domain: String,
+    /// Optional Sentinel client auth. Empty (the default) means exactly
+    /// today's behavior: Sentinel has no auth, and nothing on the platform
+    /// stamps this var yet. Non-empty makes `generate_sentinel_conf` emit
+    /// `requirepass`/`sentinel sentinel-pass` and every internal Sentinel
+    /// client send AUTH — see `sentinel_query::sentinel_url`. Deliberately a
+    /// single shared secret rather than per-node: Sentinel's own
+    /// password-only auth model requires the *same* `requirepass` on every
+    /// monitoring instance for peers to authenticate to each other (Redis
+    /// Sentinel docs, "Sentinel password-only authentication").
+    pub sentinel_password: String,
 }
 
 impl Config {
@@ -45,6 +55,7 @@ impl Config {
             health_port: u16::env_parse("HEALTH_PORT", 8080),
             data_dir: Self::resolve_data_dir(),
             private_domain: RailwayEnv::private_domain(),
+            sentinel_password: String::env_or("SENTINEL_PASSWORD", ""),
         })
     }
 
@@ -183,6 +194,7 @@ impl Config {
             health_port: 8080,
             data_dir: "/data".to_string(),
             private_domain: "redis-1.railway.internal".to_string(),
+            sentinel_password: String::new(),
         }
     }
 }
@@ -213,6 +225,7 @@ mod tests {
             "REDIS_PASSWORD",
             "SENTINEL_ENABLED",
             "SENTINEL_HOSTS",
+            "SENTINEL_PASSWORD",
             "REPLICA_OF",
             "REDIS_PORT",
         ] {
@@ -334,6 +347,28 @@ mod tests {
         env::set_var("REDIS_PASSWORD", "pw");
         let config = Config::from_env().unwrap();
         assert!(!config.sentinel_enabled);
+    }
+
+    #[test]
+    fn sentinel_password_defaults_to_empty() {
+        // Empty must mean exactly today's behavior: nothing stamps this var
+        // yet, so an unset env has to reproduce the pre-auth conf and URLs.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("REDIS_PASSWORD", "pw");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.sentinel_password, "");
+    }
+
+    #[test]
+    fn sentinel_password_is_read_from_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("REDIS_PASSWORD", "pw");
+        env::set_var("SENTINEL_PASSWORD", "s3cr3t");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.sentinel_password, "s3cr3t");
+        env::remove_var("SENTINEL_PASSWORD");
     }
 
     // --- is_primary / initial master host and port: every branch ---

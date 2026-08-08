@@ -1489,6 +1489,63 @@ t_scaled_member_master_is_preserved_at_boot() {
   ok "$t"
 }
 
+# SENTINEL_PASSWORD (opt-in, default off — every other scenario in this file
+# runs with it unset and must keep passing unmodified). A cluster with it set
+# on every node from first boot must converge exactly like the no-auth path
+# (gossip, replication, failover) AND must actually refuse the unauthenticated
+# `SENTINEL SET/RESET/FAILOVER/REMOVE` this var exists to close off.
+t_sentinel_password_converges_and_blocks_unauthenticated() {
+  local t=t_sentinel_password_converges_and_blocks_unauthenticated
+  local spw="e2e-sentinel-password"
+  start_ha_trio auth -e SENTINEL_PASSWORD="$spw" \
+    || { dump_sentinel_view auth-2 auth-3
+         ko "$t" "cluster with SENTINEL_PASSWORD never became failover-ready" auth-1 auth-2 auth-3
+         return; }
+
+  # Gossip discovery and replication over an authenticated sentinel mesh —
+  # the internal clients this PR touches (peer boot query, quorum-sync,
+  # link-heal, the health server) all reaching the co-located and peer
+  # Sentinels the same as with auth off.
+  write_key auth-1 authkey authvalue \
+    || { ko "$t" "master never accepted the write with SENTINEL_PASSWORD set" auth-1; return; }
+  wait_for_key auth-2 authkey authvalue || { ko "$t" "auth-2 never synced" auth-1 auth-2; return; }
+  wait_for_key auth-3 authkey authvalue || { ko "$t" "auth-3 never synced" auth-1 auth-3; return; }
+
+  # The actual gap (B7): full cluster control without credentials. An
+  # unauthenticated SENTINEL SET must now be refused...
+  local unauthed
+  unauthed=$(docker exec auth-1 redis-cli -p 26379 SENTINEL SET mymaster quorum 1 2>&1)
+  case "$unauthed" in
+    *NOAUTH*) ;;
+    *) ko "$t" "unauthenticated SENTINEL SET was not refused: ${unauthed}" auth-1; return ;;
+  esac
+
+  # ...while the authenticated call — what every internal client in this
+  # image now sends — still succeeds.
+  local authed
+  authed=$(docker exec auth-1 redis-cli -p 26379 -a "$spw" --no-auth-warning \
+    SENTINEL SET mymaster quorum 2 2>&1)
+  [ "$authed" = "OK" ] \
+    || { ko "$t" "authenticated SENTINEL SET failed: ${authed}" auth-1; return; }
+
+  # Failover must still work end-to-end with auth on — this is the rollout
+  # risk called out in the PR: a lock that also locks out this image's own
+  # watchers is worse than the gap it closes.
+  local promoted
+  promoted=$(promote_by_pausing auth-1 auth-2 auth-3) || {
+    dump_sentinel_view auth-2 auth-3
+    ko "$t" "no replica was promoted after pausing the authenticated master" auth-2 auth-3
+    return
+  }
+  [ "$(rcli "$promoted" GET authkey)" = "authvalue" ] \
+    || { ko "$t" "adopted key lost across failover with auth on (promoted=${promoted})" "$promoted"; return; }
+  note "promoted: ${promoted}"
+
+  docker unpause auth-1 >/dev/null 2>&1
+  docker rm -f auth-1 auth-2 auth-3 >/dev/null 2>&1
+  ok "$t"
+}
+
 # The membership probe's discriminator is the shared password, not DNS: a
 # foreign service that happens to reuse the hostname of a dead member
 # resolves and answers, but refuses the cluster's AUTH — that state is a
@@ -1629,6 +1686,7 @@ ALL_TESTS=(
   t_scaled_member_master_is_preserved_at_boot
   t_foreign_host_reusing_member_name_is_quarantined
   t_wiped_master_volume_does_not_wipe_cluster
+  t_sentinel_password_converges_and_blocks_unauthenticated
 )
 
 setup
