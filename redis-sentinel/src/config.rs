@@ -19,6 +19,10 @@ pub struct Config {
     pub redis_master_name: String,
     pub sentinel_down_after_ms: u64,
     pub sentinel_failover_timeout_ms: u64,
+    /// Milliseconds Sentinel tolerates a rebooted master answering -LOADING
+    /// before treating it as down. 0 (upstream's shipped default) disables
+    /// this path entirely — see sentinel_conf's comment on the directive.
+    pub sentinel_master_reboot_down_after_ms: u64,
     pub health_port: u16,
     pub data_dir: String,
     /// The hostname of this service's private domain (used to derive master host for sentinels).
@@ -47,6 +51,10 @@ impl Config {
             redis_master_name: String::env_or("REDIS_MASTER_NAME", "mymaster"),
             sentinel_down_after_ms: u64::env_parse("SENTINEL_DOWN_AFTER_MS", 5000),
             sentinel_failover_timeout_ms: u64::env_parse("SENTINEL_FAILOVER_TIMEOUT_MS", 30000),
+            sentinel_master_reboot_down_after_ms: u64::env_parse(
+                "SENTINEL_MASTER_REBOOT_DOWN_AFTER_MS",
+                10000,
+            ),
             health_port: u16::env_parse("HEALTH_PORT", 8080),
             data_dir: Self::resolve_data_dir(),
             private_domain: RailwayEnv::private_domain(),
@@ -182,6 +190,7 @@ impl Config {
             redis_master_name: "mymaster".to_string(),
             sentinel_down_after_ms: 5000,
             sentinel_failover_timeout_ms: 30000,
+            sentinel_master_reboot_down_after_ms: 10000,
             health_port: 8080,
             data_dir: "/data".to_string(),
             private_domain: "redis-1.railway.internal".to_string(),

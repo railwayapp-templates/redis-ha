@@ -82,11 +82,16 @@ pub fn generate_sentinel_conf(config: &Config, boot_master: &BootMaster) -> Stri
         ),
         // Allow one replica to sync at a time during failover
         format!("sentinel parallel-syncs {} 1", config.redis_master_name),
-        // Reboot detection: treat a restarted master that looks like it came back
-        // too quickly as potentially still-broken
+        // Bounds how long Sentinel tolerates a rebooted master answering
+        // -LOADING before treating it as down. Upstream ships this at 0,
+        // which is not "no bound" but "no reboot-triggered bound at all" —
+        // the pre-7.0 behavior of waiting on that master's own load time,
+        // however long it takes. Non-zero gives Sentinel an independent,
+        // bounded trigger into failing over to a replica that already has
+        // data instead of leaving the cluster hostage to that wait.
         format!(
-            "sentinel master-reboot-down-after-period {} 0",
-            config.redis_master_name
+            "sentinel master-reboot-down-after-period {} {}",
+            config.redis_master_name, config.sentinel_master_reboot_down_after_ms
         ),
     ];
 
@@ -105,4 +110,27 @@ pub fn generate_sentinel_conf(config: &Config, boot_master: &BootMaster) -> Stri
     }
 
     lines.join("\n") + "\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn master_reboot_down_after_period_defaults_to_ten_seconds() {
+        let config = Config::for_tests();
+        let conf = generate_sentinel_conf(&config, &BootMaster::NoLocalState);
+        assert!(conf.contains("sentinel master-reboot-down-after-period mymaster 10000"));
+    }
+
+    // Must never regress to upstream's shipped 0, which disables the
+    // reboot-triggered down path entirely — see the comment on the directive.
+    #[test]
+    fn master_reboot_down_after_period_is_configurable_via_env() {
+        let mut config = Config::for_tests();
+        config.sentinel_master_reboot_down_after_ms = 20000;
+        let conf = generate_sentinel_conf(&config, &BootMaster::NoLocalState);
+        assert!(conf.contains("sentinel master-reboot-down-after-period mymaster 20000"));
+    }
 }
