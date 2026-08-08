@@ -88,6 +88,7 @@ Key variables on the Redis nodes (set on Redis-1, referenced by replicas):
 | `BOOT_ROLE_FROM_SENTINEL_STATE` | `true` | Take the boot role from Sentinel's own `sentinel.conf` instead of `REPLICA_OF`. Set to `false` to pin every boot to the deploy-time topology |
 | `BOOT_ROLE_FROM_PEER_SENTINELS` | `true` | On a first boot (no local Sentinel state), ask the peer Sentinels in `SENTINEL_HOSTS` who the master currently is before trusting `REPLICA_OF`. Set to `false` to disable the query |
 | `QUORUM_SYNC_DISABLED` | unset | Set to `1` to stop the watcher that keeps the local Sentinel's quorum at a majority of the known Sentinels |
+| `SENTINEL_PRUNE_DISABLED` | unset | Set to `1` to stop the same watcher from forgetting (via `SENTINEL RESET`) peers that have been down past `SENTINEL_PRUNE_DWELL_SECONDS` (default 1800) |
 | `LINK_HEAL_DISABLED` | unset | Set to `1` to stop the replication-link self-heal watcher |
 
 ### Boot role
@@ -106,6 +107,8 @@ Beyond boot-time role resolution, two watchers run on every Sentinel-managed nod
 
 - **link-heal** repoints a replica whose replication link is durably broken (`REPLICAOF` reissued at Sentinel's answer), completes a promotion whose `REPLICAOF NO ONE` never landed, and — the case Sentinel structurally cannot fix — repoints a replica attached to the *wrong* master over a healthy link. Sentinel only learns replicas from the master's `INFO`, so a node chained behind a demoted ex-master is invisible to it forever; the watcher compares the replica's own attachment against `SENTINEL get-master-addr-by-name` and acts once the disagreement outlives `LINK_HEAL_WRONG_MASTER_DWELL_SECONDS` (default 300).
 - **quorum-sync** keeps the local Sentinel's odown quorum at a strict majority of the Sentinels it actually gossips with (peers flagged `s_down` don't count, so scale-downs shrink it back). `sentinel.conf` otherwise freezes the first-boot quorum forever — after a 3→5 scale-up the original nodes would keep quorum 2 while the new ones write 3. Quorum only gates odown; failover authorization always needs a majority of all known Sentinels, so a transiently low value cannot enable a unilateral failover.
+
+  The same watcher also prunes dead peers from that failover-authorization denominator: Sentinel never forgets a removed node on its own, so after a scale-down the leftover `s_down` entries permanently raise the majority a failover election needs. A peer continuously down past `SENTINEL_PRUNE_DWELL_SECONDS` (default 30 min) triggers a local `SENTINEL RESET` — only while the master reads healthy from that node (never mid-incident), and at most once per `SENTINEL_PRUNE_BACKOFF_SECONDS` (default 1 h). The reset briefly clears the local replica/peer view, which re-populates from the master's INFO and hello gossip within seconds.
 
 ## Development
 
