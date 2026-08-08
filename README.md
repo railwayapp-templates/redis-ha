@@ -18,8 +18,7 @@ Self-healing Redis HA cluster with colocated Sentinel and automatic failover. De
 Application
     ↓
 Redis HA (HAProxy)
-    ├─ :6379 (write)  → Current master only
-    └─ :6380 (read)   → Any healthy node (round-robin)
+    └─ :6379          → Current master only
     ↓
 Redis Cluster
     ├─ Redis-1 (master)  ← Writes + Reads
@@ -77,8 +76,7 @@ Both images are thin wrappers on official upstream images. The Rust entrypoints 
 ### `haproxy` (`haproxy-entrypoint`)
 
 - Renders `haproxy.cfg` from `REDIS_NODES` env var at startup
-- Routes `:6379` writes to the backend reporting `role:master`
-- Routes `:6380` reads to all healthy backends (round-robin)
+- Routes `:6379` to the backend reporting `role:master`
 - Exposes HAProxy stats at `:8404/stats`
 
 ## Environment variables

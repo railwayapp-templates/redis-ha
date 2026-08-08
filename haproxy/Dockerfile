@@ -38,10 +38,9 @@ RUN chown -R haproxy:haproxy /usr/local/etc/haproxy
 
 USER haproxy
 
-# 6379 = write port (primary only)
-# 6380 = read port (any healthy node)
+# 6379 = redis port (routed to the current primary only)
 # 8404 = stats page
-EXPOSE 6379 6380 8404
+EXPOSE 6379 8404
 
 HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
     CMD wget -qO- http://127.0.0.1:8404/stats || exit 1

@@ -1,11 +1,16 @@
 //! HAProxy configuration generator for Redis HA.
 //!
 //! Architecture:
-//!   - Port 6379 (writes): HTTP health check on each node's /role endpoint.
-//!     Only the node that returns 200 (i.e. role=master) is marked UP.
-//!   - Port 6380 (reads): HTTP health check on each node's /health endpoint.
-//!     Any healthy Redis node (master or replica) receives read traffic.
+//!   - Port 6379 (writes + reads): HTTP health check on each node's /role
+//!     endpoint. Only the node that returns 200 (i.e. role=master) is marked
+//!     UP — every client connection lands on the current master.
 //!   - Port 8404: stats page for observability.
+//!
+//! There is deliberately no replica-read frontend. TCP passthrough balances
+//! per CONNECTION, and the dominant Redis client shape is one long-lived
+//! connection — so a "load-balanced read port" pins each client to whichever
+//! node it happened to land on, with no staleness bound if that replica's
+//! replication link is broken. Replicas exist for failover, not fan-out.
 //!
 //! The health checks hit the Rust health server running on each redis-sentinel
 //! container (HEALTH_CHECK_PORT, default 8080), not Redis directly. This
@@ -94,21 +99,6 @@ backend redis_primary_backend
     # reconnect and land on the new master.
     default-server fall 1 rise 2 on-marked-down shutdown-sessions
 {servers}
-
-# Read traffic — load-balanced across all healthy nodes (master + replicas).
-# The /health check returns 200 on any node that Redis answers PING.
-frontend redis_reads
-    bind :::6380 v4v6
-    default_backend redis_replica_backend
-
-backend redis_replica_backend
-    balance leastconn
-    option httpchk
-    http-check send meth GET uri /health
-    http-check expect status 200
-    # fall 2 is fine for reads — an occasional blip is less harmful than for writes.
-    default-server fall 2 rise 1 on-marked-down shutdown-sessions
-{servers}
 "#,
         max_conn = config.max_conn,
         timeout_connect = config.timeout_connect,
@@ -175,6 +165,19 @@ mod tests {
 
         assert!(conf.contains("defaults\n    log global"));
         assert!(!section(&conf, "frontend redis_writes").contains("no log"));
-        assert!(!section(&conf, "frontend redis_reads").contains("no log"));
+    }
+
+    /// The read frontend is gone for good: per-connection TCP balancing gave
+    /// single-connection Redis clients no balancing at all, just an unbounded
+    /// staleness lottery. Locks the removal so it doesn't quietly return.
+    #[test]
+    fn no_replica_read_frontend() {
+        let config = config_for_tests();
+        let nodes = crate::nodes::parse_nodes(&config.redis_nodes).unwrap();
+        let conf = generate_config(&config, &nodes);
+
+        assert!(!conf.contains("redis_reads"));
+        assert!(!conf.contains("redis_replica_backend"));
+        assert!(!conf.contains("6380"));
     }
 }
