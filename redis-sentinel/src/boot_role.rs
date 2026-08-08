@@ -393,13 +393,19 @@ async fn query_peer_sentinels(config: &Config) -> Option<(String, u16)> {
         DEFAULT_PEER_QUERY_TIMEOUT_MS,
     ));
     let master_name = config.redis_master_name.clone();
+    // Sentinel has no auth by default; SENTINEL_PASSWORD opts a cluster in
+    // (Config::sentinel_password). Every peer is assumed to be stamped the
+    // same way this node is — stamping a mixed cluster is the unsafe
+    // rollout this feature explicitly does not attempt to paper over; see
+    // the module-level rollout note shipped with SENTINEL_PASSWORD.
+    let sentinel_password = config.sentinel_password.clone();
 
     let mut set = tokio::task::JoinSet::new();
     for (host, port) in peers {
         let master_name = master_name.clone();
+        let password = sentinel_password.clone();
         set.spawn(async move {
-            // Sentinel has no auth by default.
-            let url = format!("redis://{host}:{port}");
+            let url = crate::sentinel_query::sentinel_url(&host, port, &password);
             let mut conn = crate::sentinel_query::connect(&url, deadline).await?;
             crate::sentinel_query::get_master_addr(&mut conn, &master_name, deadline).await
         });

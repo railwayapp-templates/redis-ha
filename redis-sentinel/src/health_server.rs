@@ -190,16 +190,24 @@ async fn is_sentinel_confirmed_master(state: &AppState) -> bool {
     sentinel_confirms_master(state, "mymaster").await
 }
 
+/// `local_sentinel_password` is `""` unless the co-located Sentinel's
+/// on-disk conf currently carries `requirepass` — resolved by the caller
+/// from the file (see `sentinel_conf::conf_requires_auth`), not from
+/// `SENTINEL_PASSWORD` directly, since a preserved conf that predates the
+/// var has no `requirepass` regardless of what the env now says, and
+/// authenticating against a Sentinel that requires none is a hard
+/// connection failure, not a no-op.
 pub async fn run_health_server(
     health_port: u16,
     redis_port: u16,
     sentinel_port: u16,
     redis_password: String,
     private_domain: String,
+    local_sentinel_password: String,
 ) {
-    // Sentinel has no auth by default; connect without password.
     let redis_url = format!("redis://:{}@127.0.0.1:{}", redis_password, redis_port);
-    let sentinel_url = format!("redis://127.0.0.1:{}", sentinel_port);
+    let sentinel_url =
+        crate::sentinel_query::sentinel_url("127.0.0.1", sentinel_port, &local_sentinel_password);
     let state = AppState::new(redis_url, sentinel_url, private_domain);
 
     let app = Router::new()
