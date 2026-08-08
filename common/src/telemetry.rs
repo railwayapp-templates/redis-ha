@@ -153,6 +153,10 @@ pub struct Telemetry {
     project_id: String,
     environment_id: String,
     component: String,
+    /// Off-Railway (local dev, the e2e harness) telemetry is a no-op: the
+    /// default endpoint is production backboard, and test events with empty
+    /// resource ids are pure noise there.
+    enabled: bool,
 }
 
 impl Telemetry {
@@ -162,10 +166,12 @@ impl Telemetry {
             .build()
             .expect("HTTP client creation should not fail");
 
-        info!(component, "telemetry initialized");
+        let enabled = RailwayEnv::is_railway();
+        info!(component, enabled, "telemetry initialized");
 
         Self {
             client,
+            enabled,
             endpoint: RailwayEnv::graphql_endpoint(),
             service_id: RailwayEnv::service_id(),
             project_id: RailwayEnv::project_id(),
@@ -201,6 +207,10 @@ impl Telemetry {
     }
 
     pub fn send(&self, event: TelemetryEvent) {
+        if !self.enabled {
+            tracing::debug!(event = event.event_type(), "telemetry disabled off-Railway");
+            return;
+        }
         let payload = self.build_payload(&event);
 
         // The first event a node ever sends is NodeStarted, ~100ms into the
@@ -293,6 +303,7 @@ mod tests {
             project_id: "proj-1".to_string(),
             environment_id: "env-1".to_string(),
             component: "redis-wrapper".to_string(),
+            enabled: true,
         }
     }
 
