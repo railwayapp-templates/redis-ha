@@ -302,7 +302,10 @@ async fn query_peer_sentinels(config: &Config) -> Option<(String, u16)> {
 ///     master's INFO, so Sentinel never learns it exists and can never
 ///     `+fix-slave-config` it — the one wrong turn here that nothing
 ///     downstream un-does (link_heal's wrong-master watch is the backstop).
-///  3. Env topology — a genuinely fresh cluster where no peer answers.
+///     A peer answer naming THIS node is refused rather than obeyed — see
+///     [`boot_master_from_peer_answer`].
+///  3. Env topology — a genuinely fresh cluster where no peer answers, or a
+///     refused self-answer.
 pub async fn boot_master_for_this_boot(config: &Config) -> BootMaster {
     if !config.sentinel_enabled {
         return BootMaster::NoLocalState;
@@ -319,27 +322,47 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootMaster {
 
     if enabled(std::env::var(PEER_BOOT_ENV).ok().as_deref()) {
         if let Some((host, port)) = query_peer_sentinels(config).await {
-            let resolved = if addr_is_self(config, &host, port) {
-                BootMaster::SelfIsMaster
-            } else {
-                BootMaster::ReplicaOf(host, port)
-            };
-            match &resolved {
-                BootMaster::SelfIsMaster => {
-                    info!("boot role: master (peer sentinels name this node)")
+            match boot_master_from_peer_answer(config, host, port) {
+                Some(resolved) => {
+                    if let BootMaster::ReplicaOf(host, port) = &resolved {
+                        info!("boot role: replica of {}:{} (from peer sentinels)", host, port);
+                    }
+                    return resolved;
                 }
-                BootMaster::ReplicaOf(host, port) => {
-                    info!("boot role: replica of {}:{} (from peer sentinels)", host, port)
-                }
-                BootMaster::NoLocalState => unreachable!(),
+                None => info!(
+                    "peer sentinels name this node as master, but this is a first boot with no \
+                     local dataset — falling back to the env topology rather than self-promoting"
+                ),
             }
-            return resolved;
+        } else {
+            info!("no peer sentinel answered — falling back to the env topology");
         }
-        info!("no peer sentinel answered — falling back to the env topology");
     }
 
     info!("{}", boot_role_log_line(config, &resolved));
     resolved
+}
+
+/// What a peer answer means for the boot role. A peer naming another node is
+/// a replication target; a peer naming THIS node is refused (`None`).
+///
+/// Self-promotion off a peer answer would be actively dangerous: a first
+/// boot named master by its peers is the incumbent master coming back on a
+/// wiped or replaced volume, and `REPLICAOF NO ONE` there boots an EMPTY
+/// master that every data-bearing replica then full-syncs from — a
+/// cluster-wide wipe. The env fallback preserves today's behavior instead:
+/// a stale replica (or the env-declared master) that Sentinel's
+/// master-in-slave-role handling fails over to a replica that still has the
+/// data.
+pub(crate) fn boot_master_from_peer_answer(
+    config: &Config,
+    host: String,
+    port: u16,
+) -> Option<BootMaster> {
+    if addr_is_self(config, &host, port) {
+        return None;
+    }
+    Some(BootMaster::ReplicaOf(host, port))
 }
 
 #[cfg(test)]
@@ -424,6 +447,41 @@ mod tests {
     #[test]
     fn no_answers_is_none() {
         assert_eq!(majority_answer(&[]), None);
+    }
+
+    // --- boot_master_from_peer_answer ---
+
+    #[test]
+    fn a_peer_answer_naming_another_node_is_a_replication_target() {
+        let config = Config::for_tests(); // self = redis-1.railway.internal:6379
+        assert_eq!(
+            boot_master_from_peer_answer(&config, "redis-2.railway.internal".to_string(), 6379),
+            Some(BootMaster::ReplicaOf(
+                "redis-2.railway.internal".to_string(),
+                6379
+            ))
+        );
+    }
+
+    #[test]
+    fn a_peer_answer_naming_this_node_is_refused() {
+        let config = Config::for_tests();
+        assert_eq!(
+            boot_master_from_peer_answer(&config, "Redis-1.railway.internal.".to_string(), 6379),
+            None
+        );
+    }
+
+    #[test]
+    fn a_peer_answer_naming_this_host_on_another_port_is_still_a_target() {
+        let config = Config::for_tests();
+        assert_eq!(
+            boot_master_from_peer_answer(&config, "redis-1.railway.internal".to_string(), 6380),
+            Some(BootMaster::ReplicaOf(
+                "redis-1.railway.internal".to_string(),
+                6380
+            ))
+        );
     }
 
     // --- parse_sentinel_monitor ---

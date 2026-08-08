@@ -98,7 +98,7 @@ Sentinel already records the current master on the same volume: it owns `sentine
 
 A node that was down for the whole failover never saw the switch, so its `sentinel.conf` still names itself and it comes back as a master — Sentinel demotes it within one failover timeout, as it does today.
 
-A node with no local state at all — a scale-up addition, a replaced volume — asks the peer Sentinels in `SENTINEL_HOSTS` who the master currently is (`BOOT_ROLE_FROM_PEER_SENTINELS`) before falling back to `REPLICA_OF`. The env topology names whoever was master when the template was stamped; a cluster that failed over since would otherwise receive the new node as an invisible chained sub-replica of a demoted ex-master.
+A node with no local state at all — a scale-up addition, a replaced volume — asks the peer Sentinels in `SENTINEL_HOSTS` who the master currently is (`BOOT_ROLE_FROM_PEER_SENTINELS`) before falling back to `REPLICA_OF`. The env topology names whoever was master when the template was stamped; a cluster that failed over since would otherwise receive the new node as an invisible chained sub-replica of a demoted ex-master. The answer is only ever used as a replication target: a peer answer naming the booting node itself (the incumbent master coming back on a wiped volume) is refused, because self-promoting an empty dataset would make every data-bearing replica full-sync from it.
 
 ## Self-healing
 
