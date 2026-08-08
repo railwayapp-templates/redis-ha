@@ -1153,6 +1153,74 @@ t_scale_down_prunes_dead_sentinels() {
   ok "$t"
 }
 
+# SENTINEL_HOSTS is stamped at deploy time and scale-up does not restamp
+# existing nodes, so a founding node restarting after a failover onto a
+# scale-up member finds its sentinel.conf naming a master the env never
+# heard of. That state is legitimate: the boot must probe the address with
+# the cluster's shared password and preserve it, not quarantine a live
+# topology on every restart (#19).
+t_scaled_member_master_is_preserved_at_boot() {
+  local t=t_scaled_member_master_is_preserved_at_boot
+  # The "scale-up member the env never learned about": a live master
+  # sharing the cluster password, absent from the booting node's
+  # SENTINEL_HOSTS.
+  mkvol memb-vol-m
+  start_node memb-m memb-vol-m /data
+  wait_for_role_master memb-m || { ko "$t" "memb-m never became master" memb-m; return; }
+
+  # The founding node: volume already carries sentinel state naming that
+  # out-of-topology master — the post-failover shape — while its own env
+  # (SENTINEL_HOSTS=memb-1 only, REPLICA_OF empty) knows nothing of it.
+  # The seeded conf mirrors what the wrapper writes and Sentinel rewrites:
+  # resolve-hostnames must precede a hostname monitor line or Sentinel
+  # refuses to boot, and auth-pass is what lets it actually see the master.
+  mkvol memb-vol-1
+  docker run --rm -v memb-vol-1:/v alpine:latest sh -c "printf '%s\n' \
+    'sentinel resolve-hostnames yes' \
+    'sentinel announce-hostnames yes' \
+    'sentinel monitor mymaster memb-m 6379 2' \
+    'sentinel auth-pass mymaster ${PW}' > /v/sentinel.conf && chown -R 999:999 /v" \
+    >/dev/null 2>&1
+  start_node memb-1 memb-vol-1 /data
+  wait_for_log_line memb-1 "authenticates as a live member" 30 \
+    || { ko "$t" "membership probe never preserved the undeclared master" memb-1; return; }
+  wait_for_replica_repointed memb-1 memb-m 90 \
+    || { ko "$t" "node never attached to the preserved master" memb-1 memb-m; return; }
+  docker run --rm -v memb-vol-1:/v alpine:latest sh -c 'ls /v/sentinel.conf.ghost-*' \
+    >/dev/null 2>&1 \
+    && { ko "$t" "live member state must not be quarantined" memb-1; return; }
+
+  docker rm -f memb-m memb-1 >/dev/null 2>&1
+  ok "$t"
+}
+
+# The membership probe's discriminator is the shared password, not DNS: a
+# foreign service that happens to reuse the hostname of a dead member
+# resolves and answers, but refuses the cluster's AUTH — that state is a
+# dead world and must still be quarantined.
+t_foreign_host_reusing_member_name_is_quarantined() {
+  local t=t_foreign_host_reusing_member_name_is_quarantined
+  docker rm -f memb-x >/dev/null 2>&1
+  docker run -d --name memb-x --label "$LABEL" --network "$NET" \
+    --network-alias memb-x "$SEED_IMAGE" \
+    redis-server --requirepass not-the-cluster-password >/dev/null
+
+  mkvol memb-vol-f
+  docker run --rm -v memb-vol-f:/v alpine:latest sh -c \
+    'echo "sentinel monitor mymaster memb-x 6379 2" > /v/sentinel.conf && chown -R 999:999 /v' \
+    >/dev/null 2>&1
+  start_node memb-f memb-vol-f /data
+  wait_for_log_line memb-f "moved ghost sentinel.conf aside" 30 \
+    || { ko "$t" "foreign-auth master was not quarantined" memb-f memb-x; return; }
+  wait_for_role_master memb-f || { ko "$t" "node never fell back to the env topology" memb-f; return; }
+  docker run --rm -v memb-vol-f:/v alpine:latest sh -c 'ls /v/sentinel.conf.ghost-*' \
+    >/dev/null 2>&1 \
+    || { ko "$t" "quarantined state must be preserved on the volume" memb-f; return; }
+
+  docker rm -f memb-x memb-f >/dev/null 2>&1
+  ok "$t"
+}
+
 # ----- runner ------------------------------------------------------------------
 ALL_TESTS=(
   t_fresh_boot
@@ -1174,6 +1242,8 @@ ALL_TESTS=(
   t_link_heal_repoints_wrong_master_attachment
   t_quorum_follows_registered_membership
   t_scale_down_prunes_dead_sentinels
+  t_scaled_member_master_is_preserved_at_boot
+  t_foreign_host_reusing_member_name_is_quarantined
 )
 
 setup
