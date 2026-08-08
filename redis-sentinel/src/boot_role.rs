@@ -1266,7 +1266,7 @@ mod tests {
 
         assert_eq!(
             boot_master_for_this_boot(&config).await,
-            BootMaster::NoLocalState
+            BootResolution::of(BootMaster::NoLocalState)
         );
     }
 
@@ -1289,7 +1289,7 @@ mod tests {
 
         assert_eq!(
             boot_master_for_this_boot(&config).await,
-            BootMaster::NoLocalState
+            BootResolution::of(BootMaster::NoLocalState)
         );
         assert!(dir.path().join("sentinel.conf").exists());
     }
