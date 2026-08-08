@@ -44,6 +44,16 @@ Each Redis node runs a colocated Sentinel on port 26379. HAProxy probes each nod
 
 Use `REDIS_URL` (writes) or `REDIS_PUBLIC_URL` (public TCP) from the **Redis HA** (HAProxy) service. Do not connect directly to individual Redis nodes.
 
+### Connection lifetime
+
+The edge holds idle connections open for 1 day by default (`HAPROXY_TIMEOUT_CLIENT` / `HAPROXY_TIMEOUT_SERVER` on the HAProxy service). A connection idle past that — no commands, no pub/sub messages — is closed with a clean FIN; any client with reconnect enabled recovers transparently. TCP keepalives are on (`option tcpka`), so dead peers are reaped well before the idle timeout; raise or lower the knobs if your workload needs it.
+
+Client checklist (same as any Redis on Railway's private network):
+
+- ioredis / node-redis: set `family: 0` (or `?family=0` on the URL) so DNS resolves the private network's IPv6.
+- Enable TCP keepalive in the client (e.g. ioredis `keepAlive: 30000`) and a `commandTimeout` so a half-open socket fails fast instead of hanging.
+- Expect failovers to drop in-flight connections: writes resume against the new master on reconnect, no client config change needed.
+
 ## Scaling
 
 Scale from 2–5 replicas via the cluster overview. Sentinel uses gossip to discover new peers — the initial `SENTINEL_HOSTS` list bootstraps the cluster; scale-up nodes join automatically.
