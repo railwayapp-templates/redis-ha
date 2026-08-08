@@ -32,8 +32,13 @@ impl Config {
             redis_port: u16::env_parse("REDIS_PORT", 6379),
             max_conn: String::env_or("HAPROXY_MAX_CONN", "10000"),
             timeout_connect: String::env_or("HAPROXY_TIMEOUT_CONNECT", "10s"),
-            timeout_client: String::env_or("HAPROXY_TIMEOUT_CLIENT", "30m"),
-            timeout_server: String::env_or("HAPROXY_TIMEOUT_SERVER", "30m"),
+            // Standalone Redis never disconnects idle clients (redis `timeout 0`),
+            // so the edge must not either: pooled connections and pub/sub
+            // subscribers on quiet channels legitimately sit idle for hours.
+            // Dead peers are reaped by TCP keepalive (`option tcpka`), which does
+            // NOT reset these idle timers — they are a last-resort backstop only.
+            timeout_client: String::env_or("HAPROXY_TIMEOUT_CLIENT", "1d"),
+            timeout_server: String::env_or("HAPROXY_TIMEOUT_SERVER", "1d"),
             timeout_check: String::env_or("HAPROXY_TIMEOUT_CHECK", "3s"),
             check_interval: String::env_or("HAPROXY_CHECK_INTERVAL", "3s"),
             check_fastinter: String::env_or("HAPROXY_CHECK_FASTINTER", "500ms"),
