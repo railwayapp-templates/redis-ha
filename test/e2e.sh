@@ -1069,6 +1069,12 @@ t_link_heal_repoints_wrong_master_attachment() {
 # keeps each local sentinel at a strict majority of the sentinels it
 # actually gossips with, so the whole cluster converges on 3 here even
 # though every node was SEEDED with the stale template default of 2.
+#
+# The split-brain fence must converge with it: every node here booted with
+# min-replicas-to-write 1 (the stale SENTINEL_QUORUM=2 stamp), which on a
+# 5-node cluster only fences a FULLY isolated master — a partition trapping
+# one replica with the old master would leave two writers. The watcher must
+# raise every node to majority − 1 = 2.
 t_quorum_follows_registered_membership() {
   local t=t_quorum_follows_registered_membership
   local fast=(-e QUORUM_SYNC_POLL_SECONDS=2 -e QUORUM_SYNC_DWELL_SECONDS=5)
@@ -1092,6 +1098,18 @@ t_quorum_follows_registered_membership() {
       sleep 1
     done
     [ -n "$converged" ] || { ko "$t" "${n} quorum never converged to 3 (got '\''${q}'\'')" "$n"; return; }
+  done
+
+  local f
+  for n in quor-1 quor-2 quor-3 quor-4 quor-5; do
+    converged=""
+    for i in $(seq 1 120); do
+      f=$(rcli "$n" CONFIG GET min-replicas-to-write | tail -1)
+      [ "$f" = "2" ] && { converged=1; break; }
+      sleep 1
+    done
+    [ -n "$converged" ] \
+      || { ko "$t" "${n} fence never converged to 2 (got '\''${f}'\'')" "$n"; return; }
   done
 
   docker rm -f quor-1 quor-2 quor-3 quor-4 quor-5 >/dev/null 2>&1
@@ -1131,7 +1149,8 @@ t_scale_down_prunes_dead_sentinels() {
 
   # Each survivor independently: marks the two dead sentinels s_down, serves
   # the 10s prune dwell, RESETs its local view, and the membership-majority
-  # quorum then converges to majority(3) = 2.
+  # quorum then converges to majority(3) = 2. The 3 survivors are a live
+  # majority of the 5 known, so the prune's partition gate lets this pass.
   local q peers converged
   for n in prune-1 prune-2 prune-3; do
     converged=""
@@ -1147,6 +1166,21 @@ t_scale_down_prunes_dead_sentinels() {
       || { ko "$t" "${n} never pruned to 2 peers / quorum 2 (peers='\''${peers}'\'' quorum='\''${q}'\'')" "$n"; return; }
     wait_for_log_line "$n" "reset the local sentinel to forget peers down past the dwell" 10 \
       || { ko "$t" "${n} converged without the prune log line" "$n"; return; }
+  done
+
+  # The fence shrinks with the membership: majority(3) − 1 = 1. Without
+  # this a 5→3 scale-down leaves the master demanding 2 acking replicas of
+  # the single one it has left, fencing every write on a healthy cluster.
+  local f
+  for n in prune-1 prune-2 prune-3; do
+    converged=""
+    for i in $(seq 1 180); do
+      f=$(rcli "$n" CONFIG GET min-replicas-to-write | tail -1)
+      [ "$f" = "1" ] && { converged=1; break; }
+      sleep 1
+    done
+    [ -n "$converged" ] \
+      || { ko "$t" "${n} fence never shrank to 1 (got '\''${f}'\'')" "$n"; return; }
   done
 
   docker rm -f prune-1 prune-2 prune-3 >/dev/null 2>&1
