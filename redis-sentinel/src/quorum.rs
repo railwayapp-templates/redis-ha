@@ -195,7 +195,9 @@ fn step_drift(
 }
 
 /// The value for `key` in a flat field-value reply (`SENTINEL master`).
-fn field_value(fields: &[String], key: &str) -> Option<String> {
+/// `pub(crate)`: `demote_on_shutdown` reuses this to read the same
+/// `SENTINEL MASTER` reply's `flags`/`ip`/`port` fields.
+pub(crate) fn field_value(fields: &[String], key: &str) -> Option<String> {
     fields
         .chunks(2)
         .find(|pair| pair.len() == 2 && pair[0] == key)

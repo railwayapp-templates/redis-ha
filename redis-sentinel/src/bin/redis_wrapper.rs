@@ -17,6 +17,7 @@ use redis_sentinel::{
         EMPTY_PRIMARY_GUARD_ENV,
     },
     config::{data_dir_is_on_volume, Config},
+    demote_on_shutdown::DemoteTarget,
     health_server,
     link_heal,
     process_manager::{enable_aof_after_rdb_load, spawn_redis, spawn_sentinel, supervise},
@@ -230,6 +231,16 @@ async fn main() -> Result<()> {
         );
     }
 
+    // What a graceful stop needs to trigger its own failover before
+    // signaling either child — see `demote_on_shutdown` for the sequence.
+    let demote_target = DemoteTarget {
+        redis_port: config.redis_port,
+        redis_password: config.redis_password.clone(),
+        sentinel_port: config.sentinel_port,
+        redis_master_name: config.redis_master_name.clone(),
+        sentinel_enabled: config.sentinel_enabled,
+    };
+
     // Block until a process exits or we receive a signal
-    supervise(redis_proc, sentinel_proc).await
+    supervise(redis_proc, sentinel_proc, demote_target).await
 }
