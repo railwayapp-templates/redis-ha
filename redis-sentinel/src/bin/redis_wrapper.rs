@@ -190,6 +190,7 @@ async fn main() -> Result<()> {
             config.redis_port,
             config.redis_password.clone(),
             config.redis_master_name.clone(),
+            config.private_domain.clone(),
         );
     }
 
