@@ -1098,6 +1098,61 @@ t_quorum_follows_registered_membership() {
   ok "$t"
 }
 
+
+# Sentinel never forgets a removed peer: after a scale-down the leftover
+# s_down entries permanently inflate the failover-election denominator (a
+# 5->3 cluster still needs 3-of-5, i.e. unanimity of the survivors). The
+# quorum-sync watcher prunes peers down past the dwell via a local SENTINEL
+# RESET, and the membership-majority quorum then shrinks with them.
+t_scale_down_prunes_dead_sentinels() {
+  local t=t_scale_down_prunes_dead_sentinels
+  local fast=(-e QUORUM_SYNC_POLL_SECONDS=2 -e QUORUM_SYNC_DWELL_SECONDS=5 -e SENTINEL_PRUNE_DWELL_SECONDS=10 -e SENTINEL_PRUNE_BACKOFF_SECONDS=5)
+  local hosts="prune-1:26379,prune-2:26379,prune-3:26379,prune-4:26379,prune-5:26379"
+  local i
+  for i in 1 2 3 4 5; do mkvol "prune-vol-${i}"; done
+  start_node prune-1 prune-vol-1 /data -e SENTINEL_HOSTS="$hosts" "${fast[@]}"
+  for i in 2 3 4 5; do
+    start_node "prune-${i}" "prune-vol-${i}" /data \
+      -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=prune-1:6379 "${fast[@]}"
+  done
+  wait_for_role_master prune-1 || { ko "$t" "prune-1 never became master" prune-1; return; }
+
+  # Let every survivor-to-be see the full 5-sentinel membership first, so
+  # the removal below is a real scale-down of a converged cluster.
+  local n
+  for n in prune-1 prune-2 prune-3; do
+    wait_for_sentinel_peers "$n" 4 120 \
+      || { ko "$t" "${n} never saw the full membership" "$n"; return; }
+  done
+
+  # Scale down 5 -> 3: the removed services are deleted, DNS and all.
+  docker rm -f prune-4 prune-5 >/dev/null 2>&1
+  docker volume rm -f prune-vol-4 prune-vol-5 >/dev/null 2>&1
+
+  # Each survivor independently: marks the two dead sentinels s_down, serves
+  # the 10s prune dwell, RESETs its local view, and the membership-majority
+  # quorum then converges to majority(3) = 2.
+  local q peers converged
+  for n in prune-1 prune-2 prune-3; do
+    converged=""
+    for i in $(seq 1 180); do
+      peers=$(docker exec "$n" redis-cli -p 26379 SENTINEL master mymaster 2>/dev/null \
+        | grep -A1 "^num-other-sentinels$" | tail -1)
+      q=$(docker exec "$n" redis-cli -p 26379 SENTINEL master mymaster 2>/dev/null \
+        | grep -A1 "^quorum$" | tail -1)
+      [ "$peers" = "2" ] && [ "$q" = "2" ] && { converged=1; break; }
+      sleep 1
+    done
+    [ -n "$converged" ] \
+      || { ko "$t" "${n} never pruned to 2 peers / quorum 2 (peers='\''${peers}'\'' quorum='\''${q}'\'')" "$n"; return; }
+    wait_for_log_line "$n" "reset the local sentinel to forget peers down past the dwell" 10 \
+      || { ko "$t" "${n} converged without the prune log line" "$n"; return; }
+  done
+
+  docker rm -f prune-1 prune-2 prune-3 >/dev/null 2>&1
+  ok "$t"
+}
+
 # ----- runner ------------------------------------------------------------------
 ALL_TESTS=(
   t_fresh_boot
@@ -1118,6 +1173,7 @@ ALL_TESTS=(
   t_new_node_boot_asks_peer_sentinels
   t_link_heal_repoints_wrong_master_attachment
   t_quorum_follows_registered_membership
+  t_scale_down_prunes_dead_sentinels
 )
 
 setup
