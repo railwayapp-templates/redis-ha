@@ -182,8 +182,15 @@ async fn main() -> Result<()> {
             telemetry,
         );
         // Keep this Sentinel's odown quorum a majority of the Sentinels it
-        // actually knows, so scale changes converge without a conf rewrite.
-        quorum::spawn(config.sentinel_port, config.redis_master_name.clone());
+        // actually knows — and the local Redis's split-brain fence at
+        // majority − 1 of them — so scale changes converge without a conf
+        // rewrite or redeploy.
+        quorum::spawn(
+            config.sentinel_port,
+            config.redis_port,
+            config.redis_password.clone(),
+            config.redis_master_name.clone(),
+        );
     }
 
     // Block until a process exits or we receive a signal
