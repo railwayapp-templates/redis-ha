@@ -990,6 +990,114 @@ t_link_heal_recovers_from_partition_during_failover() {
   ok "$t"
 }
 
+
+# A node added by a scale-up boots with REPLICA_OF naming whoever was master
+# when the template was stamped. If the cluster failed over since, that
+# address is a demoted replica: attach there and the new node never appears
+# in the real master's INFO, so no sentinel learns it exists and
+# +fix-slave-config can never repoint it. First line of defense: with no
+# local sentinel state, ask the peers' sentinels who the master is and
+# attach there from the very first handshake.
+t_new_node_boot_asks_peer_sentinels() {
+  local t=t_new_node_boot_asks_peer_sentinels
+  start_ha_trio peerq \
+    || { ko "$t" "trio never became a functioning cluster" peerq-1 peerq-2 peerq-3; return; }
+  local promoted
+  promoted=$(promote_by_pausing peerq-1 peerq-2 peerq-3) \
+    || { dump_sentinel_view peerq-2 peerq-3; ko "$t" "no replica was promoted" peerq-2 peerq-3; return; }
+  note "promoted: ${promoted}"
+
+  # The scale-up node: fresh volume, env topology still naming the paused,
+  # demoted peerq-1 — exactly what the platform would stamp.
+  mkvol peerq-vol-4
+  start_node peerq-4 peerq-vol-4 /data \
+    -e SENTINEL_HOSTS="peerq-1:26379,peerq-2:26379,peerq-3:26379" \
+    -e REPLICA_OF=peerq-1:6379
+  wait_for_log_line peerq-4 "from peer sentinels" 30 \
+    || { ko "$t" "boot role never came from the peer sentinels" peerq-4; return; }
+  wait_for_replica_repointed peerq-4 "$promoted" 90 \
+    || { ko "$t" "new node did not attach to the current master" peerq-4 "$promoted"; return; }
+
+  docker unpause peerq-1 >/dev/null 2>&1
+  docker rm -f peerq-1 peerq-2 peerq-3 peerq-4 >/dev/null 2>&1
+  ok "$t"
+}
+
+# The backstop for the same race, for when the peer query cannot save the
+# boot (failover completing WHILE the node syncs, or the query switched
+# off): the node attaches to the demoted ex-master, link healthy, chained
+# behind the real master, invisible to every sentinel. link-heal's
+# wrong-master watch must spot the disagreement with Sentinel's answer and
+# repoint it live.
+t_link_heal_repoints_wrong_master_attachment() {
+  local t=t_link_heal_repoints_wrong_master_attachment
+  local fast=(-e LINK_HEAL_POLL_SECONDS=1 -e LINK_HEAL_WRONG_MASTER_DWELL_SECONDS=5 -e LINK_HEAL_ACTION_BACKOFF_SECONDS=1)
+  start_ha_trio wrongm "${fast[@]}" \
+    || { ko "$t" "trio never became a functioning cluster" wrongm-1 wrongm-2 wrongm-3; return; }
+  local promoted
+  promoted=$(promote_by_pausing wrongm-1 wrongm-2 wrongm-3) \
+    || { dump_sentinel_view wrongm-2 wrongm-3; ko "$t" "no replica was promoted" wrongm-2 wrongm-3; return; }
+  note "promoted: ${promoted}"
+
+  # Bring the demoted ex-master back as a replica so it can serve a chained
+  # sync to the new node — the shape the incident produced.
+  docker unpause wrongm-1 >/dev/null 2>&1
+  wait_for_replica_repointed wrongm-1 "$promoted" 120 \
+    || { ko "$t" "old master never rejoined as a replica" wrongm-1 "$promoted"; return; }
+
+  mkvol wrongm-vol-4
+  start_node wrongm-4 wrongm-vol-4 /data \
+    -e SENTINEL_HOSTS="wrongm-1:26379,wrongm-2:26379,wrongm-3:26379" \
+    -e REPLICA_OF=wrongm-1:6379 \
+    -e BOOT_ROLE_FROM_PEER_SENTINELS=false \
+    "${fast[@]}"
+  wait_for_replica_repointed wrongm-4 wrongm-1 90 \
+    || { ko "$t" "node never attached to the demoted master (fault injection failed)" wrongm-4 wrongm-1; return; }
+
+  wait_for_log_line wrongm-4 "repointing a replica durably attached to the wrong master" 90 \
+    || { ko "$t" "wrong-master watch never acted" wrongm-4; return; }
+  wait_for_replica_repointed wrongm-4 "$promoted" 90 \
+    || { ko "$t" "replica never landed on the real master after the heal" wrongm-4 "$promoted"; return; }
+
+  docker rm -f wrongm-1 wrongm-2 wrongm-3 wrongm-4 >/dev/null 2>&1
+  ok "$t"
+}
+
+# Every sentinel.conf freezes the quorum its first boot computed, and a
+# preserved conf never rereads the restamped env — after a 3→5 scale the old
+# nodes kept quorum 2 while the new ones wrote 3. The quorum-sync watcher
+# keeps each local sentinel at a strict majority of the sentinels it
+# actually gossips with, so the whole cluster converges on 3 here even
+# though every node was SEEDED with the stale template default of 2.
+t_quorum_follows_registered_membership() {
+  local t=t_quorum_follows_registered_membership
+  local fast=(-e QUORUM_SYNC_POLL_SECONDS=2 -e QUORUM_SYNC_DWELL_SECONDS=5)
+  local hosts="quor-1:26379,quor-2:26379,quor-3:26379,quor-4:26379,quor-5:26379"
+  local i
+  for i in 1 2 3 4 5; do mkvol "quor-vol-${i}"; done
+  start_node quor-1 quor-vol-1 /data -e SENTINEL_HOSTS="$hosts" "${fast[@]}"
+  for i in 2 3 4 5; do
+    start_node "quor-${i}" "quor-vol-${i}" /data \
+      -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=quor-1:6379 "${fast[@]}"
+  done
+  wait_for_role_master quor-1 || { ko "$t" "quor-1 never became master" quor-1; return; }
+
+  local n q converged
+  for n in quor-1 quor-2 quor-3 quor-4 quor-5; do
+    converged=""
+    for i in $(seq 1 120); do
+      q=$(docker exec "$n" redis-cli -p 26379 SENTINEL master mymaster 2>/dev/null \
+        | grep -A1 "^quorum$" | tail -1)
+      [ "$q" = "3" ] && { converged=1; break; }
+      sleep 1
+    done
+    [ -n "$converged" ] || { ko "$t" "${n} quorum never converged to 3 (got '\''${q}'\'')" "$n"; return; }
+  done
+
+  docker rm -f quor-1 quor-2 quor-3 quor-4 quor-5 >/dev/null 2>&1
+  ok "$t"
+}
+
 # ----- runner ------------------------------------------------------------------
 ALL_TESTS=(
   t_fresh_boot
@@ -1007,6 +1115,9 @@ ALL_TESTS=(
   t_cold_restart_preserves_promoted_master
   t_link_heal_recovers_broken_replica_link
   t_link_heal_recovers_from_partition_during_failover
+  t_new_node_boot_asks_peer_sentinels
+  t_link_heal_repoints_wrong_master_attachment
+  t_quorum_follows_registered_membership
 )
 
 setup
