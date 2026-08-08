@@ -662,6 +662,122 @@ t_sentinel_failover() {
   ok "$t"
 }
 
+# The planned-shutdown counterpart of t_sentinel_failover: `docker stop`
+# sends SIGTERM (not SIGKILL) and gives the container up to `-t` seconds to
+# exit on its own — exactly the redeploy path `demote_on_shutdown` targets.
+# Without it, the master's process would just die and the survivors would
+# only notice once SENTINEL_DOWN_AFTER_MS elapses; with it, the master's own
+# local Sentinel is asked to force the failover BEFORE redis-server is even
+# signaled, so the switch is confirmed while the old master is still up to
+# observe it — proven here directly from its own log, not inferred from
+# timing.
+t_sigterm_master_demotes_before_exit() {
+  local t=t_sigterm_master_demotes_before_exit
+  local hosts="demote-1:26379,demote-2:26379,demote-3:26379"
+  mkvol demote-vol-1; mkvol demote-vol-2; mkvol demote-vol-3
+  start_node demote-1 demote-vol-1 /data -e SENTINEL_HOSTS="$hosts"
+  start_node demote-2 demote-vol-2 /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=demote-1:6379
+  start_node demote-3 demote-vol-3 /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=demote-1:6379
+  wait_for_role_master demote-1 \
+    || { ko "$t" "demote-1 never became master" demote-1 demote-2 demote-3; return; }
+
+  write_key demote-1 demotekey demotevalue \
+    || { ko "$t" "master never accepted the pre-shutdown write" demote-1; return; }
+  wait_for_key demote-2 demotekey demotevalue || { ko "$t" "demote-2 never synced" demote-1 demote-2; return; }
+  wait_for_key demote-3 demotekey demotevalue || { ko "$t" "demote-3 never synced" demote-1 demote-3; return; }
+
+  # Same readiness bar as t_sentinel_failover: both survivors must see each
+  # other and have a live view of both replicas before the master leaves, or
+  # the failover this test is about to force could never actually succeed.
+  wait_for_sentinel_peers demote-2 2 || { ko "$t" "demote-2 sentinel never saw 2 peers" demote-2; return; }
+  wait_for_sentinel_peers demote-3 2 || { ko "$t" "demote-3 sentinel never saw 2 peers" demote-3; return; }
+  wait_for_sentinel_slave_view demote-2 2 \
+    || { dump_sentinel_view demote-2; ko "$t" "demote-2 sentinel never got a live view of both replicas" demote-2; return; }
+  wait_for_sentinel_slave_view demote-3 2 \
+    || { dump_sentinel_view demote-3; ko "$t" "demote-3 sentinel never got a live view of both replicas" demote-3; return; }
+
+  # Unlike an ordinary unplanned failover — where the dying master is never
+  # the leader, so only the survivors' views matter — demote-1's own local
+  # Sentinel is the one `SENTINEL FAILOVER` forces into the leader role
+  # here, and per the docs it runs the WHOLE state machine unilaterally,
+  # including reconfiguring every OTHER known replica. If demote-1's own
+  # view of demote-3 is stale at that moment (Sentinel discovers slaves from
+  # the master's own INFO on a periodic refresh, a few seconds by default),
+  # reconf-slaves only touches the replicas it already knew about, and
+  # demote-3 is left pointed at the master that is about to disappear until
+  # Sentinel's slower `+fix-slave-config` housekeeping eventually catches
+  # it — empirically confirmed live (see the demote_on_shutdown PR
+  # description) before this check was added.
+  wait_for_sentinel_slave_view demote-1 2 \
+    || { dump_sentinel_view demote-1; ko "$t" "demote-1 (the future failover leader) never got a live view of both replicas" demote-1; return; }
+
+  # `docker stop -t 30`: SIGTERM, then up to 30s (Railway's own grace window
+  # — see demote_on_shutdown's module doc) before a SIGKILL. A demote that
+  # actually ran and confirmed should return in well under that.
+  local stop_started stop_finished stop_elapsed
+  stop_started=$(date +%s)
+  docker stop -t 30 demote-1 >/dev/null 2>&1
+  stop_finished=$(date +%s)
+  stop_elapsed=$(( stop_finished - stop_started ))
+
+  # Direct proof, from the old master's OWN log, that the demote sequence
+  # ran and confirmed the failover before it exited — not inferred from
+  # timing. graceful_shutdown (and its own kill fallbacks) only run after
+  # demote_before_shutdown returns, so this line existing at all means it
+  # returned before redis-server or sentinel were ever signaled to stop.
+  docker logs demote-1 2>&1 | grep -q "demote-on-shutdown: master shutting down" \
+    || { ko "$t" "demote-1 never attempted the pre-shutdown failover" demote-1; return; }
+  docker logs demote-1 2>&1 | grep -q "demote-on-shutdown: failover confirmed" \
+    || { ko "$t" "demote-1 never confirmed the failover before exiting" demote-1; return; }
+
+  # And it must have actually been fast — nowhere near the -t budget, which
+  # is the whole point versus a timeout failover.
+  [ "$stop_elapsed" -lt 15 ] \
+    || { ko "$t" "docker stop took ${stop_elapsed}s — looks like the shutdown timed out rather than a triggered failover completing" demote-1; return; }
+
+  # A survivor must have taken over, and the switch must be visible in a
+  # survivor's own Sentinel log too (`+switch-master`) — the event the local
+  # `SENTINEL FAILOVER` request drove.
+  local promoted="" n
+  for n in demote-2 demote-3; do
+    docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
+      | grep -q '"role":"master"' && { promoted="$n"; break; }
+  done
+  [ -n "$promoted" ] || { ko "$t" "no survivor was promoted after the stop" demote-2 demote-3; return; }
+  note "promoted: ${promoted} (docker stop took ${stop_elapsed}s)"
+
+  local switch_seen=""
+  for n in demote-2 demote-3; do
+    docker logs "$n" 2>&1 | grep -q '+switch-master' && { switch_seen=1; break; }
+  done
+  [ -n "$switch_seen" ] \
+    || { ko "$t" "no survivor logged +switch-master" demote-2 demote-3; return; }
+
+  # The new master must accept writes promptly — the blackout this feature
+  # closes, not the 5-10s a timeout failover would cost.
+  write_key "$promoted" postdemotekey postdemotevalue 15 \
+    || { ko "$t" "new master never accepted a write promptly after the stop" "$promoted"; return; }
+
+  # The stopped node must rejoin as a REPLICA on restart: its own Sentinel
+  # observed (indeed drove) the switch before it went down, so boot-role
+  # resolution reads that back rather than reasserting deploy-time master.
+  docker start demote-1 >/dev/null 2>&1
+  wait_for_ping demote-1 || { ko "$t" "demote-1 never came back after restart" demote-1; return; }
+  local role
+  role=$(redis_role demote-1)
+  [ "$role" = "slave" ] \
+    || { ko "$t" "demote-1 rejoined as '${role}', expected slave of ${promoted}" demote-1; return; }
+  wait_for_link_status demote-1 up 60 \
+    || { ko "$t" "demote-1 never linked to ${promoted} after rejoining" demote-1 "$promoted"; return; }
+  wait_for_key demote-1 postdemotekey postdemotevalue \
+    || { ko "$t" "demote-1 never resynced the post-stop write" demote-1; return; }
+  wait_for_key demote-1 demotekey demotevalue 30 \
+    || { ko "$t" "pre-shutdown key missing after the rejoin" demote-1; return; }
+
+  docker rm -f demote-1 demote-2 demote-3 >/dev/null 2>&1
+  ok "$t"
+}
+
 # `REPLICA_OF` is the topology at DEPLOY time. Redeploying the node that was
 # deployed as the initial master, after Sentinel has moved the master
 # elsewhere, used to regenerate `replicaof` from that env var alone and bring
@@ -1457,6 +1573,92 @@ t_foreign_host_reusing_member_name_is_quarantined() {
   ok "$t"
 }
 
+# The empty-master wipe: the env-primary comes back on a wiped/replaced
+# volume before any failover happened, so every peer sentinel still names it
+# master. The env fallback would boot it as an EMPTY master; its replicas
+# were never repointed, so they reconnect, ack (min-replicas-to-write is
+# satisfied — the fence does not protect here) and full-resync the empty
+# dataset: the whole cluster's data gone. The boot guard must refuse — exit
+# before redis ever listens, volume untouched — so Sentinel fails over to a
+# data-bearing replica, and the wiped node's next boot joins it as a
+# replica through the peer query.
+t_wiped_master_volume_does_not_wipe_cluster() {
+  local t=t_wiped_master_volume_does_not_wipe_cluster
+  local hosts="wipe-1:26379,wipe-2:26379,wipe-3:26379"
+  # A longer down-after keeps the peers naming wipe-1 master while the wiped
+  # boot runs its peer query — the real trigger (a redeploy replacing the
+  # volume) has the same shape: the node is back well before sdown.
+  local slow=(-e SENTINEL_DOWN_AFTER_MS=15000)
+  start_ha_trio wipe "${slow[@]}" \
+    || { dump_sentinel_view wipe-2 wipe-3
+         ko "$t" "cluster never became failover-ready" wipe-1 wipe-2 wipe-3; return; }
+  write_key wipe-1 wipekey wipevalue \
+    || { ko "$t" "master never accepted the marker write" wipe-1; return; }
+  wait_for_key wipe-2 wipekey wipevalue || { ko "$t" "wipe-2 never synced" wipe-1 wipe-2; return; }
+  wait_for_key wipe-3 wipekey wipevalue || { ko "$t" "wipe-3 never synced" wipe-1 wipe-3; return; }
+
+  # The volume replacement: same service, same deploy-time env (REPLICA_OF
+  # still empty), nothing left on the volume.
+  docker rm -f wipe-1 >/dev/null 2>&1
+  docker run --rm -v wipe-vol-1:/v alpine:latest sh -c \
+    'rm -rf /v/* /v/.[!.]* /v/..?* 2>/dev/null; chown 999:999 /v' >/dev/null 2>&1
+  start_node wipe-1 wipe-vol-1 /data -e SENTINEL_HOSTS="$hosts" "${slow[@]}"
+
+  wait_for_log_line wipe-1 "refusing to boot as an empty master" 30 \
+    || { ko "$t" "guard never refused the empty-master boot" wipe-1; return; }
+  local i state=""
+  for i in $(seq 1 30); do
+    state=$(docker inspect -f '{{.State.Status}}:{{.State.ExitCode}}' wipe-1 2>/dev/null)
+    [ "$state" = "exited:1" ] && break
+    sleep 1
+  done
+  [ "$state" = "exited:1" ] \
+    || { ko "$t" "guard logged but the container did not exit(1) (state=${state})" wipe-1; return; }
+  # Fail-stop means hands off the volume: nothing written, nothing quarantined.
+  docker run --rm -v wipe-vol-1:/v alpine:latest sh -c 'ls -A /v' 2>/dev/null | grep -q . \
+    && { ko "$t" "the refused boot wrote to the wiped volume" wipe-1; return; }
+
+  # An exited container drops its DNS record and Sentinel spins on NXDOMAIN
+  # instead of counting the node down (see t_sentinel_failover on kill vs
+  # pause). A crashlooping Railway service keeps its private domain, so hold
+  # the name with an idle container while the failover runs.
+  docker run -d --name wipe-1-dns --label "$LABEL" --network "$NET" \
+    --network-alias wipe-1 alpine:latest sleep 600 >/dev/null
+
+  local promoted="" n
+  for i in $(seq 1 180); do
+    for n in wipe-2 wipe-3; do
+      docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
+        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+    done
+    sleep 1
+  done
+  [ -n "$promoted" ] || {
+    dump_sentinel_view wipe-2 wipe-3
+    ko "$t" "no replica was promoted after the wiped master refused to boot" wipe-2 wipe-3
+    return
+  }
+  note "promoted: ${promoted}"
+  [ "$(rcli "$promoted" GET wipekey)" = "wipevalue" ] \
+    || { ko "$t" "marker data lost on the promoted master" "$promoted"; return; }
+
+  # The next boot of the wiped node (Railway's restart policy; same env,
+  # same empty volume): the peers now name the promoted node, so it joins
+  # as a replica and resyncs the dataset — the normal first-boot path.
+  docker rm -f wipe-1-dns >/dev/null 2>&1
+  docker start wipe-1 >/dev/null 2>&1
+  wait_for_ping wipe-1 || { ko "$t" "wiped node never came back as a replica" wipe-1; return; }
+  wait_for_replica_repointed wipe-1 "$promoted" 90 \
+    || { ko "$t" "wiped node never attached to ${promoted}" wipe-1 "$promoted"; return; }
+  wait_for_key wipe-1 wipekey wipevalue \
+    || { ko "$t" "marker data never resynced to the rejoined node" wipe-1 "$promoted"; return; }
+  [ "$(rcli "$promoted" GET wipekey)" = "wipevalue" ] \
+    || { ko "$t" "promoted master lost data when the wiped node rejoined" "$promoted"; return; }
+
+  docker rm -f wipe-1 wipe-2 wipe-3 >/dev/null 2>&1
+  ok "$t"
+}
+
 # ----- runner ------------------------------------------------------------------
 ALL_TESTS=(
   t_fresh_boot
@@ -1470,6 +1672,7 @@ ALL_TESTS=(
   t_rewrite_failure_recovers
   t_replication_of_adopted_data
   t_sentinel_failover
+  t_sigterm_master_demotes_before_exit
   t_restart_old_master_rejoins_as_replica
   t_cold_restart_preserves_promoted_master
   t_link_heal_recovers_broken_replica_link
@@ -1482,6 +1685,7 @@ ALL_TESTS=(
   t_paused_majority_keeps_the_fence
   t_scaled_member_master_is_preserved_at_boot
   t_foreign_host_reusing_member_name_is_quarantined
+  t_wiped_master_volume_does_not_wipe_cluster
   t_sentinel_password_converges_and_blocks_unauthenticated
 )
 

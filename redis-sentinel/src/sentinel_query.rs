@@ -90,6 +90,31 @@ pub async fn get_master_addr(
     Some((parts[0].clone(), port))
 }
 
+/// `SENTINEL MASTER <master_name>`, bounded by `deadline` — the flat
+/// field-value reply carrying `ip`, `port`, `flags` (including
+/// `failover_in_progress` while a failover this Sentinel knows about is
+/// still running), `quorum`, and more. `None` on any failure to answer;
+/// callers must treat that as ambiguous, never as "failover finished" or
+/// "still running" — see `quorum::field_value` for reading fields out of it.
+pub async fn get_master_fields(
+    conn: &mut MultiplexedConnection,
+    master_name: &str,
+    deadline: Duration,
+) -> Option<Vec<String>> {
+    let reply = timeout(
+        deadline,
+        redis::cmd("SENTINEL")
+            .arg("master")
+            .arg(master_name)
+            .query_async::<Vec<String>>(conn),
+    )
+    .await;
+    match reply {
+        Ok(Ok(fields)) => Some(fields),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod sentinel_url_tests {
     use super::*;

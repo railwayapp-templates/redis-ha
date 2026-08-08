@@ -128,7 +128,11 @@ impl Config {
     /// adoption leaves that directory holding orphan files Redis cannot read.
     /// Counting it would keep a mount root whose data is unreadable and abandon
     /// a perfectly good nested dataset.
-    fn holds_redis_dataset(dir: &str) -> bool {
+    ///
+    /// Also the empty-primary boot guard's "nothing to serve" test
+    /// (`crate::boot_role::empty_primary_boot_guard`): a master with no
+    /// loadable dataset is what a wiped or replaced volume boots from.
+    pub(crate) fn holds_redis_dataset(dir: &str) -> bool {
         let path = std::path::Path::new(dir);
         path.join("dump.rdb").exists()
             || crate::redis_conf::aof_manifest_exists(dir)
