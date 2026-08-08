@@ -1,6 +1,32 @@
 use crate::boot_role::BootMaster;
 use crate::config::Config;
 
+/// Move a sentinel.conf whose recorded topology no longer exists out of the
+/// way, so Sentinel doesn't resume monitoring a world that is gone.
+///
+/// A volume reused across a template revert, scale-down, or re-conversion
+/// still carries the old cluster's sentinel state — a monitor line naming a
+/// master that isn't any currently-declared member. Resuming that state
+/// demotes the node into a replica of a ghost: nothing to sync from, nothing
+/// to fail over to, no writable master anywhere. Renamed aside, never
+/// deleted — the file is the only record of the old world's failover
+/// history. Returns the quarantine path when something moved.
+pub fn quarantine_ghost_sentinel_conf(
+    data_dir: &str,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    let conf = std::path::Path::new(data_dir).join("sentinel.conf");
+    if !conf.exists() {
+        return Ok(None);
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let ghost = std::path::Path::new(data_dir).join(format!("sentinel.conf.ghost-{}", ts));
+    std::fs::rename(&conf, &ghost)?;
+    Ok(Some(ghost))
+}
+
 /// Generate sentinel.conf content from environment configuration.
 ///
 /// This file is only written on first boot. After Sentinel runs a failover it
