@@ -7,6 +7,10 @@ pub struct Config {
     pub redis_port: u16,
     /// Host:port of the master to replicate from. Empty string on the primary node.
     pub replica_of: String,
+    /// Seconds of replica ACK silence the split-brain fence tolerates before
+    /// that replica stops counting toward min-replicas-to-write. Must not
+    /// exceed sentinel_down_after_ms — see redis_conf's module docs.
+    pub min_replicas_max_lag_secs: u64,
     pub sentinel_enabled: bool,
     pub sentinel_port: u16,
     pub sentinel_quorum: u32,
@@ -35,6 +39,7 @@ impl Config {
             redis_password,
             redis_port: u16::env_parse("REDIS_PORT", 6379),
             replica_of: String::env_or("REPLICA_OF", ""),
+            min_replicas_max_lag_secs: u64::env_parse("MIN_REPLICAS_MAX_LAG", 5),
             sentinel_enabled,
             sentinel_port: u16::env_parse("SENTINEL_PORT", 26379),
             sentinel_quorum: u32::env_parse("SENTINEL_QUORUM", 2),
@@ -169,6 +174,7 @@ impl Config {
             redis_password: "pw".to_string(),
             redis_port: 6379,
             replica_of: String::new(),
+            min_replicas_max_lag_secs: 5,
             sentinel_enabled: true,
             sentinel_port: 26379,
             sentinel_quorum: 2,

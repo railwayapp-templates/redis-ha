@@ -151,9 +151,19 @@ pub fn generate_redis_conf(config: &Config, boot_master: &BootMaster) -> String 
             "min-replicas-to-write {}",
             min_replicas_to_write(config.sentinel_quorum)
         ));
-        // Must be <= SENTINEL_DOWN_AFTER_MS (5s default) so the master goes
-        // read-only around the same time Sentinel declares it ODOWN elsewhere.
-        lines.push("min-replicas-max-lag 10".to_string());
+        // The lag bound is the dual-writer window: during a partition the
+        // isolated master keeps accepting writes until it stops seeing ACKs
+        // from enough replicas for this many seconds, while the healthy
+        // majority is running its own SENTINEL_DOWN_AFTER_MS clock toward
+        // promoting a replacement. This must not exceed that down-after
+        // window (5s default) — any larger and every partition guarantees a
+        // dual-writer window longer than Sentinel's own failover trigger,
+        // and everything the isolated side accepts in it is discarded on
+        // heal.
+        lines.push(format!(
+            "min-replicas-max-lag {}",
+            config.min_replicas_max_lag_secs
+        ));
     }
 
     // Every node carries the master password, not just the ones deployed as
@@ -384,7 +394,18 @@ mod tests {
             &BootMaster::NoLocalState,
         );
         assert!(conf.contains("min-replicas-to-write 1"));
-        assert!(conf.contains("min-replicas-max-lag 10"));
+        assert!(conf.contains("min-replicas-max-lag 5"));
+    }
+
+    // The lag bound has to stay inside SENTINEL_DOWN_AFTER_MS or the fence
+    // stops meaning anything; it comes from the env, not a hardcoded literal.
+    #[test]
+    fn min_replicas_max_lag_is_configurable_via_env() {
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path().to_str().unwrap());
+        config.min_replicas_max_lag_secs = 3;
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(conf.contains("min-replicas-max-lag 3"));
     }
 
     // The fence follows the stamped quorum (majority − 1): a 5-node boot
