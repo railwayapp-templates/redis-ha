@@ -1,6 +1,47 @@
 use crate::boot_role::BootMaster;
 use crate::config::Config;
 
+/// Whether a sentinel.conf on disk actually enforces client auth right now,
+/// via a non-empty `requirepass`.
+///
+/// This is the ground truth every LOCAL Sentinel client in this crate must
+/// defer to instead of assuming the env-derived posture applies:
+/// `requirepass` is written only when [`generate_sentinel_conf`] creates a
+/// *fresh* file, and Sentinel owns the file after that (see the module doc
+/// on [`quarantine_ghost_sentinel_conf`]) — `SENTINEL CONFIG SET` cannot add
+/// it to a preserved conf at runtime (see `quorum::ensure_announce_identity`
+/// and the Redis Sentinel docs' enumerated global parameters, which list
+/// `sentinel-user`/`sentinel-pass` but not `requirepass`). So a preserved
+/// conf from before Sentinel auth existed keeps requiring no auth for the
+/// life of this boot, no matter that auth is now the default for new
+/// clusters.
+///
+/// That gap matters here specifically because sending `AUTH` to a Sentinel
+/// that has no password configured is a hard connection failure in Redis
+/// ("Client sent AUTH, but no password is set"), not a harmless no-op.
+/// Blindly authenticating every local URL would turn this image's rollout
+/// onto an already-running unauthenticated cluster into an outage of every
+/// local watcher (quorum-sync, link-heal, the health server,
+/// demote-on-shutdown) on top of not even closing the auth gap on that
+/// node. Reading the file back is what lets the wrapper send exactly the
+/// AUTH the co-located Sentinel will actually accept.
+///
+/// Whitespace-tolerant and case-insensitive on the keyword, matching
+/// [`crate::boot_role::parse_sentinel_monitor`]'s style. A quoted empty
+/// value (`requirepass ""`) — valid Redis conf syntax for "no password" —
+/// counts as no auth, not as a password of two quote characters.
+pub fn conf_requires_auth(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        if !matches!(fields.next(), Some(kw) if kw.eq_ignore_ascii_case("requirepass")) {
+            return false;
+        }
+        fields
+            .next()
+            .is_some_and(|value| !value.trim_matches('"').is_empty())
+    })
+}
+
 /// Move a sentinel.conf whose recorded topology no longer exists out of the
 /// way, so Sentinel doesn't resume monitoring a world that is gone.
 ///
@@ -38,7 +79,17 @@ pub fn quarantine_ghost_sentinel_conf(
 /// Sentinels must start monitoring that master, or its own Sentinel would
 /// begin life believing the stamped-at-deploy topology the rest of the
 /// cluster has already failed over from.
-pub fn generate_sentinel_conf(config: &Config, boot_master: &BootMaster) -> String {
+///
+/// `sentinel_password` is the outcome of the first-boot auth decision
+/// (`sentinel_auth::first_boot_sentinel_password`): the cluster's shared
+/// `REDIS_PASSWORD` when this boot enables Sentinel auth, `""` (no auth
+/// lines) when it must stay open — because the peers it is joining are
+/// open, or the `SENTINEL_AUTH` kill switch is off.
+pub fn generate_sentinel_conf(
+    config: &Config,
+    boot_master: &BootMaster,
+    sentinel_password: &str,
+) -> String {
     let (master_host, master_port) = match boot_master {
         BootMaster::SelfIsMaster => (config.private_domain.clone(), config.redis_port),
         BootMaster::ReplicaOf(host, port) => (host.clone(), *port),
@@ -50,6 +101,29 @@ pub fn generate_sentinel_conf(config: &Config, boot_master: &BootMaster) -> Stri
         "daemonize no".to_string(),
         "logfile \"\"".to_string(),
         "loglevel notice".to_string(),
+    ];
+
+    // Sentinel client auth (empty = none — the caller decides, see the doc
+    // comment). `requirepass` is the directive that protects THIS
+    // Sentinel's own port from an unauthenticated `SENTINEL
+    // SET/RESET/FAILOVER/REMOVE` (Redis Sentinel docs, "Sentinel
+    // password-only authentication"). `sentinel sentinel-pass` is how this
+    // Sentinel authenticates when it dials OUT to a peer Sentinel that also
+    // requires auth; the same docs section notes that with a single shared
+    // password and no ACL, Sentinel already falls back to using its own
+    // `requirepass` for outbound auth when no `sentinel-pass` is
+    // configured, so this is redundant with that fallback — it is set
+    // explicitly anyway so outbound auth doesn't depend on an implicit
+    // default. `sentinel sentinel-user` is deliberately omitted: that
+    // directive names a NON-default ACL superuser for outbound auth, and
+    // password-only auth (this configuration, no ACL) always authenticates
+    // outbound as `default`, which needs no user directive at all.
+    if !sentinel_password.is_empty() {
+        lines.push(format!("requirepass {}", sentinel_password));
+        lines.push(format!("sentinel sentinel-pass {}", sentinel_password));
+    }
+
+    lines.extend([
         // Resolve peers by DNS hostname so Railway's internal DNS works
         "sentinel resolve-hostnames yes".to_string(),
         "sentinel announce-hostnames yes".to_string(),
@@ -93,7 +167,7 @@ pub fn generate_sentinel_conf(config: &Config, boot_master: &BootMaster) -> Stri
             "sentinel master-reboot-down-after-period {} {}",
             config.redis_master_name, config.sentinel_master_reboot_down_after_ms
         ),
-    ];
+    ]);
 
     // Inject known peers so gossip bootstraps faster
     for peer in config.sentinel_hosts.split(',') {
@@ -115,12 +189,12 @@ pub fn generate_sentinel_conf(config: &Config, boot_master: &BootMaster) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::boot_role::BootMaster;
 
     #[test]
     fn master_reboot_down_after_period_defaults_to_ten_seconds() {
         let config = Config::for_tests();
-        let conf = generate_sentinel_conf(&config, &BootMaster::NoLocalState);
+        let conf = generate_sentinel_conf(&config, &BootMaster::NoLocalState, "");
         assert!(conf.contains("sentinel master-reboot-down-after-period mymaster 10000"));
     }
 
@@ -130,7 +204,96 @@ mod tests {
     fn master_reboot_down_after_period_is_configurable_via_env() {
         let mut config = Config::for_tests();
         config.sentinel_master_reboot_down_after_ms = 20000;
-        let conf = generate_sentinel_conf(&config, &BootMaster::NoLocalState);
+        let conf = generate_sentinel_conf(&config, &BootMaster::NoLocalState, "");
         assert!(conf.contains("sentinel master-reboot-down-after-period mymaster 20000"));
+    }
+
+    // --- generate_sentinel_conf: auth lines ---
+
+    #[test]
+    fn an_open_boot_writes_no_auth_lines() {
+        // An open first boot (peers answered unauthenticated, or the
+        // SENTINEL_AUTH kill switch is off) must reproduce the pre-auth
+        // conf exactly: no requirepass, no sentinel-pass, no sentinel-user.
+        let config = Config::for_tests();
+        let conf = generate_sentinel_conf(&config, &BootMaster::SelfIsMaster, "");
+        assert!(!conf.lines().any(|l| l.starts_with("requirepass")));
+        assert!(!conf.contains("sentinel-pass"));
+        assert!(!conf.contains("sentinel-user"));
+    }
+
+    #[test]
+    fn an_authed_boot_adds_requirepass_and_sentinel_pass_but_never_sentinel_user() {
+        let config = Config::for_tests();
+        let conf = generate_sentinel_conf(&config, &BootMaster::SelfIsMaster, "s3cr3t");
+        assert!(conf.lines().any(|l| l == "requirepass s3cr3t"));
+        assert!(conf
+            .lines()
+            .any(|l| l == "sentinel sentinel-pass s3cr3t"));
+        // Password-only auth with the default user needs no user directive
+        // (verified against the Redis Sentinel docs — see the doc comment
+        // on generate_sentinel_conf).
+        assert!(!conf.contains("sentinel-user"));
+    }
+
+    #[test]
+    fn the_reused_redis_password_lands_in_exactly_the_three_auth_directives() {
+        // The real call site passes the cluster's REDIS_PASSWORD as the
+        // sentinel password, so the one secret appears exactly three times:
+        // the pre-existing `sentinel auth-pass` (data-side auth) plus the
+        // two Sentinel-side lines this feature adds.
+        let mut config = Config::for_tests();
+        config.redis_password = "hunter2".to_string();
+        let conf =
+            generate_sentinel_conf(&config, &BootMaster::SelfIsMaster, &config.redis_password);
+        assert_eq!(conf.matches("hunter2").count(), 3);
+        assert!(conf.lines().any(|l| l == "requirepass hunter2"));
+        assert!(conf.lines().any(|l| l == "sentinel sentinel-pass hunter2"));
+        assert!(conf
+            .lines()
+            .any(|l| l == "sentinel auth-pass mymaster hunter2"));
+    }
+
+    // --- conf_requires_auth ---
+
+    #[test]
+    fn no_requirepass_line_is_no_auth() {
+        assert!(!conf_requires_auth("port 26379\ndaemonize no\n"));
+        assert!(!conf_requires_auth(""));
+    }
+
+    #[test]
+    fn a_requirepass_line_with_a_value_requires_auth() {
+        assert!(conf_requires_auth("port 26379\nrequirepass hunter2\n"));
+    }
+
+    #[test]
+    fn requirepass_is_case_insensitive_and_whitespace_tolerant() {
+        assert!(conf_requires_auth("RequirePass   hunter2\n"));
+        assert!(conf_requires_auth("  requirepass\thunter2  \n"));
+    }
+
+    #[test]
+    fn a_quoted_empty_password_is_no_auth() {
+        // Valid Redis conf syntax for "no password" — must not be confused
+        // with a two-character password of two quote marks.
+        assert!(!conf_requires_auth(r#"requirepass """#));
+    }
+
+    #[test]
+    fn a_quoted_nonempty_password_still_requires_auth() {
+        assert!(conf_requires_auth(r#"requirepass "hunter2""#));
+    }
+
+    #[test]
+    fn a_truncated_requirepass_line_is_no_auth() {
+        assert!(!conf_requires_auth("requirepass\n"));
+    }
+
+    #[test]
+    fn other_directives_do_not_match() {
+        assert!(!conf_requires_auth(
+            "sentinel auth-pass mymaster hunter2\nmasterauth hunter2\n"
+        ));
     }
 }

@@ -43,6 +43,18 @@
 //! master currently is, and only a cluster where no peer answers — a
 //! genuinely fresh one — falls back to the env topology.
 //!
+//! A peer answer naming THIS node is refused rather than obeyed
+//! ([`boot_master_from_peer_answer`]), and when the env fallback would then
+//! self-promote a primary whose data dir holds no loadable dataset, the boot
+//! is refused outright ([`decide_empty_primary_boot`]): the cluster never
+//! failed over, so its replicas still point at this node, reconnect the
+//! moment it listens — satisfying min-replicas-to-write — and full-resync
+//! the empty dataset. That is the documented replication wipe ("Safety of
+//! replication when master has persistence turned off") Sentinel explicitly
+//! does not protect against. Exiting instead lets the peers fail over to a
+//! replica that still holds the data, and this node's next boot joins the
+//! new master as a replica through the peer query.
+//!
 //! ## Limits
 //! This is local state, not consensus. A node that was *down* for the whole
 //! failover never saw the switch-master event, so its `sentinel.conf` still
@@ -50,6 +62,13 @@
 //! failover-timeout, exactly as it does today. What this module fixes is every
 //! case where the node's own Sentinel did observe the switch, which includes
 //! the promoted node itself and any node that outlived the failover.
+//!
+//! The empty-primary guard only covers a boot that reached the peer query:
+//! a volume that kept its sentinel.conf but lost its dataset resolves
+//! locally and never asks the peers. The triggers this guards against —
+//! volume replaced or recreated (template revert, re-conversion, fork) and
+//! the volume-attach race booting on an empty ephemeral dir — lose the
+//! whole volume, sentinel.conf included.
 
 use crate::config::Config;
 use std::io::ErrorKind;
@@ -272,8 +291,9 @@ pub fn boot_role_log_line(config: &Config, resolved: &BootMaster) -> String {
 }
 
 /// Kill switch semantics, split out from the environment so it is testable.
-/// Only the literal `false` turns the behavior off.
-fn enabled(raw: Option<&str>) -> bool {
+/// Only the literal `false` turns the behavior off. `pub(crate)` because
+/// `sentinel_auth` follows the same convention for `SENTINEL_AUTH`.
+pub(crate) fn enabled(raw: Option<&str>) -> bool {
     !matches!(raw.map(|v| v.trim().to_ascii_lowercase()), Some(v) if v == "false")
 }
 
@@ -393,15 +413,26 @@ async fn query_peer_sentinels(config: &Config) -> Option<(String, u16)> {
         DEFAULT_PEER_QUERY_TIMEOUT_MS,
     ));
     let master_name = config.redis_master_name.clone();
+    // A first boot cannot know the peers' auth posture yet — that is what
+    // it is here to find out (see `sentinel_auth`). So each peer is asked
+    // without credentials first, and a NOAUTH-class refusal retries with
+    // the cluster's shared REDIS_PASSWORD, which is the Sentinel password
+    // whenever Sentinel auth is on.
+    let redis_password = config.redis_password.clone();
 
     let mut set = tokio::task::JoinSet::new();
     for (host, port) in peers {
         let master_name = master_name.clone();
+        let password = redis_password.clone();
         set.spawn(async move {
-            // Sentinel has no auth by default.
-            let url = format!("redis://{host}:{port}");
-            let mut conn = crate::sentinel_query::connect(&url, deadline).await?;
-            crate::sentinel_query::get_master_addr(&mut conn, &master_name, deadline).await
+            crate::sentinel_query::get_master_addr_with_auth_fallback(
+                &host,
+                port,
+                &master_name,
+                &password,
+                deadline,
+            )
+            .await
         });
     }
 
@@ -412,6 +443,29 @@ async fn query_peer_sentinels(config: &Config) -> Option<(String, u16)> {
         }
     }
     majority_answer(&answers)
+}
+
+/// The resolved boot role plus the one observation the role alone cannot
+/// carry: whether the peer-query stage refused a majority answer naming
+/// this node. [`BootMaster::NoLocalState`] collapses "no peer answered" and
+/// "every peer says the master is us" into the same env fallback, and the
+/// empty-primary boot guard has to tell them apart — only the second, on a
+/// primary with no dataset, is a cluster wipe in progress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootResolution {
+    pub master: BootMaster,
+    /// True only when the peer majority named this node and
+    /// [`boot_master_from_peer_answer`] refused the answer.
+    pub peers_named_self: bool,
+}
+
+impl BootResolution {
+    fn of(master: BootMaster) -> Self {
+        Self {
+            master,
+            peers_named_self: false,
+        }
+    }
 }
 
 /// Resolve the role this boot starts in, honoring the kill switches, and log
@@ -438,14 +492,16 @@ async fn query_peer_sentinels(config: &Config) -> Option<(String, u16)> {
 ///     A peer answer naming THIS node is refused rather than obeyed — see
 ///     [`boot_master_from_peer_answer`].
 ///  3. Env topology — a genuinely fresh cluster where no peer answers, or a
-///     refused self-answer.
-pub async fn boot_master_for_this_boot(config: &Config) -> BootMaster {
+///     refused self-answer. A refused self-answer on an env-primary with no
+///     loadable dataset never reaches this fallback: the wrapper's
+///     empty-primary guard ([`empty_primary_boot_guard`]) exits instead.
+pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
     if !config.sentinel_enabled {
-        return BootMaster::NoLocalState;
+        return BootResolution::of(BootMaster::NoLocalState);
     }
     if !enabled(std::env::var(BOOT_ROLE_ENV).ok().as_deref()) {
         info!("boot role: from env topology ({}=false)", BOOT_ROLE_ENV);
-        return BootMaster::NoLocalState;
+        return BootResolution::of(BootMaster::NoLocalState);
     }
     let resolved = match classify_local_state(config) {
         LocalSentinelState::Usable(resolved) => resolved,
@@ -465,9 +521,10 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootMaster {
     };
     if !matches!(resolved, BootMaster::NoLocalState) {
         info!("{}", boot_role_log_line(config, &resolved));
-        return resolved;
+        return BootResolution::of(resolved);
     }
 
+    let mut peers_named_self = false;
     if enabled(std::env::var(PEER_BOOT_ENV).ok().as_deref()) {
         if let Some((host, port)) = query_peer_sentinels(config).await {
             // A peer can be resuming the same dead world this node just
@@ -493,12 +550,15 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootMaster {
                                 host, port
                             );
                         }
-                        return resolved;
+                        return BootResolution::of(resolved);
                     }
-                    None => info!(
-                        "peer sentinels name this node as master, but this is a first boot with no \
-                         local dataset — falling back to the env topology rather than self-promoting"
-                    ),
+                    None => {
+                        peers_named_self = true;
+                        info!(
+                            "peer sentinels name this node as master, but this is a first boot \
+                             with no local sentinel state — not self-promoting off a peer answer"
+                        );
+                    }
                 }
             }
         } else {
@@ -507,7 +567,10 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootMaster {
     }
 
     info!("{}", boot_role_log_line(config, &resolved));
-    resolved
+    BootResolution {
+        master: resolved,
+        peers_named_self,
+    }
 }
 
 /// What a peer answer means for the boot role. A peer naming another node is
@@ -517,10 +580,12 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootMaster {
 /// boot named master by its peers is the incumbent master coming back on a
 /// wiped or replaced volume, and `REPLICAOF NO ONE` there boots an EMPTY
 /// master that every data-bearing replica then full-syncs from — a
-/// cluster-wide wipe. The env fallback preserves today's behavior instead:
-/// a stale replica (or the env-declared master) that Sentinel's
-/// master-in-slave-role handling fails over to a replica that still has the
-/// data.
+/// cluster-wide wipe. The refusal is recorded on the resolution
+/// ([`BootResolution::peers_named_self`]) so the wrapper can tell it apart
+/// from a genuinely fresh cluster: with a loadable dataset on disk the env
+/// fallback is the incumbent master restarting normally (today's behavior);
+/// without one, on an env-primary, the empty-primary guard refuses the boot
+/// entirely rather than letting the env fallback stage the same wipe.
 pub(crate) fn boot_master_from_peer_answer(
     config: &Config,
     host: String,
@@ -530,6 +595,63 @@ pub(crate) fn boot_master_from_peer_answer(
         return None;
     }
     Some(BootMaster::ReplicaOf(host, port))
+}
+
+// ====================================================================
+// Empty-primary boot guard
+// ====================================================================
+
+/// Kill switch for the empty-primary boot guard. Same semantics as
+/// [`BOOT_ROLE_ENV`]: only the literal `false` disables it — disabled, the
+/// env fallback self-promotes exactly as it did before the guard.
+pub const EMPTY_PRIMARY_GUARD_ENV: &str = "EMPTY_PRIMARY_BOOT_GUARD";
+
+/// Whether this boot may proceed into the env fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyPrimaryBoot {
+    Proceed,
+    /// Exit instead of booting: the cluster still names this node master and
+    /// the data dir holds nothing to serve. Its replicas were never
+    /// repointed, so they reconnect the moment it listens — acking enough to
+    /// satisfy min-replicas-to-write — and full-resync the empty dataset.
+    /// With this node down instead, the peers see the master down and fail
+    /// over to a replica that still holds the data (their replicas are
+    /// inside the down-after×10 validity window), and this node's next boot
+    /// finds the new master through the peer query and joins as a replica.
+    Refuse,
+}
+
+/// Pure (zero-I/O) decision, mirroring `decide_link_heal`: the wrapper
+/// gathers the observations and performs the log + telemetry + exit.
+///
+/// All four must hold. `peers_named_self` already implies Sentinel is
+/// enabled and the resolution had no usable local state (only the peer
+/// query produces it), so neither is a separate input. `is_primary` scopes
+/// the guard to the one node the env fallback would self-promote; a
+/// loadable dataset means the incumbent master is restarting normally and
+/// the env fallback stays.
+pub fn decide_empty_primary_boot(
+    peers_named_self: bool,
+    is_primary: bool,
+    holds_dataset: bool,
+    guard_enabled: bool,
+) -> EmptyPrimaryBoot {
+    if guard_enabled && peers_named_self && is_primary && !holds_dataset {
+        EmptyPrimaryBoot::Refuse
+    } else {
+        EmptyPrimaryBoot::Proceed
+    }
+}
+
+/// [`decide_empty_primary_boot`] with its inputs gathered from the resolved
+/// boot role, the env topology, the data dir, and the kill switch.
+pub fn empty_primary_boot_guard(config: &Config, resolution: &BootResolution) -> EmptyPrimaryBoot {
+    decide_empty_primary_boot(
+        resolution.peers_named_self,
+        config.is_primary(),
+        Config::holds_redis_dataset(&config.data_dir),
+        enabled(std::env::var(EMPTY_PRIMARY_GUARD_ENV).ok().as_deref()),
+    )
 }
 
 #[cfg(test)]
@@ -648,6 +770,81 @@ mod tests {
                 "redis-1.railway.internal".to_string(),
                 6380
             ))
+        );
+    }
+
+    // --- decide_empty_primary_boot ---
+
+    #[test]
+    fn an_empty_primary_the_peers_still_name_master_is_refused() {
+        // The wipe scenario: env-primary, fresh/wiped volume, cluster never
+        // failed over. Every replica would full-resync the empty dataset.
+        assert_eq!(
+            decide_empty_primary_boot(true, true, false, true),
+            EmptyPrimaryBoot::Refuse
+        );
+    }
+
+    #[test]
+    fn a_peer_answer_naming_another_node_never_refuses() {
+        // ReplicaOf path, or no peer answered at all — the guard has no say.
+        assert_eq!(
+            decide_empty_primary_boot(false, true, false, true),
+            EmptyPrimaryBoot::Proceed
+        );
+    }
+
+    #[test]
+    fn an_env_replica_never_refuses() {
+        // REPLICA_OF set: the env fallback boots a stale replica, which
+        // Sentinel's master-in-slave-role handling resolves — never a wipe.
+        assert_eq!(
+            decide_empty_primary_boot(true, false, false, true),
+            EmptyPrimaryBoot::Proceed
+        );
+    }
+
+    #[test]
+    fn an_incumbent_master_with_a_dataset_boots_as_today() {
+        // The peers naming us master with data on disk is the incumbent
+        // master restarting normally — the env fallback stays.
+        assert_eq!(
+            decide_empty_primary_boot(true, true, true, true),
+            EmptyPrimaryBoot::Proceed
+        );
+    }
+
+    #[test]
+    fn the_kill_switch_restores_the_env_fallback() {
+        assert_eq!(
+            decide_empty_primary_boot(true, true, false, false),
+            EmptyPrimaryBoot::Proceed
+        );
+    }
+
+    #[test]
+    fn the_guard_reads_the_dataset_off_the_data_dir() {
+        // EMPTY_PRIMARY_BOOT_GUARD is not set in the test environment, so
+        // the kill-switch default (enabled) applies.
+        let dir = tempdir().unwrap();
+        let config = config_at(dir.path());
+        assert!(config.is_primary());
+        let refused = BootResolution {
+            master: BootMaster::NoLocalState,
+            peers_named_self: true,
+        };
+        assert_eq!(
+            empty_primary_boot_guard(&config, &refused),
+            EmptyPrimaryBoot::Refuse
+        );
+        fs::write(dir.path().join("dump.rdb"), b"REDIS0011fake").unwrap();
+        assert_eq!(
+            empty_primary_boot_guard(&config, &refused),
+            EmptyPrimaryBoot::Proceed
+        );
+        assert_eq!(
+            empty_primary_boot_guard(&config, &BootResolution::of(BootMaster::NoLocalState)),
+            EmptyPrimaryBoot::Proceed
         );
     }
 
@@ -1051,5 +1248,61 @@ mod tests {
         assert!(!enabled(Some("FALSE")));
         assert!(!enabled(Some(" false ")));
         assert!(!enabled(Some("False")));
+    }
+
+    // --- standalone boots (SENTINEL_ENABLED unset) ---
+    //
+    // The state a root is left in after its HA template is reverted: still on
+    // this image, its volume still carrying sentinel.conf from the cluster
+    // days — possibly naming a node that is mid-teardown and, sharing the
+    // cluster's password, would even pass the membership probe. A boot that
+    // is declared standalone must not take a replication topology from any
+    // of it: no local-state read, no peer query, no quarantine.
+
+    #[tokio::test]
+    async fn standalone_boot_ignores_persisted_sentinel_state() {
+        let dir = tempdir().unwrap();
+        let mut config = Config::for_tests();
+        config.sentinel_enabled = false;
+        config.data_dir = dir.path().to_str().unwrap().to_string();
+        // A leftover peer list makes the persisted master a DECLARED member,
+        // which a sentinel-enabled boot would obey with no probe and no env
+        // read — so a regression here fails deterministically, without
+        // touching the network or the process environment.
+        config.sentinel_hosts = "redis-2.railway.internal:26379".to_string();
+        fs::write(
+            dir.path().join("sentinel.conf"),
+            "sentinel monitor mymaster redis-2.railway.internal 6379 2\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            boot_master_for_this_boot(&config).await,
+            BootResolution::of(BootMaster::NoLocalState)
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_boot_leaves_dead_world_state_untouched() {
+        let dir = tempdir().unwrap();
+        let mut config = Config::for_tests();
+        config.sentinel_enabled = false;
+        config.data_dir = dir.path().to_str().unwrap().to_string();
+        config.sentinel_hosts = String::new();
+        // An undeclared master would be probed and then quarantined on an HA
+        // boot. The standalone gate returns before any of that machinery, so
+        // the file must survive byte-for-byte — it is still the cluster's
+        // last known state, and a later re-conversion is entitled to find it.
+        fs::write(
+            dir.path().join("sentinel.conf"),
+            "sentinel monitor mymaster redis-9.dead-world.invalid 6379 2\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            boot_master_for_this_boot(&config).await,
+            BootResolution::of(BootMaster::NoLocalState)
+        );
+        assert!(dir.path().join("sentinel.conf").exists());
     }
 }

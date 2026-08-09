@@ -12,16 +12,21 @@
 use anyhow::{Context, Result};
 use common::{init_logging, RailwayEnv, Telemetry, TelemetryEvent};
 use redis_sentinel::{
-    boot_role::{boot_master_for_this_boot, BootMaster},
+    boot_role::{
+        boot_master_for_this_boot, empty_primary_boot_guard, BootMaster, EmptyPrimaryBoot,
+        EMPTY_PRIMARY_GUARD_ENV,
+    },
     config::{data_dir_is_on_volume, Config},
-    health_server::run_health_server,
+    demote_on_shutdown::DemoteTarget,
+    health_server,
     link_heal,
     process_manager::{enable_aof_after_rdb_load, spawn_redis, spawn_sentinel, supervise},
     quorum,
     redis_conf::{
         generate_redis_conf, needs_rdb_to_aof_migration, quarantine_manifestless_aof_dir,
     },
-    sentinel_conf::generate_sentinel_conf,
+    sentinel_auth,
+    sentinel_conf::{conf_requires_auth, generate_sentinel_conf},
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -79,7 +84,36 @@ async fn main() -> Result<()> {
     // Sentinels this node is joining. Read before the conf is regenerated,
     // because the regenerated conf is what would otherwise re-impose the
     // deploy-time topology on a node Sentinel has since promoted or demoted.
-    let boot_master = boot_master_for_this_boot(&config).await;
+    let resolution = boot_master_for_this_boot(&config).await;
+
+    // Fail-stop guard, checked before anything is written to the volume: an
+    // env-primary booting with no loadable dataset into a live cluster whose
+    // Sentinels still name it master must not fall back to the env topology.
+    // No failover ever repointed the replicas, so they reconnect and ack —
+    // min-replicas-to-write is satisfied — and then full-resync the empty
+    // dataset: the documented replication wipe Sentinel does not protect
+    // against. Exiting leaves the master down instead; the peers fail over
+    // to a replica that still holds the data, and this node's next boot
+    // joins the new master as a replica through the peer query.
+    if empty_primary_boot_guard(&config, &resolution) == EmptyPrimaryBoot::Refuse {
+        let error = format!(
+            "refusing to boot as an empty master: the peer sentinels name this node ({}) as \
+             the current master, but {} holds no loadable dataset — the volume was wiped or \
+             replaced. Booting would have every replica full-resync the empty dataset and \
+             destroy the cluster's data. This container exits so Sentinel fails over to a \
+             data-bearing replica; this node then rejoins as a replica on a later boot. Set \
+             {}=false to override.",
+            config.private_domain, config.data_dir, EMPTY_PRIMARY_GUARD_ENV
+        );
+        tracing::error!("{error}");
+        telemetry.send(TelemetryEvent::ComponentError {
+            component: "redis-wrapper".to_string(),
+            error,
+            context: "startup".to_string(),
+        });
+        std::process::exit(1);
+    }
+    let boot_master = resolution.master;
 
     // Always regenerate redis.conf so env-var changes take effect on restart.
     let redis_conf_path = format!("{}/redis.conf", config.data_dir);
@@ -89,27 +123,65 @@ async fn main() -> Result<()> {
     info!(path = %redis_conf_path, "wrote redis.conf");
 
     // Only write sentinel.conf on first boot — Sentinel owns it after that.
+    // First boot is also the ONE moment this node's auth posture is decided
+    // (`requirepass` cannot be added to a running Sentinel or a preserved
+    // conf), so the generation path probes the peers and posture-matches:
+    // auth on (reusing the cluster's REDIS_PASSWORD) for a fresh or
+    // already-authed cluster, off when joining a cluster that runs open —
+    // see `sentinel_auth` for why a mixed-auth cluster cannot vote.
     let sentinel_conf_path = format!("{}/sentinel.conf", config.data_dir);
-    if config.sentinel_enabled && !Path::new(&sentinel_conf_path).exists() {
-        let sentinel_conf = generate_sentinel_conf(&config, &boot_master);
+    let local_sentinel_requires_auth = if config.sentinel_enabled
+        && !Path::new(&sentinel_conf_path).exists()
+    {
+        let sentinel_password = sentinel_auth::first_boot_sentinel_password(&config).await;
+        let sentinel_conf = generate_sentinel_conf(&config, &boot_master, &sentinel_password);
         fs::write(&sentinel_conf_path, &sentinel_conf)
             .context("failed to write sentinel.conf")?;
         fs::set_permissions(&sentinel_conf_path, fs::Permissions::from_mode(0o600))
             .context("failed to set sentinel.conf permissions")?;
         info!(path = %sentinel_conf_path, "wrote sentinel.conf (first boot)");
+        conf_requires_auth(&sentinel_conf)
     } else if config.sentinel_enabled {
         info!(path = %sentinel_conf_path, "sentinel.conf exists, preserving");
-    }
+        fs::read_to_string(&sentinel_conf_path)
+            .map(|existing| conf_requires_auth(&existing))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    // The password to use for THIS wrapper's own connections to the
+    // co-located Sentinel — gated on the file, not on the env-derived
+    // default. A preserved conf from before Sentinel auth existed has no
+    // `requirepass` (it cannot be retrofitted at runtime — see
+    // quorum::ensure_announce_identity's doc comment), and AUTHing against
+    // a Sentinel that requires none is a hard connection failure in Redis
+    // ("Client sent AUTH, but no password is set"), not a harmless no-op.
+    // Trusting the default here would turn this image's rollout onto an
+    // already-running unauthenticated cluster into an outage of every
+    // local watcher (health server, link-heal, quorum-sync,
+    // demote-on-shutdown) on top of not even closing the auth gap on that
+    // node. When the conf does require auth, the password IS the cluster's
+    // REDIS_PASSWORD — the whole point of the reuse.
+    let local_sentinel_password = if local_sentinel_requires_auth {
+        config.redis_password.clone()
+    } else {
+        String::new()
+    };
 
-    // Start health HTTP server (non-blocking — runs in background)
-    let hp = config.health_port;
-    let rp = config.redis_port;
-    let sp = config.sentinel_port;
-    let pw = config.redis_password.clone();
-    let domain = config.private_domain.clone();
-    tokio::spawn(async move {
-        run_health_server(hp, rp, sp, pw, domain).await;
-    });
+    // Supervised health HTTP server: HAProxy's only signal for routing reads
+    // and writes, so an unsupervised task dying here silently pulls this
+    // node from BOTH backends forever (see health_server module docs).
+    // Mirrors link_heal/quorum's respawn shape rather than a bare spawn.
+    health_server::spawn(
+        config.health_port,
+        config.redis_port,
+        config.sentinel_port,
+        config.redis_password.clone(),
+        config.private_domain.clone(),
+        config.redis_master_name.clone(),
+        local_sentinel_password.clone(),
+        telemetry.clone(),
+    );
 
     // The role this boot actually starts in, which is the resolved one — not
     // the env-declared one it can now contradict.
@@ -180,6 +252,7 @@ async fn main() -> Result<()> {
             config.sentinel_port,
             config.redis_master_name.clone(),
             telemetry,
+            local_sentinel_password.clone(),
         );
         // Keep this Sentinel's odown quorum a majority of the Sentinels it
         // actually knows — and the local Redis's split-brain fence at
@@ -191,9 +264,21 @@ async fn main() -> Result<()> {
             config.redis_password.clone(),
             config.redis_master_name.clone(),
             config.private_domain.clone(),
+            local_sentinel_password.clone(),
         );
     }
 
+    // What a graceful stop needs to trigger its own failover before
+    // signaling either child — see `demote_on_shutdown` for the sequence.
+    let demote_target = DemoteTarget {
+        redis_port: config.redis_port,
+        redis_password: config.redis_password.clone(),
+        sentinel_port: config.sentinel_port,
+        redis_master_name: config.redis_master_name.clone(),
+        sentinel_enabled: config.sentinel_enabled,
+        local_sentinel_password,
+    };
+
     // Block until a process exits or we receive a signal
-    supervise(redis_proc, sentinel_proc).await
+    supervise(redis_proc, sentinel_proc, demote_target).await
 }

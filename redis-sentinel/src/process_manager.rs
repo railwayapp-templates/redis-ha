@@ -1,8 +1,12 @@
 //! Process supervision for Redis and Sentinel subprocesses.
 //!
 //! Spawns both processes, forwards OS signals to them, and exits the container
-//! if either dies — letting Railway's restart policy handle recovery.
+//! if either dies — letting Railway's restart policy handle recovery. On a
+//! graceful stop (SIGTERM/SIGINT), `demote_on_shutdown::demote_before_shutdown`
+//! runs first — see that module for why and how — and only then does the
+//! existing `graceful_shutdown` sequence run, unchanged.
 
+use crate::demote_on_shutdown::{self, DemoteTarget};
 use crate::redis_conf::aof_manifest_exists;
 use anyhow::{Context, Result};
 use common::{Telemetry, TelemetryEvent};
@@ -202,11 +206,14 @@ pub async fn spawn_sentinel(data_dir: &str) -> Result<Child> {
 
 /// Run the supervisor loop.
 ///
-/// Waits for either child to exit or for a termination signal. On SIGTERM/SIGINT
-/// both children are forwarded the signal and we wait briefly before exiting.
+/// Waits for either child to exit or for a termination signal. On SIGTERM/SIGINT,
+/// a colocated master first gets a chance to trigger its own failover
+/// (`demote_on_shutdown`) before both children are forwarded the signal and we
+/// wait briefly before exiting.
 pub async fn supervise(
     mut redis: Child,
     mut sentinel: Option<Child>,
+    demote_target: DemoteTarget,
 ) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -251,12 +258,14 @@ pub async fn supervise(
 
             _ = sigterm.recv() => {
                 info!("received SIGTERM, shutting down");
+                demote_on_shutdown::demote_before_shutdown(&demote_target, sentinel.is_some()).await;
                 graceful_shutdown(redis_pid, sentinel_pid, &mut redis, &mut sentinel).await;
                 std::process::exit(0);
             }
 
             _ = sigint.recv() => {
                 info!("received SIGINT, shutting down");
+                demote_on_shutdown::demote_before_shutdown(&demote_target, sentinel.is_some()).await;
                 graceful_shutdown(redis_pid, sentinel_pid, &mut redis, &mut sentinel).await;
                 std::process::exit(0);
             }
@@ -270,7 +279,12 @@ async fn graceful_shutdown(
     redis: &mut Child,
     sentinel: &mut Option<Child>,
 ) {
-    // Sentinel first so it doesn't trigger spurious failovers
+    // Sentinel first so it doesn't trigger spurious failovers. By the time
+    // this runs, `demote_on_shutdown::demote_before_shutdown` (called by
+    // `supervise` before this function) has already used the local Sentinel
+    // to drive a failover if this node was master — signaling it here is
+    // just the normal, unchanged teardown of a Sentinel that (on a master)
+    // has already done its one job for this shutdown.
     if let (Some(ref mut s), Some(pid)) = (sentinel, sentinel_pid) {
         info!("sending SIGTERM to redis-sentinel");
         let _ = signal::kill(pid, Signal::SIGTERM);

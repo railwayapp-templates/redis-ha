@@ -1,0 +1,71 @@
+name: Mint a minor alias tag
+
+# One-off maintenance: alias the CURRENT :<major> redis-sentinel build as
+# :<minor>. The weekly build only aliases the minor it bundles, so
+# a minor that was never current while the alias step existed has no tag —
+# e.g. the bootstrap gap: the step shipped while upstream :8 already bundled
+# 8.4, leaving sources pinned at redis:8.2.x with nothing to pin to.
+#
+# Publishing an OLDER minor alias onto the current build preserves the alias
+# invariant the conversion pin relies on (":M.m exists ⟹ every :M build
+# bundles ≥ M.m" — the current build is newer by definition, and newer reads
+# older RDB). The alternative — retagging an OLD build that really bundled
+# that minor — would pin converted clusters to a stale wrapper, which is
+# worse than a newer redis.
+#
+# The one direction this must never go is FORWARD: aliasing a minor the
+# current build doesn't reach yet (e.g. :8.6 while :8 bundles 8.4) would
+# forge the compatibility proof. The guard below refuses it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      major:
+        description: "Major whose current build to alias (e.g. 8)"
+        required: true
+      minor:
+        description: "Full major.minor alias to mint (e.g. 8.2)"
+        required: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/redis-sentinel
+
+jobs:
+  mint:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate and mint
+        run: |
+          major='${{ inputs.major }}'
+          minor='${{ inputs.minor }}'
+          case "$minor" in
+            "$major".*) ;;
+            *) echo "alias $minor does not belong to major $major" >&2; exit 1 ;;
+          esac
+
+          src="${IMAGE}:${major}"
+          bundled=$(docker run --rm --entrypoint redis-server "$src" --version)
+          echo "current ${major} build bundles: $bundled"
+          bundled_minor=$(echo "$bundled" | sed -nE 's/.*v=([0-9]+)\.([0-9]+).*/\1.\2/p')
+          if [ -z "$bundled_minor" ]; then
+            echo "could not parse bundled version" >&2; exit 1
+          fi
+          # Refuse forward aliases: the proof is "every :major build >= alias".
+          newest=$(printf '%s\n%s\n' "$bundled_minor" "$minor" | sort -V | tail -1)
+          if [ "$newest" != "$bundled_minor" ]; then
+            echo "refusing: alias $minor is NEWER than the bundled $bundled_minor" >&2
+            exit 1
+          fi
+
+          docker buildx imagetools create \
+            -t "${IMAGE}:${minor}" \
+            "$src"

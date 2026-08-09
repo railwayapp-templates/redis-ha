@@ -1,10 +1,12 @@
 pub mod boot_role;
 pub mod config;
+pub mod demote_on_shutdown;
 pub mod dns_probe;
 pub mod health_server;
 pub mod link_heal;
 pub mod process_manager;
 pub mod quorum;
 pub mod redis_conf;
+pub mod sentinel_auth;
 pub mod sentinel_conf;
 pub mod sentinel_query;
