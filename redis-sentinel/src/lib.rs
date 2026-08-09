@@ -7,5 +7,6 @@ pub mod link_heal;
 pub mod process_manager;
 pub mod quorum;
 pub mod redis_conf;
+pub mod sentinel_auth;
 pub mod sentinel_conf;
 pub mod sentinel_query;

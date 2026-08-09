@@ -291,8 +291,9 @@ pub fn boot_role_log_line(config: &Config, resolved: &BootMaster) -> String {
 }
 
 /// Kill switch semantics, split out from the environment so it is testable.
-/// Only the literal `false` turns the behavior off.
-fn enabled(raw: Option<&str>) -> bool {
+/// Only the literal `false` turns the behavior off. `pub(crate)` because
+/// `sentinel_auth` follows the same convention for `SENTINEL_AUTH`.
+pub(crate) fn enabled(raw: Option<&str>) -> bool {
     !matches!(raw.map(|v| v.trim().to_ascii_lowercase()), Some(v) if v == "false")
 }
 
@@ -412,21 +413,26 @@ async fn query_peer_sentinels(config: &Config) -> Option<(String, u16)> {
         DEFAULT_PEER_QUERY_TIMEOUT_MS,
     ));
     let master_name = config.redis_master_name.clone();
-    // Sentinel has no auth by default; SENTINEL_PASSWORD opts a cluster in
-    // (Config::sentinel_password). Every peer is assumed to be stamped the
-    // same way this node is — stamping a mixed cluster is the unsafe
-    // rollout this feature explicitly does not attempt to paper over; see
-    // the module-level rollout note shipped with SENTINEL_PASSWORD.
-    let sentinel_password = config.sentinel_password.clone();
+    // A first boot cannot know the peers' auth posture yet — that is what
+    // it is here to find out (see `sentinel_auth`). So each peer is asked
+    // without credentials first, and a NOAUTH-class refusal retries with
+    // the cluster's shared REDIS_PASSWORD, which is the Sentinel password
+    // whenever Sentinel auth is on.
+    let redis_password = config.redis_password.clone();
 
     let mut set = tokio::task::JoinSet::new();
     for (host, port) in peers {
         let master_name = master_name.clone();
-        let password = sentinel_password.clone();
+        let password = redis_password.clone();
         set.spawn(async move {
-            let url = crate::sentinel_query::sentinel_url(&host, port, &password);
-            let mut conn = crate::sentinel_query::connect(&url, deadline).await?;
-            crate::sentinel_query::get_master_addr(&mut conn, &master_name, deadline).await
+            crate::sentinel_query::get_master_addr_with_auth_fallback(
+                &host,
+                port,
+                &master_name,
+                &password,
+                deadline,
+            )
+            .await
         });
     }
 
