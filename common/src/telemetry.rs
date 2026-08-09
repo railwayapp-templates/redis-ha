@@ -283,12 +283,19 @@ fn classify(status: u16, body: &str) -> SendOutcome {
 }
 
 /// Keep a rejection body loggable without dumping a whole HTML error page.
+/// The cut backs up to a char boundary — slicing a multi-byte character in
+/// half panics, and a panic in the error-reporting path is the worst place
+/// to have one.
 fn truncate(body: &str) -> String {
     const MAX: usize = 300;
     if body.len() <= MAX {
         return body.to_string();
     }
-    format!("{}…", &body[..MAX])
+    let mut end = MAX;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &body[..end])
 }
 
 #[cfg(test)]
@@ -466,5 +473,21 @@ mod tests {
         let long = "x".repeat(400);
         let out = truncate(&long);
         assert!(out.len() < 400 && out.ends_with('…'));
+    }
+
+    /// A multi-byte character straddling the cut must not panic the
+    /// error-reporting path (str slicing panics off a char boundary).
+    #[test]
+    fn truncate_never_splits_a_multibyte_character() {
+        // 299 ASCII bytes, then 3-byte characters across the 300 mark.
+        let body = format!("{}日本語のエラー", "x".repeat(299));
+        let out = truncate(&body);
+        assert!(out.ends_with('…'));
+
+        // All-multibyte body: every byte offset near the cut lands
+        // mid-character.
+        let body = "é".repeat(400);
+        let out = truncate(&body);
+        assert!(out.ends_with('…'));
     }
 }
