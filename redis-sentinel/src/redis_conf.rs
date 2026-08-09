@@ -130,6 +130,20 @@ pub fn generate_redis_conf(config: &Config, boot_master: &BootMaster) -> String 
         format!("replica-announce-ip {}", config.private_domain),
         format!("replica-announce-port {}", config.redis_port),
         "cluster-preferred-endpoint-type hostname".to_string(),
+        // Sized for full resyncs, not partial ones: the 1MB repl-backlog-size
+        // default forces a FULL resync on any disconnect longer than it takes
+        // to fill 1MB of writes, and the default client-output-buffer-limit
+        // for replicas (256mb hard / 64mb soft-60s) lets that same resync
+        // blow its own output buffer mid-transfer on anything but a small
+        // dataset — either one turns a short blip into a resync loop instead
+        // of a completed one. Stamped on every boot, standalone included: a
+        // reverted-HA root keeps this image and may gain replicas again
+        // later, and both directives are inert without any.
+        format!("repl-backlog-size {}", config.repl_backlog_size),
+        format!(
+            "client-output-buffer-limit replica {}",
+            config.client_output_buffer_limit_replica
+        ),
     ];
 
     if config.sentinel_enabled {
@@ -151,9 +165,19 @@ pub fn generate_redis_conf(config: &Config, boot_master: &BootMaster) -> String 
             "min-replicas-to-write {}",
             min_replicas_to_write(config.sentinel_quorum)
         ));
-        // Must be <= SENTINEL_DOWN_AFTER_MS (5s default) so the master goes
-        // read-only around the same time Sentinel declares it ODOWN elsewhere.
-        lines.push("min-replicas-max-lag 10".to_string());
+        // The lag bound is the dual-writer window: during a partition the
+        // isolated master keeps accepting writes until it stops seeing ACKs
+        // from enough replicas for this many seconds, while the healthy
+        // majority is running its own SENTINEL_DOWN_AFTER_MS clock toward
+        // promoting a replacement. This must not exceed that down-after
+        // window (5s default) — any larger and every partition guarantees a
+        // dual-writer window longer than Sentinel's own failover trigger,
+        // and everything the isolated side accepts in it is discarded on
+        // heal.
+        lines.push(format!(
+            "min-replicas-max-lag {}",
+            config.min_replicas_max_lag_secs
+        ));
     }
 
     // Every node carries the master password, not just the ones deployed as
@@ -384,7 +408,18 @@ mod tests {
             &BootMaster::NoLocalState,
         );
         assert!(conf.contains("min-replicas-to-write 1"));
-        assert!(conf.contains("min-replicas-max-lag 10"));
+        assert!(conf.contains("min-replicas-max-lag 5"));
+    }
+
+    // The lag bound has to stay inside SENTINEL_DOWN_AFTER_MS or the fence
+    // stops meaning anything; it comes from the env, not a hardcoded literal.
+    #[test]
+    fn min_replicas_max_lag_is_configurable_via_env() {
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path().to_str().unwrap());
+        config.min_replicas_max_lag_secs = 3;
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(conf.contains("min-replicas-max-lag 3"));
     }
 
     // The fence follows the stamped quorum (majority − 1): a 5-node boot
@@ -490,5 +525,42 @@ mod tests {
         let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
         assert!(!conf.contains("replicaof"));
         assert!(conf.contains("masterauth pw"));
+    }
+
+    // --- replication sizing: full-resync and output-buffer protection ---
+
+    #[test]
+    fn every_boot_stamps_replication_sizing_defaults() {
+        let dir = tempdir().unwrap();
+        let conf = generate_redis_conf(
+            &config_at(dir.path().to_str().unwrap()),
+            &BootMaster::NoLocalState,
+        );
+        assert!(conf.contains("repl-backlog-size 64mb"));
+        assert!(conf.contains("client-output-buffer-limit replica 512mb 128mb 120"));
+    }
+
+    // Inert without replicas, but a standalone boot (reverted-HA root) can
+    // gain replicas again later on the same image — must not be gated on
+    // sentinel_enabled.
+    #[test]
+    fn standalone_boot_still_stamps_replication_sizing() {
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path().to_str().unwrap());
+        config.sentinel_enabled = false;
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(conf.contains("repl-backlog-size 64mb"));
+        assert!(conf.contains("client-output-buffer-limit replica 512mb 128mb 120"));
+    }
+
+    #[test]
+    fn replication_sizing_is_configurable_via_env() {
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path().to_str().unwrap());
+        config.repl_backlog_size = "256mb".to_string();
+        config.client_output_buffer_limit_replica = "1gb 256mb 180".to_string();
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(conf.contains("repl-backlog-size 256mb"));
+        assert!(conf.contains("client-output-buffer-limit replica 1gb 256mb 180"));
     }
 }
