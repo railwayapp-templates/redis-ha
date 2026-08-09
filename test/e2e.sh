@@ -363,6 +363,23 @@ wait_for_replica_repointed() { # wait_for_replica_repointed NODE EXPECTED_MASTER
   return 1
 }
 
+wait_for_replica_attached_host() { # wait_for_replica_attached_host NODE EXPECTED_MASTER_HOST [timeout]
+  # Attachment target only, link state ignored — for asserting a TRANSIENT
+  # attachment a watcher is about to undo. A fresh replica full-syncing from
+  # the wrong master holds master_host=<wrong> with the link still down for
+  # the whole transfer (diskless-sync delay included), and link-heal's
+  # wrong-master dwell runs concurrently off that same master_host field —
+  # requiring link "up" here means catching the sub-second window between
+  # sync completion and the heal, a coin flip on a 1s poll.
+  local i host
+  for i in $(seq 1 "${3:-90}"); do
+    host=$(master_host_of "$1")
+    [ "$host" = "$2" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
 # ----- scenarios --------------------------------------------------------------
 
 # A fresh volume boots straight into AOF with a Sentinel-confirmed master —
@@ -1175,7 +1192,10 @@ t_link_heal_repoints_wrong_master_attachment() {
     -e REPLICA_OF=wrongm-1:6379 \
     -e BOOT_ROLE_FROM_PEER_SENTINELS=false \
     "${fast[@]}"
-  wait_for_replica_repointed wrongm-4 wrongm-1 90 \
+  # Attachment target only (no link-up requirement): the heal under test may
+  # legitimately fire the moment its dwell lapses, which races the full
+  # sync's own completion — see wait_for_replica_attached_host.
+  wait_for_replica_attached_host wrongm-4 wrongm-1 90 \
     || { ko "$t" "node never attached to the demoted master (fault injection failed)" wrongm-4 wrongm-1; return; }
 
   wait_for_log_line wrongm-4 "repointing a replica durably attached to the wrong master" 90 \
