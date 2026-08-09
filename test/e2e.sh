@@ -141,6 +141,14 @@ start_node() {
 
 rcli() { docker exec "$1" redis-cli -a "$PW" "${@:2}" 2>/dev/null; }
 
+# Sentinel-port client. Sentinel auth is now on by default for fresh
+# clusters, reusing REDIS_PASSWORD, so this authenticates with the same
+# password rcli uses. Against a sentinel that requires no auth (kill-switch
+# or posture-matched scenarios) redis-cli's AUTH failure is non-fatal — it
+# prints "AUTH failed: ..." to stderr (discarded here) and runs the command
+# anyway — verified against redis 8.2.1, so one helper serves both postures.
+scli() { docker exec "$1" redis-cli -p 26379 -a "$PW" --no-auth-warning "${@:2}" 2>/dev/null; }
+
 wait_for_ping() { # wait_for_ping NODE [timeout]
   local i
   for i in $(seq 1 "${2:-60}"); do
@@ -174,7 +182,7 @@ wait_for_sentinel_peers() { # wait_for_sentinel_peers NODE MIN_PEERS [timeout]
   # quorum, so failover tests must wait for the mesh to form first.
   local i peers
   for i in $(seq 1 "${3:-60}"); do
-    peers=$(docker exec "$1" redis-cli -p 26379 SENTINEL master mymaster 2>/dev/null       | grep -A1 "^num-other-sentinels$" | tail -1)
+    peers=$(scli "$1" SENTINEL master mymaster       | grep -A1 "^num-other-sentinels$" | tail -1)
     [ -n "$peers" ] && [ "$peers" -ge "$2" ] 2>/dev/null && return 0
     sleep 1
   done
@@ -190,7 +198,7 @@ wait_for_sentinel_peers() { # wait_for_sentinel_peers NODE MIN_PEERS [timeout]
 wait_for_sentinel_slave_view() { # wait_for_sentinel_slave_view NODE MIN_SLAVES [timeout]
   local i good resets=0
   for i in $(seq 1 "${3:-60}"); do
-    good=$(docker exec "$1" redis-cli -p 26379 SENTINEL slaves mymaster 2>/dev/null       | paste - - | awk '
+    good=$(scli "$1" SENTINEL slaves mymaster       | paste - - | awk '
         $1=="flags" && $2=="slave" { f=1 }
         $1=="master-link-status" && $2=="ok" { l=1 }
         $1=="info-refresh" && $2+0 < 10000 { r=1 }
@@ -198,7 +206,7 @@ wait_for_sentinel_slave_view() { # wait_for_sentinel_slave_view NODE MIN_SLAVES 
         END { if (f&&l&&r) n++; print n+0 }')
     [ "$good" -ge "$2" ] 2>/dev/null && return 0
     if [ $(( i % 20 )) -eq 0 ] && [ "$resets" -lt 2 ]; then
-      docker exec "$1" redis-cli -p 26379 SENTINEL RESET mymaster >/dev/null 2>&1
+      scli "$1" SENTINEL RESET mymaster >/dev/null
       resets=$((resets + 1))
     fi
     sleep 1
@@ -209,7 +217,7 @@ wait_for_sentinel_slave_view() { # wait_for_sentinel_slave_view NODE MIN_SLAVES 
 dump_sentinel_view() { # dump_sentinel_view NODE...
   for n in "$@"; do
     echo "--- SENTINEL view (${n}) ---" >&2
-    docker exec "$n" redis-cli -p 26379 SENTINEL slaves mymaster 2>/dev/null       | paste - - | grep -E "^name|^flags|master-link-status|info-refresh|last-ping-reply" >&2
+    scli "$n" SENTINEL slaves mymaster       | paste - - | grep -E "^name|^flags|master-link-status|info-refresh|last-ping-reply" >&2
   done
 }
 
@@ -350,6 +358,23 @@ wait_for_replica_repointed() { # wait_for_replica_repointed NODE EXPECTED_MASTER
     host=$(echo "$info" | grep "^master_host:" | tr -d '\r')
     status=$(echo "$info" | grep "^master_link_status:" | tr -d '\r')
     [ "$host" = "master_host:$2" ] && [ "$status" = "master_link_status:up" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+wait_for_replica_attached_host() { # wait_for_replica_attached_host NODE EXPECTED_MASTER_HOST [timeout]
+  # Attachment target only, link state ignored — for asserting a TRANSIENT
+  # attachment a watcher is about to undo. A fresh replica full-syncing from
+  # the wrong master holds master_host=<wrong> with the link still down for
+  # the whole transfer (diskless-sync delay included), and link-heal's
+  # wrong-master dwell runs concurrently off that same master_host field —
+  # requiring link "up" here means catching the sub-second window between
+  # sync completion and the heal, a coin flip on a 1s poll.
+  local i host
+  for i in $(seq 1 "${3:-90}"); do
+    host=$(master_host_of "$1")
+    [ "$host" = "$2" ] && return 0
     sleep 1
   done
   return 1
@@ -1167,7 +1192,10 @@ t_link_heal_repoints_wrong_master_attachment() {
     -e REPLICA_OF=wrongm-1:6379 \
     -e BOOT_ROLE_FROM_PEER_SENTINELS=false \
     "${fast[@]}"
-  wait_for_replica_repointed wrongm-4 wrongm-1 90 \
+  # Attachment target only (no link-up requirement): the heal under test may
+  # legitimately fire the moment its dwell lapses, which races the full
+  # sync's own completion — see wait_for_replica_attached_host.
+  wait_for_replica_attached_host wrongm-4 wrongm-1 90 \
     || { ko "$t" "node never attached to the demoted master (fault injection failed)" wrongm-4 wrongm-1; return; }
 
   wait_for_log_line wrongm-4 "repointing a replica durably attached to the wrong master" 90 \
@@ -1208,7 +1236,7 @@ t_quorum_follows_registered_membership() {
   for n in quor-1 quor-2 quor-3 quor-4 quor-5; do
     converged=""
     for i in $(seq 1 120); do
-      q=$(docker exec "$n" redis-cli -p 26379 SENTINEL master mymaster 2>/dev/null \
+      q=$(scli "$n" SENTINEL master mymaster \
         | grep -A1 "^quorum$" | tail -1)
       [ "$q" = "3" ] && { converged=1; break; }
       sleep 1
@@ -1271,9 +1299,9 @@ t_scale_down_prunes_dead_sentinels() {
   for n in prune-1 prune-2 prune-3; do
     converged=""
     for i in $(seq 1 180); do
-      peers=$(docker exec "$n" redis-cli -p 26379 SENTINEL master mymaster 2>/dev/null \
+      peers=$(scli "$n" SENTINEL master mymaster \
         | grep -A1 "^num-other-sentinels$" | tail -1)
-      q=$(docker exec "$n" redis-cli -p 26379 SENTINEL master mymaster 2>/dev/null \
+      q=$(scli "$n" SENTINEL master mymaster \
         | grep -A1 "^quorum$" | tail -1)
       [ "$peers" = "2" ] && [ "$q" = "2" ] && { converged=1; break; }
       sleep 1
@@ -1489,60 +1517,156 @@ t_scaled_member_master_is_preserved_at_boot() {
   ok "$t"
 }
 
-# SENTINEL_PASSWORD (opt-in, default off — every other scenario in this file
-# runs with it unset and must keep passing unmodified). A cluster with it set
-# on every node from first boot must converge exactly like the no-auth path
-# (gossip, replication, failover) AND must actually refuse the unauthenticated
-# `SENTINEL SET/RESET/FAILOVER/REMOVE` this var exists to close off.
-t_sentinel_password_converges_and_blocks_unauthenticated() {
-  local t=t_sentinel_password_converges_and_blocks_unauthenticated
-  local spw="e2e-sentinel-password"
-  start_ha_trio auth -e SENTINEL_PASSWORD="$spw" \
-    || { dump_sentinel_view auth-2 auth-3
-         ko "$t" "cluster with SENTINEL_PASSWORD never became failover-ready" auth-1 auth-2 auth-3
+# Whether a volume's sentinel.conf carries a non-empty requirepass. Matches
+# both the wrapper's `requirepass <pw>` and Sentinel's own rewrite form
+# (`requirepass "<pw>"`).
+sentinel_conf_requires_auth() { # sentinel_conf_requires_auth VOLUME
+  docker run --rm -v "$1:/v" alpine:latest sh -c \
+    'grep -i "^requirepass " /v/sentinel.conf' 2>/dev/null | grep -vq '""'
+}
+
+# Sentinel auth, default ON for fresh clusters, reusing REDIS_PASSWORD as
+# the sentinel password — nothing extra stamped by the platform. A trio
+# started with the exact env the template stamps must come up AUTHED on
+# every node (no mixed posture anywhere), refuse the unauthenticated
+# `SENTINEL SET/RESET/FAILOVER/REMOVE` the auth exists to close off, accept
+# the authenticated equivalent, and still fail over end-to-end — a lock
+# that also locks out this image's own watchers (or the peers' votes) would
+# be worse than the gap it closes.
+t_sentinel_auth_on_by_default_for_fresh_cluster() {
+  local t=t_sentinel_auth_on_by_default_for_fresh_cluster
+  start_ha_trio authdef \
+    || { dump_sentinel_view authdef-2 authdef-3
+         ko "$t" "default-authed cluster never became failover-ready" authdef-1 authdef-2 authdef-3
          return; }
 
-  # Gossip discovery and replication over an authenticated sentinel mesh —
-  # the internal clients this PR touches (peer boot query, quorum-sync,
-  # link-heal, the health server) all reaching the co-located and peer
-  # Sentinels the same as with auth off.
-  write_key auth-1 authkey authvalue \
-    || { ko "$t" "master never accepted the write with SENTINEL_PASSWORD set" auth-1; return; }
-  wait_for_key auth-2 authkey authvalue || { ko "$t" "auth-2 never synced" auth-1 auth-2; return; }
-  wait_for_key auth-3 authkey authvalue || { ko "$t" "auth-3 never synced" auth-1 auth-3; return; }
+  # The env-primary booted with no peers up: the decision must be the
+  # default-on arm, and every node's conf must carry requirepass — the
+  # posture-consistency invariant a fresh cluster gets for free.
+  docker logs authdef-1 2>&1 | grep -F "fresh cluster, auth on by default" >/dev/null \
+    || { ko "$t" "authdef-1 did not log the default-on decision" authdef-1; return; }
+  local v
+  for v in authdef-vol-1 authdef-vol-2 authdef-vol-3; do
+    sentinel_conf_requires_auth "$v" \
+      || { ko "$t" "${v} sentinel.conf carries no requirepass — auth was not on by default" authdef-1 authdef-2 authdef-3; return; }
+  done
 
-  # The actual gap (B7): full cluster control without credentials. An
-  # unauthenticated SENTINEL SET must now be refused...
+  # Replication over the authenticated sentinel mesh — the internal clients
+  # (peer boot query, quorum-sync, link-heal, health server) all reaching
+  # the co-located and peer Sentinels.
+  write_key authdef-1 authkey authvalue \
+    || { ko "$t" "master never accepted the write with default auth on" authdef-1; return; }
+  wait_for_key authdef-2 authkey authvalue || { ko "$t" "authdef-2 never synced" authdef-1 authdef-2; return; }
+  wait_for_key authdef-3 authkey authvalue || { ko "$t" "authdef-3 never synced" authdef-1 authdef-3; return; }
+
+  # The actual gap: full cluster control without credentials. An
+  # unauthenticated SENTINEL SET must be refused...
   local unauthed
-  unauthed=$(docker exec auth-1 redis-cli -p 26379 SENTINEL SET mymaster quorum 1 2>&1)
+  unauthed=$(docker exec authdef-1 redis-cli -p 26379 SENTINEL SET mymaster quorum 1 2>&1)
   case "$unauthed" in
     *NOAUTH*) ;;
-    *) ko "$t" "unauthenticated SENTINEL SET was not refused: ${unauthed}" auth-1; return ;;
+    *) ko "$t" "unauthenticated SENTINEL SET was not refused: ${unauthed}" authdef-1; return ;;
   esac
 
-  # ...while the authenticated call — what every internal client in this
-  # image now sends — still succeeds.
+  # ...while the REDIS_PASSWORD-authenticated call — what every internal
+  # client in this image sends — still succeeds.
   local authed
-  authed=$(docker exec auth-1 redis-cli -p 26379 -a "$spw" --no-auth-warning \
+  authed=$(docker exec authdef-1 redis-cli -p 26379 -a "$PW" --no-auth-warning \
     SENTINEL SET mymaster quorum 2 2>&1)
   [ "$authed" = "OK" ] \
-    || { ko "$t" "authenticated SENTINEL SET failed: ${authed}" auth-1; return; }
+    || { ko "$t" "REDIS_PASSWORD-authenticated SENTINEL SET failed: ${authed}" authdef-1; return; }
 
-  # Failover must still work end-to-end with auth on — this is the rollout
-  # risk called out in the PR: a lock that also locks out this image's own
-  # watchers is worse than the gap it closes.
+  # Failover end-to-end with auth on.
   local promoted
-  promoted=$(promote_by_pausing auth-1 auth-2 auth-3) || {
-    dump_sentinel_view auth-2 auth-3
-    ko "$t" "no replica was promoted after pausing the authenticated master" auth-2 auth-3
+  promoted=$(promote_by_pausing authdef-1 authdef-2 authdef-3) || {
+    dump_sentinel_view authdef-2 authdef-3
+    ko "$t" "no replica was promoted after pausing the authenticated master" authdef-2 authdef-3
     return
   }
   [ "$(rcli "$promoted" GET authkey)" = "authvalue" ] \
-    || { ko "$t" "adopted key lost across failover with auth on (promoted=${promoted})" "$promoted"; return; }
+    || { ko "$t" "key lost across failover with auth on (promoted=${promoted})" "$promoted"; return; }
   note "promoted: ${promoted}"
 
-  docker unpause auth-1 >/dev/null 2>&1
-  docker rm -f auth-1 auth-2 auth-3 >/dev/null 2>&1
+  docker unpause authdef-1 >/dev/null 2>&1
+  docker rm -f authdef-1 authdef-2 authdef-3 >/dev/null 2>&1
+  ok "$t"
+}
+
+# The hazard the posture probe exists for: requirepass is decided once, at
+# the boot that generates sentinel.conf, and can never be retrofitted at
+# runtime (`SENTINEL CONFIG SET requirepass` -> "Invalid argument"). So a
+# node scaled up onto an existing UNAUTHENTICATED cluster must boot
+# unauthenticated too — a default-on first boot would otherwise mint the
+# one sentinel that rejects every peer's credential-less failover RPCs
+# while the peers hard-fail its authed ones: partitioned out of failover
+# authorization while looking healthy on the data port. The founding trio
+# runs with SENTINEL_AUTH=false, leaving exactly the on-disk state of a
+# cluster that predates sentinel auth (a sentinel.conf with no
+# requirepass); the scale-up node runs with stock env (auth default ON) and
+# must match the open posture it probes.
+t_scale_up_of_unauthed_cluster_stays_unauthed() {
+  local t=t_scale_up_of_unauthed_cluster_stays_unauthed
+  local hosts="scaleup-1:26379,scaleup-2:26379,scaleup-3:26379"
+  start_ha_trio scaleup -e SENTINEL_AUTH=false \
+    || { dump_sentinel_view scaleup-2 scaleup-3
+         ko "$t" "kill-switched trio never became failover-ready" scaleup-1 scaleup-2 scaleup-3
+         return; }
+  # The kill switch must reproduce the pre-auth behavior exactly: an open
+  # sentinel port.
+  docker exec scaleup-1 redis-cli -p 26379 PING 2>/dev/null | grep -q PONG \
+    || { ko "$t" "SENTINEL_AUTH=false did not leave the sentinel port open" scaleup-1; return; }
+
+  write_key scaleup-1 upkey upvalue \
+    || { ko "$t" "master never accepted the pre-scale-up write" scaleup-1; return; }
+
+  # The scale-up: fresh volume, stock env (no SENTINEL_AUTH — the default),
+  # deploy-time topology naming the founding master.
+  mkvol scaleup-vol-4
+  start_node scaleup-4 scaleup-vol-4 /data \
+    -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=scaleup-1:6379
+  wait_for_log_line scaleup-4 "matching the cluster's open posture" 30 \
+    || { ko "$t" "scale-up node never posture-matched the open cluster" scaleup-4; return; }
+  wait_for_file_in_volume scaleup-vol-4 sentinel.conf 30 \
+    || { ko "$t" "scale-up node never wrote sentinel.conf" scaleup-4; return; }
+  sentinel_conf_requires_auth scaleup-vol-4 \
+    && { ko "$t" "scale-up node wrote requirepass into an unauthenticated cluster — mixed auth" scaleup-4; return; }
+  # Retried: the conf lands before the sentinel process starts listening.
+  local i sentinel_open=""
+  for i in $(seq 1 30); do
+    docker exec scaleup-4 redis-cli -p 26379 PING 2>/dev/null | grep -q PONG \
+      && { sentinel_open=1; break; }
+    sleep 1
+  done
+  [ -n "$sentinel_open" ] \
+    || { ko "$t" "scale-up node's sentinel is not open like its peers" scaleup-4; return; }
+  wait_for_key scaleup-4 upkey upvalue \
+    || { ko "$t" "scale-up node never synced the dataset" scaleup-1 scaleup-4; return; }
+
+  # Failover with the scale-up node's vote REQUIRED: 4 known sentinels mean
+  # the leader election needs 3 votes, and pausing the master leaves
+  # exactly 3 alive — scaleup-4 must be one of them. A mixed-auth node
+  # would make this promotion impossible, so converging here IS the proof
+  # that no auth line divides the cluster.
+  local n
+  for n in scaleup-2 scaleup-3 scaleup-4; do
+    wait_for_sentinel_peers "$n" 3 || { ko "$t" "${n} never saw all 3 peers" "$n"; return; }
+  done
+  wait_for_sentinel_slave_view scaleup-2 3 \
+    || { dump_sentinel_view scaleup-2; ko "$t" "scaleup-2 never got a live view of all replicas" scaleup-2; return; }
+  wait_for_sentinel_slave_view scaleup-3 3 \
+    || { dump_sentinel_view scaleup-3; ko "$t" "scaleup-3 never got a live view of all replicas" scaleup-3; return; }
+  local promoted
+  promoted=$(promote_by_pausing scaleup-1 scaleup-2 scaleup-3 scaleup-4) || {
+    dump_sentinel_view scaleup-2 scaleup-3 scaleup-4
+    ko "$t" "no replica was promoted — the scale-up node's vote was needed and missing" scaleup-2 scaleup-3 scaleup-4
+    return
+  }
+  [ "$(rcli "$promoted" GET upkey)" = "upvalue" ] \
+    || { ko "$t" "key lost across the post-scale-up failover (promoted=${promoted})" "$promoted"; return; }
+  note "promoted: ${promoted}"
+
+  docker unpause scaleup-1 >/dev/null 2>&1
+  docker rm -f scaleup-1 scaleup-2 scaleup-3 scaleup-4 >/dev/null 2>&1
   ok "$t"
 }
 
@@ -1686,7 +1810,8 @@ ALL_TESTS=(
   t_scaled_member_master_is_preserved_at_boot
   t_foreign_host_reusing_member_name_is_quarantined
   t_wiped_master_volume_does_not_wipe_cluster
-  t_sentinel_password_converges_and_blocks_unauthenticated
+  t_sentinel_auth_on_by_default_for_fresh_cluster
+  t_scale_up_of_unauthed_cluster_stays_unauthed
 )
 
 setup

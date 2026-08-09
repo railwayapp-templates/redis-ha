@@ -368,20 +368,20 @@ impl WatcherState {
 /// `sentinel_enabled`. Talks to the colocated Sentinel for the quorum and to
 /// the colocated Redis for the fence, both over loopback.
 ///
-/// Two distinct passwords, because they answer two distinct questions:
-///   - `local_sentinel_password` is what actually gets THIS watcher past the
-///     co-located Sentinel's own front door right now — `""` unless that
-///     Sentinel's on-disk conf currently carries `requirepass` (the caller
-///     resolves this from the file, not from env; see
-///     `sentinel_conf::conf_requires_auth`). A preserved conf that predates
-///     `SENTINEL_PASSWORD` has no `requirepass` no matter what the env says,
-///     and authenticating against a Sentinel that requires none is a hard
-///     connection failure, not a no-op.
-///   - `sentinel_password` is the raw `SENTINEL_PASSWORD` env value, used
-///     only as the argument to the `sentinel-pass` retrofit in
-///     [`ensure_announce_identity`] — the credential this Sentinel should
-///     present when it dials OUT to a peer, independent of whether its own
-///     front door is locked.
+/// `local_sentinel_password` answers two questions with one value, because
+/// the cluster's auth posture is consistent by construction (see
+/// `sentinel_auth`): it is what gets THIS watcher past the co-located
+/// Sentinel's own front door — `""` unless that Sentinel's on-disk conf
+/// currently carries `requirepass` (the caller resolves this from the
+/// file, not from the env-derived default; see
+/// `sentinel_conf::conf_requires_auth`) — and it is the credential the
+/// `sentinel-pass` retrofit in [`ensure_announce_identity`] tells the
+/// Sentinel to present when it dials OUT to its peers, who match this
+/// node's posture. A preserved conf from before Sentinel auth existed has
+/// no `requirepass` no matter what the default now is, and authenticating
+/// against a Sentinel that requires none is a hard connection failure, not
+/// a no-op — so an open node must neither AUTH locally nor dial out with
+/// `sentinel-pass`.
 pub fn spawn(
     sentinel_port: u16,
     redis_port: u16,
@@ -389,7 +389,6 @@ pub fn spawn(
     master_name: String,
     private_domain: String,
     local_sentinel_password: String,
-    sentinel_password: String,
 ) {
     if disabled() {
         info!("quorum-sync: QUORUM_SYNC_DISABLED=1, watcher inactive");
@@ -428,7 +427,7 @@ pub fn spawn(
             let rurl = redis_url.clone();
             let name = master_name.clone();
             let domain = private_domain.clone();
-            let pw = sentinel_password.clone();
+            let pw = local_sentinel_password.clone();
             let handle =
                 tokio::task::spawn(async move { run(surl, rurl, name, domain, pw, cfg).await });
             match handle.await {
@@ -448,16 +447,25 @@ pub fn spawn(
 /// only the I/O that sends them.
 ///
 /// `sentinel-pass` is included whenever `sentinel_password` is non-empty —
-/// it is a global parameter `SENTINEL CONFIG SET` does accept (Redis
-/// Sentinel docs enumerate `resolve-hostnames`, `announce-hostnames`,
-/// `announce-ip`, `announce-port`, `sentinel-user`, `sentinel-pass` as the
-/// settable global parameters). `requirepass` is deliberately never in this
-/// list: it is NOT one of those settable parameters, so a preserved conf
-/// that predates `SENTINEL_PASSWORD` cannot be made to require auth without
-/// regenerating sentinel.conf from scratch — this retrofit only lets an
-/// old, still-open node authenticate OUTBOUND to a peer that already
-/// requires it; it does not close that old node's own front door. `default`
-/// is not added as a `sentinel-user`: password-only auth authenticates
+/// i.e. whenever the LOCAL conf requires auth, since the caller passes the
+/// file-resolved local password — and it is a global parameter `SENTINEL
+/// CONFIG SET` does accept (Redis Sentinel docs enumerate
+/// `resolve-hostnames`, `announce-hostnames`, `announce-ip`,
+/// `announce-port`, `sentinel-user`, `sentinel-pass` as the settable
+/// global parameters). This is how a node whose conf predates the explicit
+/// `sentinel sentinel-pass` line absorbs the outbound-auth credential
+/// without a restart. It must never fire on an open node: Sentinel sends
+/// AUTH to every peer once `sentinel-pass` is set, and a peer with no
+/// `requirepass` hard-fails that handshake — an open cluster's mesh would
+/// disintegrate.
+///
+/// `requirepass` is deliberately never in this list: it is NOT one of
+/// those settable parameters (verified against redis 8.2.1: "ERR Invalid
+/// argument 'requirepass' to SENTINEL CONFIG SET"), so a preserved
+/// pre-auth conf cannot be made to require auth without regenerating
+/// sentinel.conf from scratch — this retrofit only feeds the outbound
+/// credential; it does not close the node's own front door. `default` is
+/// not added as a `sentinel-user`: password-only auth authenticates
 /// outbound as the `default` user with no user directive needed at all
 /// (verified against the docs — see `sentinel_conf::generate_sentinel_conf`).
 fn identity_and_auth_config(
@@ -479,7 +487,7 @@ fn identity_and_auth_config(
 /// regenerated — Sentinel owns the file after first boot; without it this
 /// Sentinel keeps gossiping its container IP, which changes on every
 /// redeploy and can never satisfy the deletion probe on peers) and, when
-/// `SENTINEL_PASSWORD` is set, for outbound auth (see
+/// the local conf requires auth, for outbound auth (see
 /// [`identity_and_auth_config`] for exactly what is and is not retrofittable
 /// this way). `SENTINEL CONFIG SET` is persisted by Sentinel's own conf
 /// rewrite, peers absorb the address switch keyed by runid, and on a fresh
@@ -514,14 +522,14 @@ async fn run(
     redis_url: String,
     master_name: String,
     private_domain: String,
-    sentinel_password: String,
+    local_sentinel_password: String,
     cfg: WatcherConfig,
 ) {
     let mut state = WatcherState::default();
     // Give Sentinel its startup head start instead of logging a guaranteed
     // connection failure on the first poll.
     sleep(Duration::from_secs(cfg.poll_secs)).await;
-    ensure_announce_identity(&sentinel_url, &private_domain, &sentinel_password).await;
+    ensure_announce_identity(&sentinel_url, &private_domain, &local_sentinel_password).await;
     loop {
         iteration(&sentinel_url, &redis_url, &master_name, &mut state, &cfg).await;
         sleep(Duration::from_secs(cfg.poll_secs)).await;

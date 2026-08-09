@@ -31,7 +31,9 @@
 //!    replica's shutdown does no further work than today's (this one
 //!    fast local round trip is the only difference).
 //! 2. `SENTINEL FAILOVER <master name>` against the LOCAL Sentinel only
-//!    (`127.0.0.1:<sentinel_port>`, no auth — Sentinel has none by default).
+//!    (`127.0.0.1:<sentinel_port>`, AUTHed iff the local sentinel.conf
+//!    carries `requirepass` — the same file-resolved
+//!    `local_sentinel_password` every other local watcher uses).
 //!    Per the Sentinel command reference: *"Force a failover as if the
 //!    master was not reachable, and without asking for agreement to other
 //!    Sentinels (however a new version of the configuration will be
@@ -141,6 +143,11 @@ pub struct DemoteTarget {
     pub sentinel_port: u16,
     pub redis_master_name: String,
     pub sentinel_enabled: bool,
+    /// What gets this shutdown path past the co-located Sentinel's front
+    /// door: `""` unless the on-disk sentinel.conf carries `requirepass`,
+    /// resolved by the wrapper from the file exactly like link-heal's and
+    /// quorum-sync's (see `sentinel_conf::conf_requires_auth`).
+    pub local_sentinel_password: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -360,9 +367,15 @@ pub async fn demote_before_shutdown(target: &DemoteTarget, sentinel_colocated: b
         "redis://:{}@127.0.0.1:{}",
         target.redis_password, target.redis_port
     );
-    // Sentinel has no auth by default (same as link_heal's and quorum's
-    // local Sentinel connections).
-    let sentinel_url = format!("redis://127.0.0.1:{}", target.sentinel_port);
+    // AUTHed iff the local conf requires it (same file-resolved password as
+    // link_heal's and quorum's local Sentinel connections) — a shutdown on
+    // an authed node would otherwise get NOAUTH exactly when it is asking
+    // for the failover this module exists to trigger.
+    let sentinel_url = crate::sentinel_query::sentinel_url(
+        "127.0.0.1",
+        target.sentinel_port,
+        &target.local_sentinel_password,
+    );
 
     let role = local_role(&redis_url).await;
     if !should_attempt_demote(role) {

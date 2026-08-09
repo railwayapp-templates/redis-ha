@@ -85,7 +85,7 @@ Key variables on the Redis nodes (set on Redis-1, referenced by replicas):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `REDIS_PASSWORD` | `${{secret(64)}}` | Auth — applied to requirepass, masterauth, sentinel auth-pass |
+| `REDIS_PASSWORD` | `${{secret(64)}}` | Auth — applied to requirepass, masterauth, sentinel auth-pass, and (when Sentinel auth is on — see below) the Sentinel's own requirepass |
 | `REDIS_MASTER_NAME` | `mymaster` | Sentinel master set name |
 | `SENTINEL_QUORUM` | `2` | Seed for the odown quorum on first boot. At runtime each node keeps its own Sentinel's quorum at a strict majority of the Sentinels it actually knows (see Self-healing), so this only matters until gossip discovery settles |
 | `SENTINEL_DOWN_AFTER_MS` | `5000` | MS before a node is considered down |
@@ -93,6 +93,7 @@ Key variables on the Redis nodes (set on Redis-1, referenced by replicas):
 | `REDIS_MIN_REPLICAS_TO_WRITE` | `1` | Master disables writes when fewer healthy replicas |
 | `REDIS_MIN_REPLICAS_MAX_LAG` | `10` | Replica lag threshold (seconds) |
 | `REDIS_APPENDONLY` | `yes` | AOF persistence (required — see notes) |
+| `SENTINEL_AUTH` | `true` | Sentinel auth for new clusters, reusing `REDIS_PASSWORD` as the Sentinel password (see Sentinel auth). Set to the literal `false` to always generate an open (no-auth) `sentinel.conf` |
 | `BOOT_ROLE_FROM_SENTINEL_STATE` | `true` | Take the boot role from Sentinel's own `sentinel.conf` instead of `REPLICA_OF`. Set to `false` to pin every boot to the deploy-time topology |
 | `BOOT_ROLE_FROM_PEER_SENTINELS` | `true` | On a first boot (no local Sentinel state), ask the peer Sentinels in `SENTINEL_HOSTS` who the master currently is before trusting `REPLICA_OF`. Set to `false` to disable the query |
 | `QUORUM_SYNC_DISABLED` | unset | Set to `1` to stop the watcher that keeps the local Sentinel's quorum at a majority of the known Sentinels |
@@ -108,6 +109,18 @@ Sentinel already records the current master on the same volume: it owns `sentine
 A node that was down for the whole failover never saw the switch, so its `sentinel.conf` still names itself and it comes back as a master — Sentinel demotes it within one failover timeout, as it does today.
 
 A node with no local state at all — a scale-up addition, a replaced volume — asks the peer Sentinels in `SENTINEL_HOSTS` who the master currently is (`BOOT_ROLE_FROM_PEER_SENTINELS`) before falling back to `REPLICA_OF`. The env topology names whoever was master when the template was stamped; a cluster that failed over since would otherwise receive the new node as an invisible chained sub-replica of a demoted ex-master. The answer is only ever used as a replication target: a peer answer naming the booting node itself (the incumbent master coming back on a wiped volume) is refused, because self-promoting an empty dataset would make every data-bearing replica full-sync from it.
+
+## Sentinel auth
+
+New clusters get Sentinel client auth automatically: the first boot that generates `sentinel.conf` writes `requirepass` / `sentinel sentinel-pass` set to the cluster's existing shared `REDIS_PASSWORD` — nothing extra is stamped by the platform. This closes off unauthenticated `SENTINEL SET/RESET/FAILOVER/REMOVE` on port 26379.
+
+`requirepass` on a Sentinel can only land before Sentinel first starts (`SENTINEL CONFIG SET requirepass` is refused at runtime, and the wrapper preserves `sentinel.conf` after first boot), and Sentinels vote for failovers over the same authenticated port — so a cluster mixing authed and open Sentinels cannot exchange votes. To never create that split, a first boot probes the peers it is joining with a credential-less PING and matches their posture:
+
+- No peer answers → a genuinely fresh cluster → **auth on** (the default-on win).
+- Peers refuse with `NOAUTH` → the cluster is already authed → **auth on**, matching.
+- Any peer answers openly → the cluster runs without auth → **auth off**, matching — a scale-up onto an existing unauthenticated cluster stays unauthenticated.
+
+Existing unauthenticated clusters therefore keep working unchanged, restarts and scale-ups included. Upgrading one to auth is a deliberate whole-cluster operation (regenerate every node's `sentinel.conf` in one window); a rolling restart can never converge to auth precisely because each regenerated node matches the still-open majority. `SENTINEL_AUTH=false` is the kill switch: it forces an open first boot regardless of what the peers say.
 
 ## Self-healing
 

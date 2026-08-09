@@ -248,9 +248,9 @@ async fn is_sentinel_confirmed_master(state: &AppState) -> bool {
 ///
 /// `local_sentinel_password` is `""` unless the co-located Sentinel's
 /// on-disk conf currently carries `requirepass` — resolved by the caller
-/// from the file (see `sentinel_conf::conf_requires_auth`), not from
-/// `SENTINEL_PASSWORD` directly, since a preserved conf that predates the
-/// var has no `requirepass` regardless of what the env now says, and
+/// from the file (see `sentinel_conf::conf_requires_auth`), never assumed
+/// from the default, since a preserved conf that predates Sentinel auth
+/// has no `requirepass` regardless of what new clusters now get, and
 /// authenticating against a Sentinel that requires none is a hard
 /// connection failure, not a no-op.
 async fn run_health_server(
