@@ -91,13 +91,17 @@ backend redis_primary_backend
     option httpchk
     http-check send meth GET uri /role
     http-check expect status 200
-    # fall 1: one failed /role check is enough to pull a server out of rotation.
-    # The check is Sentinel-verified so false positives are unlikely; acting
-    # immediately minimises the window where the old master can still receive
-    # writes through HAProxy.  shutdown-sessions RSTs every open client
-    # connection the moment the server is marked down, forcing clients to
-    # reconnect and land on the new master.
-    default-server fall 1 rise 2 on-marked-down shutdown-sessions
+    # fall 2 + fastinter 500ms: the first failed /role check switches the
+    # probe to the fast interval, so a real demotion is confirmed and the
+    # server pulled ~500ms after the first failure — but ONE slow or dropped
+    # check can no longer RST every client connection on a healthy master.
+    # /role runs a redis PING and a Sentinel confirmation (2s timeout each)
+    # against `timeout check 3s`, so a single blip under load is expected,
+    # and with no replica passing /role a false mark-down is a self-inflicted
+    # write outage until `rise 2` readmits the master. shutdown-sessions RSTs
+    # every open client connection the moment the server is genuinely marked
+    # down, forcing clients to reconnect and land on the new master.
+    default-server fall 2 rise 2 on-marked-down shutdown-sessions
 {servers}
 "#,
         max_conn = config.max_conn,
@@ -179,5 +183,25 @@ mod tests {
         assert!(!conf.contains("redis_reads"));
         assert!(!conf.contains("redis_replica_backend"));
         assert!(!conf.contains("6380"));
+    }
+
+    /// fall 2, not 1: one slow /role check on a healthy master must not RST
+    /// every client connection (fastinter re-probes 500ms later, so a real
+    /// demotion is still confirmed almost immediately). /role's internal
+    /// budget (PING + Sentinel confirmation, 2s each) can legitimately
+    /// exceed `timeout check 3s` under load.
+    #[test]
+    fn write_backend_tolerates_one_failed_check() {
+        let config = config_for_tests();
+        let nodes = crate::nodes::parse_nodes(&config.redis_nodes).unwrap();
+        let conf = generate_config(&config, &nodes);
+
+        // Whole-conf assert: the write backend is the only backend in this
+        // template, and `section()`'s bare find() would land on the
+        // frontend's `default_backend redis_primary_backend` line instead.
+        assert!(
+            conf.contains("default-server fall 2 rise 2 on-marked-down shutdown-sessions")
+        );
+        assert!(!conf.contains("fall 1"));
     }
 }
