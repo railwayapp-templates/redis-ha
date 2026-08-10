@@ -146,6 +146,18 @@ pub fn generate_redis_conf(config: &Config, boot_master: &BootMaster) -> String 
         ),
     ];
 
+    // Absent when no cgroup memory limit could be detected and no
+    // MAXMEMORY_MB override was set — Redis then has no ceiling, same as
+    // every boot before this existed. `noeviction`, not an eviction policy:
+    // this dataset backs correctness-sensitive uses (queues, idempotency
+    // keys, rate limits), so silently discarding a live key under memory
+    // pressure is worse than failing the write that would have crossed the
+    // ceiling. See Config::maxmemory_bytes for why 75%, not 100%.
+    if let Some(bytes) = config.maxmemory_bytes {
+        lines.push(format!("maxmemory {bytes}"));
+        lines.push("maxmemory-policy noeviction".to_string());
+    }
+
     if config.sentinel_enabled {
         // Split-brain fence: master stops accepting writes when the replicas
         // still acking it drop below the count a majority-side partition
@@ -562,5 +574,39 @@ mod tests {
         let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
         assert!(conf.contains("repl-backlog-size 256mb"));
         assert!(conf.contains("client-output-buffer-limit replica 1gb 256mb 180"));
+    }
+
+    // --- maxmemory: absent by default, stamped (with noeviction) when set ---
+
+    #[test]
+    fn no_maxmemory_directive_when_none_was_detected() {
+        let dir = tempdir().unwrap();
+        let config = config_at(dir.path().to_str().unwrap());
+        assert_eq!(config.maxmemory_bytes, None); // for_tests() default
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(!conf.contains("maxmemory"));
+    }
+
+    #[test]
+    fn maxmemory_and_noeviction_are_stamped_together_when_set() {
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path().to_str().unwrap());
+        config.maxmemory_bytes = Some(1_610_612_736); // 1.5 GiB
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(conf.contains("maxmemory 1610612736"));
+        assert!(conf.contains("maxmemory-policy noeviction"));
+    }
+
+    #[test]
+    fn maxmemory_is_stamped_on_a_standalone_boot_too() {
+        // Same reasoning as replication sizing: a standalone (reverted-HA)
+        // root keeps this image and the same OOM exposure.
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path().to_str().unwrap());
+        config.sentinel_enabled = false;
+        config.maxmemory_bytes = Some(536_870_912);
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(conf.contains("maxmemory 536870912"));
+        assert!(conf.contains("maxmemory-policy noeviction"));
     }
 }
