@@ -85,7 +85,7 @@ pub async fn enable_aof_after_rdb_load(
     data_dir: &str,
     telemetry: &Telemetry,
 ) {
-    let url = format!("redis://:{}@127.0.0.1:{}", password, port);
+    let url = crate::sentinel_query::build_redis_url("127.0.0.1", port, password);
     let client = match Client::open(url) {
         Ok(client) => client,
         Err(err) => {

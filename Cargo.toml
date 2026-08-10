@@ -22,6 +22,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 nix = { version = "0.29", features = ["signal", "process"] }
 axum = "0.8"
 redis = { version = "0.27", features = ["tokio-comp", "aio"] }
+url = "2.5"
 
 [profile.release]
 lto = true

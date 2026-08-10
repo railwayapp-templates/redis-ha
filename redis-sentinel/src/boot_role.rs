@@ -344,7 +344,7 @@ async fn undeclared_master_is_member(config: &Config, host: &str, port: u16) -> 
         "UNDECLARED_MASTER_PROBE_TIMEOUT_MS",
         DEFAULT_MEMBER_PROBE_TIMEOUT_MS,
     ));
-    let url = format!("redis://:{}@{}:{}", config.redis_password, host, port);
+    let url = crate::sentinel_query::build_redis_url(host, port, &config.redis_password);
     for _ in 0..2 {
         if crate::sentinel_query::authenticated_ping(&url, deadline).await {
             return true;

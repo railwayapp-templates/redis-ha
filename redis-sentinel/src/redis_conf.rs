@@ -100,12 +100,43 @@ pub fn min_replicas_to_write(sentinel_quorum: u32) -> u32 {
     sentinel_quorum.saturating_sub(1).max(1)
 }
 
+/// Renders `value` as a double-quoted config-file token, safe for any byte
+/// value a password could actually contain — space, `#`, a bare `'` or `"`,
+/// all of which corrupt or truncate an unquoted `requirepass`/`masterauth`
+/// line (worst case: everything after a stray `#` silently becomes a
+/// comment, and the node boots with no password at all). Backslash and
+/// double-quote — the two characters that let a crafted value escape the
+/// quotes and inject a second directive onto the same line — are
+/// backslash-escaped; every other byte passes through unchanged inside the
+/// quotes. Redis's own config parser (`sdssplitargs`, shared by redis.conf
+/// and sentinel.conf, and what `CONFIG REWRITE` itself both reads and
+/// writes) decodes exactly this escaping. Always quoting — not just when the
+/// value looks like it needs it — means one code path instead of a
+/// "does this need quoting" branch to get wrong.
+///
+/// A password can carry any of this: conversion adopts whatever
+/// `REDIS_PASSWORD` the standalone service already had, which the customer
+/// set, not this image.
+pub fn quote_conf_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
 pub fn generate_redis_conf(config: &Config, boot_master: &BootMaster) -> String {
     let adopting_rdb = needs_rdb_to_aof_migration(&config.data_dir);
 
     let mut lines: Vec<String> = vec![
         format!("port {}", config.redis_port),
-        format!("requirepass {}", config.redis_password),
+        format!("requirepass {}", quote_conf_value(&config.redis_password)),
         "protected-mode yes".to_string(),
         // Persist data to the volume. Deliberately off for this one boot when
         // adopting an RDB-only dataset — enabled at runtime once the RDB is
@@ -200,7 +231,7 @@ pub fn generate_redis_conf(config: &Config, boot_master: &BootMaster) -> String 
     // dataset frozen at the moment it lost the master role — and stays
     // eligible for a later promotion, which is how that stale dataset becomes
     // the cluster's. Inert on a master, which never reads it.
-    lines.push(format!("masterauth {}", config.redis_password));
+    lines.push(format!("masterauth {}", quote_conf_value(&config.redis_password)));
 
     if let Some((host, port)) = replicate_from(config, boot_master) {
         lines.push(format!("replicaof {} {}", host, port));
@@ -388,8 +419,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = config_at(dir.path().to_str().unwrap());
         assert!(config.is_primary());
-        assert!(generate_redis_conf(&config, &BootMaster::NoLocalState).contains("masterauth pw"));
-        assert!(generate_redis_conf(&config, &BootMaster::SelfIsMaster).contains("masterauth pw"));
+        assert!(generate_redis_conf(&config, &BootMaster::NoLocalState).contains(r#"masterauth "pw""#));
+        assert!(generate_redis_conf(&config, &BootMaster::SelfIsMaster).contains(r#"masterauth "pw""#));
     }
 
     #[test]
@@ -399,7 +430,7 @@ mod tests {
         config.replica_of = "master-host:7000".to_string();
         let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
         assert!(conf.contains("replicaof master-host 7000"));
-        assert!(conf.contains("masterauth pw"));
+        assert!(conf.contains(r#"masterauth "pw""#));
     }
 
     #[test]
@@ -409,7 +440,7 @@ mod tests {
         config.replica_of = "master-host".to_string();
         let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
         assert!(!conf.contains("replicaof"));
-        assert!(conf.contains("masterauth pw"));
+        assert!(conf.contains(r#"masterauth "pw""#));
     }
 
     #[test]
@@ -497,7 +528,7 @@ mod tests {
             &BootMaster::ReplicaOf("redis-2.railway.internal".to_string(), 6379),
         );
         assert!(conf.contains("replicaof redis-2.railway.internal 6379"));
-        assert!(conf.contains("masterauth pw"));
+        assert!(conf.contains(r#"masterauth "pw""#));
     }
 
     #[test]
@@ -519,7 +550,7 @@ mod tests {
         config.replica_of = "master-host:6379".to_string();
         let as_replica = generate_redis_conf(&config, &BootMaster::NoLocalState);
         assert!(as_replica.contains("replicaof master-host 6379"));
-        assert!(as_replica.contains("masterauth pw"));
+        assert!(as_replica.contains(r#"masterauth "pw""#));
 
         config.replica_of = String::new();
         let as_primary = generate_redis_conf(&config, &BootMaster::NoLocalState);
@@ -536,7 +567,7 @@ mod tests {
         config.replica_of = "master-host:abc".to_string();
         let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
         assert!(!conf.contains("replicaof"));
-        assert!(conf.contains("masterauth pw"));
+        assert!(conf.contains(r#"masterauth "pw""#));
     }
 
     // --- replication sizing: full-resync and output-buffer protection ---
@@ -608,5 +639,74 @@ mod tests {
         let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
         assert!(conf.contains("maxmemory 536870912"));
         assert!(conf.contains("maxmemory-policy noeviction"));
+    }
+
+    // --- quote_conf_value: every branch ---
+
+    #[test]
+    fn a_plain_value_is_just_quoted() {
+        assert_eq!(quote_conf_value("hunter2"), r#""hunter2""#);
+    }
+
+    #[test]
+    fn a_backslash_is_escaped() {
+        assert_eq!(quote_conf_value(r"pass\word"), r#""pass\\word""#);
+    }
+
+    #[test]
+    fn a_double_quote_is_escaped() {
+        assert_eq!(quote_conf_value(r#"pass"word"#), r#""pass\"word""#);
+    }
+
+    #[test]
+    fn a_space_and_hash_survive_inside_the_quotes_untouched() {
+        // Neither needs escaping once the whole value is quoted — a bare
+        // space would otherwise split the token, and a bare "#" would
+        // otherwise start a comment.
+        assert_eq!(quote_conf_value("pass word#tail"), r#""pass word#tail""#);
+    }
+
+    #[test]
+    fn an_empty_value_becomes_an_empty_quoted_string() {
+        assert_eq!(quote_conf_value(""), r#""""#);
+    }
+
+    #[test]
+    fn adjacent_backslash_and_quote_each_get_their_own_escape() {
+        // The case a naive "escape quotes, then escape backslashes" two-pass
+        // implementation gets wrong: escaping backslashes AFTER quotes would
+        // re-escape the backslash quote-escaping just added.
+        assert_eq!(quote_conf_value(r#"a\"b"#), r#""a\\\"b""#);
+    }
+
+    // --- requirepass / masterauth: quoted end to end, via generate_redis_conf ---
+
+    #[test]
+    fn requirepass_and_masterauth_are_quoted() {
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path().to_str().unwrap());
+        config.redis_password = "hunter2".to_string();
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(conf.lines().any(|l| l == r#"requirepass "hunter2""#));
+        assert!(conf.lines().any(|l| l == r#"masterauth "hunter2""#));
+    }
+
+    #[test]
+    fn a_password_with_a_hash_and_a_space_does_not_truncate_or_split_the_directive() {
+        // Unquoted, this password would comment out everything after "#" on
+        // the requirepass line (silently booting with NO password) and split
+        // the masterauth line into two malformed tokens. Conversion adopts
+        // whatever REDIS_PASSWORD the standalone service already had, so
+        // this is a real customer-controlled input.
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path().to_str().unwrap());
+        config.redis_password = "p# w\"ord".to_string();
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(conf.lines().any(|l| l == r#"requirepass "p# w\"ord""#));
+        assert!(conf.lines().any(|l| l == r#"masterauth "p# w\"ord""#));
+        // Every directive after the password lines is still on its own,
+        // intact line — nothing got swallowed into a comment or merged.
+        assert!(conf.lines().any(|l| l == "protected-mode yes"));
+        assert!(conf.lines().any(|l| l.starts_with("dir ")));
     }
 }

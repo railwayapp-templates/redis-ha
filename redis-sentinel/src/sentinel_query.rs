@@ -12,25 +12,39 @@ use redis::Client;
 use std::time::Duration;
 use tokio::time::timeout;
 
-/// Build a `redis://` URL for a Sentinel endpoint, the one place that decides
-/// whether a Sentinel connection carries AUTH.
+/// Builds a `redis://` URL for any endpoint this crate connects to — a
+/// Sentinel port or the local Redis data port alike — the one place that
+/// decides whether the connection carries AUTH and the one place the
+/// password is escaped into the URL's userinfo component.
 ///
 /// `password` follows the crate-wide "empty = off" convention: an empty
 /// password produces the exact unauthenticated URL every caller built by
-/// hand before this helper existed, and a non-empty one — the cluster's
-/// shared `REDIS_PASSWORD`, when the local sentinel.conf carries
-/// `requirepass` (see `sentinel_auth`) — sends AUTH. Every internal client
-/// of a Sentinel endpoint — the boot-time peer query, the quorum-sync
-/// watcher, link-heal, the health server, demote-on-shutdown — goes through
-/// this so there is one formula to update instead of six, and one place
-/// that can truthfully claim "the password never appears in a log line" by
+/// hand before this helper existed, and a non-empty one sends AUTH. Every
+/// internal client of a redis:// endpoint — the boot-time peer query, the
+/// quorum-sync watcher, link-heal, the health server, demote-on-shutdown,
+/// process-manager, boot-role's dataset probe — goes through this so there
+/// is one formula to update instead of eight, and one place that can
+/// truthfully claim "the password never appears in a log line" by
 /// construction (the `redis` crate never logs the URLs it's given).
-pub fn sentinel_url(host: &str, port: u16, password: &str) -> String {
+///
+/// Routes through `url::Url::set_password` rather than interpolating the raw
+/// password into the string: a password containing `@`, `:`, `/`, `#`, `%`,
+/// or whitespace — entirely possible, since a converted cluster inherits
+/// whatever password the customer's standalone Redis already had — breaks a
+/// hand-built URL's parsing (wrong host, truncated password, or an outright
+/// unparseable string), not just cosmetically. `url` percent-encodes exactly
+/// the userinfo-illegal byte set, and the `redis` crate parses URLs through
+/// the same crate, so what this builds is guaranteed to parse back to the
+/// original password, not merely "usually work."
+pub fn build_redis_url(host: &str, port: u16, password: &str) -> String {
     if password.is_empty() {
-        format!("redis://{host}:{port}")
-    } else {
-        format!("redis://:{password}@{host}:{port}")
+        return format!("redis://{host}:{port}");
     }
+    let mut url = url::Url::parse(&format!("redis://{host}:{port}"))
+        .expect("a bare host:port authority always parses");
+    url.set_password(Some(password))
+        .expect("a URL with a host always accepts a password");
+    url.to_string()
 }
 
 /// How a Sentinel endpoint answered a credential-less probe.
@@ -68,7 +82,7 @@ fn is_noauth(err: &redis::RedisError) -> bool {
 /// and anything else — refused connection, timeout — proves only that this
 /// endpoint had no answer to give.
 pub async fn probe_unauthenticated(host: &str, port: u16, deadline: Duration) -> UnauthedProbe {
-    let url = sentinel_url(host, port, "");
+    let url = build_redis_url(host, port, "");
     let Some(mut conn) = connect(&url, deadline).await else {
         return UnauthedProbe::NoAnswer;
     };
@@ -175,14 +189,14 @@ pub async fn get_master_addr_with_auth_fallback(
     password: &str,
     deadline: Duration,
 ) -> Option<(String, u16)> {
-    let open_url = sentinel_url(host, port, "");
+    let open_url = build_redis_url(host, port, "");
     let mut conn = connect(&open_url, deadline).await?;
     match request_master_addr(&mut conn, master_name, deadline).await {
         Ok(answer) => return answer,
         Err(err) if is_noauth(&err) && !password.is_empty() => {}
         Err(_) => return None,
     }
-    let authed_url = sentinel_url(host, port, password);
+    let authed_url = build_redis_url(host, port, password);
     let mut conn = connect(&authed_url, deadline).await?;
     request_master_addr(&mut conn, master_name, deadline)
         .await
@@ -216,30 +230,34 @@ pub async fn get_master_fields(
 }
 
 #[cfg(test)]
-mod sentinel_url_tests {
+mod build_redis_url_tests {
     use super::*;
+    use redis::IntoConnectionInfo;
 
     #[test]
     fn empty_password_is_todays_unauthenticated_url() {
         assert_eq!(
-            sentinel_url("redis-1.railway.internal", 26379, ""),
+            build_redis_url("redis-1.railway.internal", 26379, ""),
             "redis://redis-1.railway.internal:26379"
         );
     }
 
     #[test]
-    fn a_password_is_embedded_as_the_url_auth_component() {
+    fn a_plain_password_is_embedded_as_the_url_auth_component() {
         assert_eq!(
-            sentinel_url("redis-1.railway.internal", 26379, "s3cr3t"),
+            build_redis_url("redis-1.railway.internal", 26379, "s3cr3t"),
             "redis://:s3cr3t@redis-1.railway.internal:26379"
         );
     }
 
     #[test]
     fn loopback_host_works_the_same_way() {
-        assert_eq!(sentinel_url("127.0.0.1", 26379, ""), "redis://127.0.0.1:26379");
         assert_eq!(
-            sentinel_url("127.0.0.1", 26379, "pw"),
+            build_redis_url("127.0.0.1", 26379, ""),
+            "redis://127.0.0.1:26379"
+        );
+        assert_eq!(
+            build_redis_url("127.0.0.1", 26379, "pw"),
             "redis://:pw@127.0.0.1:26379"
         );
     }
@@ -248,7 +266,77 @@ mod sentinel_url_tests {
     fn the_password_never_appears_unescaped_elsewhere_in_the_url() {
         // Guards against a future edit accidentally duplicating the
         // password into the host/port portion of the URL.
-        let url = sentinel_url("redis-2.railway.internal", 26379, "hunter2");
+        let url = build_redis_url("redis-2.railway.internal", 26379, "hunter2");
         assert_eq!(url.matches("hunter2").count(), 1);
+    }
+
+    // --- passwords with characters that break a hand-interpolated URL ---
+    //
+    // Every case here round-trips through the `redis` crate's own parser
+    // (the actual consumer, not just a string-shape assertion) to prove the
+    // built URL is not just well-formed but decodes back to the exact
+    // original password.
+
+    fn round_tripped_password(host: &str, port: u16, password: &str) -> String {
+        let url = build_redis_url(host, port, password);
+        let info = url
+            .as_str()
+            .into_connection_info()
+            .unwrap_or_else(|e| panic!("built URL {url:?} failed to parse: {e}"));
+        info.redis.password.unwrap_or_default()
+    }
+
+    #[test]
+    fn a_password_containing_an_at_sign_round_trips() {
+        // Unescaped, "@" is the userinfo/host delimiter — the naive
+        // `format!("redis://:{password}@{host}")` would truncate the
+        // password at the FIRST "@" and misparse the remainder as part of
+        // the host.
+        let pw = "p@ss@word";
+        assert_eq!(
+            round_tripped_password("redis-1.railway.internal", 6379, pw),
+            pw
+        );
+    }
+
+    #[test]
+    fn a_password_containing_a_colon_round_trips() {
+        let pw = "pass:word";
+        assert_eq!(round_tripped_password("127.0.0.1", 6379, pw), pw);
+    }
+
+    #[test]
+    fn a_password_containing_a_slash_round_trips() {
+        let pw = "pass/word";
+        assert_eq!(round_tripped_password("127.0.0.1", 6379, pw), pw);
+    }
+
+    #[test]
+    fn a_password_containing_a_percent_sign_round_trips() {
+        // The escape character itself — a naive percent-encoder that forgot
+        // to encode literal "%" would produce a URL whose decoder
+        // misinterprets whatever follows it as an escape sequence.
+        let pw = "50%off";
+        assert_eq!(round_tripped_password("127.0.0.1", 6379, pw), pw);
+    }
+
+    #[test]
+    fn a_password_containing_whitespace_round_trips() {
+        let pw = "pass word";
+        assert_eq!(round_tripped_password("127.0.0.1", 6379, pw), pw);
+    }
+
+    #[test]
+    fn a_password_containing_a_hash_round_trips() {
+        // Unescaped, "#" starts the URL fragment — everything after it would
+        // silently vanish from the parsed password.
+        let pw = "pass#word";
+        assert_eq!(round_tripped_password("127.0.0.1", 6379, pw), pw);
+    }
+
+    #[test]
+    fn a_password_that_is_only_special_characters_round_trips() {
+        let pw = "@:/?#%";
+        assert_eq!(round_tripped_password("127.0.0.1", 6379, pw), pw);
     }
 }
