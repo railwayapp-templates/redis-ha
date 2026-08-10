@@ -1,12 +1,23 @@
 //! HTTP health server embedded in each Redis node.
 //!
-//! Exposes two endpoints that HAProxy uses for intelligent routing:
+//! Exposes two probe endpoints that HAProxy uses for intelligent routing,
+//! plus one action endpoint the Railway dashboard drives:
 //!
-//!   GET /health  → 200 if Redis is up and responding to PING, 503 otherwise.
-//!   GET /role    → 200 {"role":"master"} only if BOTH conditions hold:
-//!                    1. local Redis reports role:master
-//!                    2. local Sentinel confirms this node is the current master
-//!                  503 in all other cases, including when Sentinel is unreachable.
+//!   GET /health      → 200 if Redis is up and responding to PING, 503 otherwise.
+//!   GET /role        → 200 {"role":"master"} only if BOTH conditions hold:
+//!                        1. local Redis reports role:master
+//!                        2. local Sentinel confirms this node is the current master
+//!                      503 in all other cases, including when Sentinel is unreachable.
+//!   POST /switchover → ask THIS node to become the primary (the generic
+//!                      clusterWiring.dataNodeSwitchover contract). Sentinel
+//!                      has no "promote node X" command, only "start an
+//!                      election", so this biases the one lever the election
+//!                      reads — this node's own replica-priority — then
+//!                      triggers `SENTINEL FAILOVER` and restores the
+//!                      priority once the election settles (or times out).
+//!                      200 = already primary, 202 = election started
+//!                      (confirmation is /role flipping), 409 = a previous
+//!                      switchover is still settling, 503 = refused.
 //!
 //! ## What the /role dual check actually fences
 //! `SENTINEL get-master-addr-by-name` answers from the local Sentinel's own
@@ -42,13 +53,14 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Json},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use common::{Telemetry, TelemetryEvent};
 use redis::{aio::MultiplexedConnection, Client};
 use serde_json::json;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
@@ -67,6 +79,9 @@ struct AppState {
     redis_master_name: String,
     redis_conn: Arc<Mutex<Option<MultiplexedConnection>>>,
     sentinel_conn: Arc<Mutex<Option<MultiplexedConnection>>>,
+    /// Single-flight latch for /switchover: a second promote while the first
+    /// election is still settling would fight its priority bias.
+    switchover_in_flight: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -83,6 +98,7 @@ impl AppState {
             redis_master_name,
             redis_conn: Arc::new(Mutex::new(None)),
             sentinel_conn: Arc::new(Mutex::new(None)),
+            switchover_in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -158,7 +174,8 @@ async fn role(State(state): State<AppState>) -> impl IntoResponse {
 async fn ping_redis(state: &AppState) -> bool {
     match state.get_redis_conn().await {
         Some(mut conn) => {
-            let result: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut conn).await;
+            let result: redis::RedisResult<String> =
+                redis::cmd("PING").query_async(&mut conn).await;
             matches!(result, Ok(s) if s == "PONG")
         }
         None => false,
@@ -167,7 +184,9 @@ async fn ping_redis(state: &AppState) -> bool {
 
 /// Check (1): local Redis says role:master.
 async fn local_role_is_master(state: &AppState) -> bool {
-    let Some(mut conn) = state.get_redis_conn().await else { return false };
+    let Some(mut conn) = state.get_redis_conn().await else {
+        return false;
+    };
     let Ok(info): redis::RedisResult<String> = redis::cmd("INFO")
         .arg("replication")
         .query_async(&mut conn)
@@ -188,7 +207,8 @@ async fn local_role_is_master(state: &AppState) -> bool {
 /// gossip varies the case or trailing-dot shape of the hostname it reports,
 /// which nothing about this cluster's health actually depends on.
 fn answer_confirms_self(answer_host: &str, private_domain: &str) -> bool {
-    crate::boot_role::normalize_host(answer_host) == crate::boot_role::normalize_host(private_domain)
+    crate::boot_role::normalize_host(answer_host)
+        == crate::boot_role::normalize_host(private_domain)
 }
 
 /// Check (2): Sentinel confirms this node is the current master.
@@ -242,6 +262,168 @@ async fn is_sentinel_confirmed_master(state: &AppState) -> bool {
     sentinel_confirms_master(state, &state.redis_master_name).await
 }
 
+/// Priority that makes this node win the next election: Sentinel picks the
+/// candidate with the LOWEST non-zero replica-priority.
+const PROMOTE_PRIORITY: &str = "1";
+/// Redis's own default, used only when the CONFIG GET reply is unreadable.
+const DEFAULT_REPLICA_PRIORITY: &str = "100";
+/// How long the post-FAILOVER settle watch polls before restoring the
+/// priority anyway — a Sentinel election normally settles in seconds; a
+/// minute of bias left behind is the failure mode being bounded here.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
+const SETTLE_POLL: Duration = Duration::from_secs(1);
+
+/// The value half of a `CONFIG GET replica-priority` reply
+/// (`["replica-priority", "<value>"]`), falling back to Redis's default when
+/// the reply has an unexpected shape — restoring SOMETHING sane beats leaving
+/// the election bias behind forever.
+fn priority_from_config_get(reply: &[String]) -> String {
+    reply
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_REPLICA_PRIORITY.to_string())
+}
+
+enum SwitchoverOutcome {
+    AlreadyPrimary,
+    /// Election triggered; carries the priority to restore once it settles.
+    Initiated {
+        previous_priority: String,
+    },
+}
+
+async fn restore_priority(state: &AppState, priority: &str) {
+    let Some(mut conn) = state.get_redis_conn().await else {
+        warn!("switchover: could not restore replica-priority — local redis unreachable");
+        return;
+    };
+    if let Err(e) = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("replica-priority")
+        .arg(priority)
+        .query_async::<()>(&mut conn)
+        .await
+    {
+        warn!(error = %e, priority, "switchover: failed to restore replica-priority");
+        *state.redis_conn.lock().await = None;
+    }
+}
+
+/// Bias this node's own replica-priority, then ask Sentinel to run a normal
+/// election. This never bypasses Sentinel's consensus — the FAILOVER path is
+/// identical to an organic failover, just with this node made the most
+/// attractive candidate first.
+async fn initiate_switchover(state: &AppState) -> anyhow::Result<SwitchoverOutcome> {
+    if is_sentinel_confirmed_master(state).await {
+        return Ok(SwitchoverOutcome::AlreadyPrimary);
+    }
+
+    let mut redis_conn = state
+        .get_redis_conn()
+        .await
+        .context("local redis unreachable")?;
+    // Remember whatever priority is configured so the settle watch restores
+    // the operator's value, not a hardcoded default.
+    let reply: Vec<String> = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("replica-priority")
+        .query_async(&mut redis_conn)
+        .await
+        .context("CONFIG GET replica-priority failed")?;
+    let previous_priority = priority_from_config_get(&reply);
+    redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("replica-priority")
+        .arg(PROMOTE_PRIORITY)
+        .query_async::<()>(&mut redis_conn)
+        .await
+        .context("CONFIG SET replica-priority failed")?;
+
+    let Some(mut sentinel_conn) = state.get_sentinel_conn().await else {
+        restore_priority(state, &previous_priority).await;
+        anyhow::bail!("local sentinel unreachable");
+    };
+    if let Err(e) = redis::cmd("SENTINEL")
+        .arg("FAILOVER")
+        .arg(&state.redis_master_name)
+        .query_async::<()>(&mut sentinel_conn)
+        .await
+    {
+        *state.sentinel_conn.lock().await = None;
+        restore_priority(state, &previous_priority).await;
+        anyhow::bail!("SENTINEL FAILOVER refused: {e}");
+    }
+    Ok(SwitchoverOutcome::Initiated { previous_priority })
+}
+
+/// Watches the election settle in the background, then restores the priority
+/// and releases the single-flight latch — success or timeout, so a failed
+/// election can't leave a permanent bias (or a wedged latch) behind.
+fn spawn_settle_watch(state: AppState, previous_priority: String) {
+    tokio::spawn(async move {
+        let deadline = Instant::now() + SETTLE_TIMEOUT;
+        let mut promoted = false;
+        while Instant::now() < deadline {
+            sleep(SETTLE_POLL).await;
+            if is_sentinel_confirmed_master(&state).await {
+                promoted = true;
+                break;
+            }
+        }
+        restore_priority(&state, &previous_priority).await;
+        state.switchover_in_flight.store(false, Ordering::SeqCst);
+        if promoted {
+            info!("switchover settled: this node is now master");
+        } else {
+            warn!(
+                timeout_secs = SETTLE_TIMEOUT.as_secs(),
+                "switchover did not settle in time — priority restored, election left to Sentinel"
+            );
+        }
+    });
+}
+
+async fn switchover(State(state): State<AppState>) -> impl IntoResponse {
+    if state.switchover_in_flight.swap(true, Ordering::SeqCst) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"status": "switchover-in-progress"})),
+        );
+    }
+    match timeout(Duration::from_secs(5), initiate_switchover(&state)).await {
+        Ok(Ok(SwitchoverOutcome::AlreadyPrimary)) => {
+            state.switchover_in_flight.store(false, Ordering::SeqCst);
+            (StatusCode::OK, Json(json!({"status": "already-primary"})))
+        }
+        Ok(Ok(SwitchoverOutcome::Initiated { previous_priority })) => {
+            // The latch is released by the settle watch, not here.
+            spawn_settle_watch(state.clone(), previous_priority);
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({"status": "failover-initiated"})),
+            )
+        }
+        Ok(Err(e)) => {
+            state.switchover_in_flight.store(false, Ordering::SeqCst);
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"status": "refused", "error": format!("{e:#}")})),
+            )
+        }
+        Err(_) => {
+            state.switchover_in_flight.store(false, Ordering::SeqCst);
+            *state.redis_conn.lock().await = None;
+            *state.sentinel_conn.lock().await = None;
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(
+                    json!({"status": "refused", "error": "timed out talking to local redis/sentinel"}),
+                ),
+            )
+        }
+    }
+}
+
 /// Bind and serve once. Returns `Err` on a bind failure or a serve error
 /// instead of `expect()`-ing — the caller (`spawn`) retries on `Err` rather
 /// than letting either kill the task permanently.
@@ -274,6 +456,7 @@ async fn run_health_server(
     let app = Router::new()
         .route("/health", get(health))
         .route("/role", get(role))
+        .route("/switchover", post(switchover))
         .with_state(state);
 
     // Bind the IPv6 unspecified address rather than 0.0.0.0: Railway's private
@@ -421,5 +604,27 @@ mod answer_confirms_self_tests {
             "redis-2.railway.internal",
             "redis-1.railway.internal"
         ));
+    }
+}
+
+#[cfg(test)]
+mod priority_from_config_get_tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_value_half_of_the_pair() {
+        let reply = vec!["replica-priority".to_string(), "42".to_string()];
+        assert_eq!(priority_from_config_get(&reply), "42");
+    }
+
+    #[test]
+    fn empty_reply_falls_back_to_redis_default() {
+        assert_eq!(priority_from_config_get(&[]), DEFAULT_REPLICA_PRIORITY);
+    }
+
+    #[test]
+    fn key_only_reply_falls_back_to_redis_default() {
+        let reply = vec!["replica-priority".to_string()];
+        assert_eq!(priority_from_config_get(&reply), DEFAULT_REPLICA_PRIORITY);
     }
 }
