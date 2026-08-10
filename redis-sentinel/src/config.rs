@@ -32,6 +32,20 @@ pub struct Config {
     pub data_dir: String,
     /// The hostname of this service's private domain (used to derive master host for sentinels).
     pub private_domain: String,
+    /// `maxmemory` in bytes: an explicit `MAXMEMORY_MB` override, or 75% of
+    /// the container's own cgroup memory limit when one can be detected.
+    /// `None` when neither is available — Redis then gets no ceiling at all,
+    /// the behavior every boot had before this field existed.
+    ///
+    /// Unset entirely, Redis grows without bound: with no eviction limit to
+    /// hit, the container's own cgroup eventually OOM-kills the process —
+    /// and BGSAVE/AOF-rewrite's fork() briefly doubles resident memory via
+    /// copy-on-write, so a `maxmemory` sized flush against the cgroup limit
+    /// (rather than comfortably under it) lets a routine save trigger the
+    /// same kill. 75%, not 100%, leaves room for exactly that spike plus
+    /// client/replication buffers, which don't count against `maxmemory`
+    /// either.
+    pub maxmemory_bytes: Option<u64>,
 }
 
 impl Config {
@@ -68,7 +82,52 @@ impl Config {
             health_port: u16::env_parse("HEALTH_PORT", 8080),
             data_dir: Self::resolve_data_dir(),
             private_domain: RailwayEnv::private_domain(),
+            maxmemory_bytes: Self::resolve_maxmemory_bytes(),
         })
+    }
+
+    /// An explicit `MAXMEMORY_MB` wins outright; otherwise 75% of whatever
+    /// cgroup memory limit can be detected. See the field doc on
+    /// `maxmemory_bytes` for why a limit is worth having at all.
+    fn resolve_maxmemory_bytes() -> Option<u64> {
+        if let Ok(raw) = env::var("MAXMEMORY_MB") {
+            if let Ok(mb) = raw.trim().parse::<u64>() {
+                return Some(mb.saturating_mul(1024 * 1024));
+            }
+        }
+        Self::detect_cgroup_memory_limit_bytes("/sys/fs/cgroup").map(|limit| limit * 3 / 4)
+    }
+
+    /// Reads this container's own cgroup memory limit, in bytes. Tries
+    /// cgroup v2 (`memory.max`, the modern default) first, falling back to
+    /// v1 (`memory/memory.limit_in_bytes`). The two report "no limit"
+    /// differently — v2 as the literal string `max`, v1 as an enormous
+    /// sentinel near `i64::MAX` rounded to a page boundary — so both are
+    /// normalized through the same ceiling: a "limit" at or above 1 TiB is
+    /// treated as unlimited, since no Railway plan grants anywhere near that
+    /// and a real value that large would make a 75% cap meaningless anyway.
+    /// A limit of exactly 0 is likewise treated as undetected rather than as
+    /// "set maxmemory to 0" (which to Redis means *no* limit, the opposite of
+    /// what a 0-byte cgroup reading would ever actually mean).
+    fn detect_cgroup_memory_limit_bytes(cgroup_root: &str) -> Option<u64> {
+        const UNLIMITED_CEILING_BYTES: u64 = 1024 * 1024 * 1024 * 1024; // 1 TiB
+
+        let v2_limit = std::fs::read_to_string(format!("{cgroup_root}/memory.max"))
+            .ok()
+            .filter(|s| s.trim() != "max")
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        let raw = match v2_limit {
+            Some(limit) => Some(limit),
+            None => std::fs::read_to_string(format!("{cgroup_root}/memory/memory.limit_in_bytes"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok()),
+        }?;
+
+        if raw == 0 || raw >= UNLIMITED_CEILING_BYTES {
+            None
+        } else {
+            Some(raw)
+        }
     }
 
     /// Where redis keeps its data.
@@ -210,6 +269,7 @@ impl Config {
             health_port: 8080,
             data_dir: "/data".to_string(),
             private_domain: "redis-1.railway.internal".to_string(),
+            maxmemory_bytes: None,
         }
     }
 }
@@ -242,6 +302,7 @@ mod tests {
             "SENTINEL_HOSTS",
             "REPLICA_OF",
             "REDIS_PORT",
+            "MAXMEMORY_MB",
         ] {
             env::remove_var(key);
         }
@@ -519,6 +580,128 @@ mod tests {
         assert_eq!(
             Config::resolve_nested_dataset(&with_slash),
             mount.join("redis/data").to_str().unwrap()
+        );
+    }
+
+    // --- resolve_maxmemory_bytes: MAXMEMORY_MB override ---
+
+    #[test]
+    fn maxmemory_mb_override_wins_and_converts_to_bytes() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("MAXMEMORY_MB", "512");
+        assert_eq!(
+            Config::resolve_maxmemory_bytes(),
+            Some(512 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn maxmemory_mb_ignores_a_junk_value_and_falls_through_to_detection() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("MAXMEMORY_MB", "not-a-number");
+        // Falls through to cgroup detection, which finds nothing on a test
+        // host with no /sys/fs/cgroup/memory.max at this literal path — so
+        // this only asserts it doesn't panic or return the junk value as 0.
+        assert_ne!(Config::resolve_maxmemory_bytes(), Some(0));
+    }
+
+    // --- detect_cgroup_memory_limit_bytes: every branch, via a fake cgroup root ---
+
+    fn fake_cgroup_root(label: &str) -> PathBuf {
+        let n = NEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "redis-ha-cgroup-{}-{}-{}",
+            std::process::id(),
+            label,
+            n
+        ));
+        fs::create_dir_all(&dir).expect("create fake cgroup root");
+        dir
+    }
+
+    #[test]
+    fn reads_a_real_v2_limit() {
+        let root = fake_cgroup_root("v2-real");
+        fs::write(root.join("memory.max"), "2147483648\n").unwrap(); // 2 GiB
+        assert_eq!(
+            Config::detect_cgroup_memory_limit_bytes(root.to_str().unwrap()),
+            Some(2147483648)
+        );
+    }
+
+    #[test]
+    fn v2_max_falls_through_to_v1() {
+        let root = fake_cgroup_root("v2-max-v1-real");
+        fs::write(root.join("memory.max"), "max\n").unwrap();
+        fs::create_dir_all(root.join("memory")).unwrap();
+        fs::write(root.join("memory/memory.limit_in_bytes"), "1073741824\n").unwrap(); // 1 GiB
+        assert_eq!(
+            Config::detect_cgroup_memory_limit_bytes(root.to_str().unwrap()),
+            Some(1073741824)
+        );
+    }
+
+    #[test]
+    fn missing_v2_file_falls_through_to_v1() {
+        let root = fake_cgroup_root("no-v2");
+        fs::create_dir_all(root.join("memory")).unwrap();
+        fs::write(root.join("memory/memory.limit_in_bytes"), "536870912\n").unwrap(); // 512 MiB
+        assert_eq!(
+            Config::detect_cgroup_memory_limit_bytes(root.to_str().unwrap()),
+            Some(536870912)
+        );
+    }
+
+    #[test]
+    fn v1_unlimited_sentinel_is_treated_as_undetected() {
+        let root = fake_cgroup_root("v1-unlimited");
+        fs::write(root.join("memory.max"), "max\n").unwrap();
+        fs::create_dir_all(root.join("memory")).unwrap();
+        // The real cgroup v1 "no limit" sentinel: i64::MAX rounded down to a
+        // 4096-byte page boundary.
+        fs::write(
+            root.join("memory/memory.limit_in_bytes"),
+            "9223372036854771712",
+        )
+        .unwrap();
+        assert_eq!(
+            Config::detect_cgroup_memory_limit_bytes(root.to_str().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_limit_at_the_unlimited_ceiling_is_treated_as_undetected() {
+        let root = fake_cgroup_root("v2-ceiling");
+        fs::write(
+            root.join("memory.max"),
+            (1024u64 * 1024 * 1024 * 1024).to_string(), // exactly 1 TiB
+        )
+        .unwrap();
+        assert_eq!(
+            Config::detect_cgroup_memory_limit_bytes(root.to_str().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_zero_limit_is_treated_as_undetected_not_as_zero_maxmemory() {
+        let root = fake_cgroup_root("v2-zero");
+        fs::write(root.join("memory.max"), "0").unwrap();
+        assert_eq!(
+            Config::detect_cgroup_memory_limit_bytes(root.to_str().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn neither_file_present_is_undetected() {
+        let root = fake_cgroup_root("neither");
+        assert_eq!(
+            Config::detect_cgroup_memory_limit_bytes(root.to_str().unwrap()),
+            None
         );
     }
 }
