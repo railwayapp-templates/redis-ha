@@ -371,7 +371,7 @@ pub async fn demote_before_shutdown(target: &DemoteTarget, sentinel_colocated: b
     // link_heal's and quorum's local Sentinel connections) — a shutdown on
     // an authed node would otherwise get NOAUTH exactly when it is asking
     // for the failover this module exists to trigger.
-    let sentinel_url = crate::sentinel_query::sentinel_url(
+    let sentinel_url = crate::sentinel_query::build_redis_url(
         "127.0.0.1",
         target.sentinel_port,
         &target.local_sentinel_password,

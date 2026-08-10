@@ -1,5 +1,6 @@
 use crate::boot_role::BootMaster;
 use crate::config::Config;
+use crate::redis_conf::quote_conf_value;
 
 /// Whether a sentinel.conf on disk actually enforces client auth right now,
 /// via a non-empty `requirepass`.
@@ -119,8 +120,11 @@ pub fn generate_sentinel_conf(
     // password-only auth (this configuration, no ACL) always authenticates
     // outbound as `default`, which needs no user directive at all.
     if !sentinel_password.is_empty() {
-        lines.push(format!("requirepass {}", sentinel_password));
-        lines.push(format!("sentinel sentinel-pass {}", sentinel_password));
+        lines.push(format!("requirepass {}", quote_conf_value(sentinel_password)));
+        lines.push(format!(
+            "sentinel sentinel-pass {}",
+            quote_conf_value(sentinel_password)
+        ));
     }
 
     lines.extend([
@@ -144,7 +148,8 @@ pub fn generate_sentinel_conf(
         ),
         format!(
             "sentinel auth-pass {} {}",
-            config.redis_master_name, config.redis_password
+            config.redis_master_name,
+            quote_conf_value(&config.redis_password)
         ),
         format!(
             "sentinel down-after-milliseconds {} {}",
@@ -226,10 +231,10 @@ mod tests {
     fn an_authed_boot_adds_requirepass_and_sentinel_pass_but_never_sentinel_user() {
         let config = Config::for_tests();
         let conf = generate_sentinel_conf(&config, &BootMaster::SelfIsMaster, "s3cr3t");
-        assert!(conf.lines().any(|l| l == "requirepass s3cr3t"));
+        assert!(conf.lines().any(|l| l == r#"requirepass "s3cr3t""#));
         assert!(conf
             .lines()
-            .any(|l| l == "sentinel sentinel-pass s3cr3t"));
+            .any(|l| l == r#"sentinel sentinel-pass "s3cr3t""#));
         // Password-only auth with the default user needs no user directive
         // (verified against the Redis Sentinel docs — see the doc comment
         // on generate_sentinel_conf).
@@ -247,11 +252,41 @@ mod tests {
         let conf =
             generate_sentinel_conf(&config, &BootMaster::SelfIsMaster, &config.redis_password);
         assert_eq!(conf.matches("hunter2").count(), 3);
-        assert!(conf.lines().any(|l| l == "requirepass hunter2"));
-        assert!(conf.lines().any(|l| l == "sentinel sentinel-pass hunter2"));
+        assert!(conf.lines().any(|l| l == r#"requirepass "hunter2""#));
         assert!(conf
             .lines()
-            .any(|l| l == "sentinel auth-pass mymaster hunter2"));
+            .any(|l| l == r#"sentinel sentinel-pass "hunter2""#));
+        assert!(conf
+            .lines()
+            .any(|l| l == r#"sentinel auth-pass mymaster "hunter2""#));
+    }
+
+    #[test]
+    fn a_password_with_a_hash_and_a_space_is_quoted_intact_on_every_directive() {
+        // Unquoted, "#" starts a comment and a space splits the token — a
+        // password shaped like this would either truncate the value or spill
+        // into whatever directive comes next on the line. Conversion adopts
+        // whatever REDIS_PASSWORD the standalone service already had, so this
+        // is a real customer-controlled input, not a contrived one.
+        let mut config = Config::for_tests();
+        config.redis_password = "p# w\"ord".to_string();
+        let conf =
+            generate_sentinel_conf(&config, &BootMaster::SelfIsMaster, &config.redis_password);
+        assert!(conf
+            .lines()
+            .any(|l| l == r#"requirepass "p# w\"ord""#));
+        assert!(conf
+            .lines()
+            .any(|l| l == r#"sentinel sentinel-pass "p# w\"ord""#));
+        assert!(conf
+            .lines()
+            .any(|l| l == r#"sentinel auth-pass mymaster "p# w\"ord""#));
+        // No line was split or swallowed into a comment: still exactly as
+        // many directives as an unremarkable password would produce.
+        assert!(conf.lines().any(|l| l.starts_with("sentinel monitor")));
+        assert!(conf
+            .lines()
+            .any(|l| l.starts_with("sentinel down-after-milliseconds")));
     }
 
     // --- conf_requires_auth ---

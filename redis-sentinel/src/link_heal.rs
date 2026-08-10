@@ -584,9 +584,13 @@ pub fn spawn(
         "link-heal: starting watcher"
     );
 
-    let redis_url = format!("redis://:{redis_password}@127.0.0.1:{redis_port}");
-    let sentinel_url =
-        crate::sentinel_query::sentinel_url("127.0.0.1", sentinel_port, &local_sentinel_password);
+    let redis_url =
+        crate::sentinel_query::build_redis_url("127.0.0.1", redis_port, &redis_password);
+    let sentinel_url = crate::sentinel_query::build_redis_url(
+        "127.0.0.1",
+        sentinel_port,
+        &local_sentinel_password,
+    );
     let state_path = format!("{data_dir}/{STATE_FILENAME}");
 
     tokio::spawn(async move {
