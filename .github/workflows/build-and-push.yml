@@ -86,19 +86,39 @@ jobs:
       - name: Discover Redis minor tags on Docker Hub
         id: discover
         run: |
-          page="https://hub.docker.com/v2/repositories/library/redis/tags?page_size=100"
+          # Use the Docker Registry v2 API (registry-1.docker.io, anonymous
+          # pull token) rather than the Hub website API (hub.docker.com):
+          # the website API hard-blocks shared GitHub runner IPs with
+          # persistent 403s, while the registry endpoint is the same path
+          # every `docker pull` takes and is expected to serve CI runners.
+          # --retry-all-errors: plain --retry does not retry 403/429.
+          token=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/redis:pull" \
+            | jq -r .token)
+          if [ -z "$token" ] || [ "$token" = "null" ]; then
+            echo "could not obtain an anonymous pull token" >&2
+            exit 1
+          fi
+
+          url="https://registry-1.docker.io/v2/library/redis/tags/list?n=1000"
           : > /tmp/hub-tags.txt
           pages=0
-          while [ -n "$page" ] && [ "$page" != "null" ]; do
+          while [ -n "$url" ]; do
             if [ "$pages" -ge 50 ]; then
-              echo "more than 50 pages of Docker Hub tags; refusing to loop forever" >&2
+              echo "more than 50 pages of registry tags; refusing to loop forever" >&2
               exit 1
             fi
-            # --retry-all-errors: Docker Hub rate-limits shared runner IPs
-            # with transient 403/429s, which plain --retry does not retry.
-            resp=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "$page")
-            echo "$resp" | jq -r '.results[].name' >> /tmp/hub-tags.txt
-            page=$(echo "$resp" | jq -r '.next')
+            resp=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+              -H "Authorization: Bearer $token" -D /tmp/tag-headers.txt "$url")
+            echo "$resp" | jq -r '.tags[]' >> /tmp/hub-tags.txt
+            # RFC-5988 pagination: a Link rel="next" header carries the
+            # relative URL of the next page; no header means last page.
+            next=$(sed -nE 's/^[Ll]ink: *<([^>]+)>; *rel="next".*/\1/p' /tmp/tag-headers.txt | tr -d '\r')
+            if [ -n "$next" ]; then
+              url="https://registry-1.docker.io${next}"
+            else
+              url=""
+            fi
             pages=$((pages + 1))
           done
 
