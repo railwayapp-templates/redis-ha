@@ -71,8 +71,12 @@ Every `major.minor` tag is a real, continuously rebuilt build line (weekly + on
 every wrapper change), not a frozen alias: RDB streams are not
 backward-readable across minors, so the platform's HA conversion pins a
 converted service to its own minor, and that pin must keep receiving upstream
-patch, base-image and wrapper updates for its whole life. Extend the CI matrix
-in `.github/workflows/build-and-push.yml` when upstream publishes a new minor.
+patch, base-image and wrapper updates for its whole life. The minors are
+discovered from Docker Hub at build time (every `redis:<major.minor>-bookworm`
+of the supported majors), so a new upstream minor joins the build set on the
+next run with no code change — the only policy knob is
+`REDIS_SUPPORTED_MAJORS` in `.github/workflows/build-and-push.yml`, which
+mirrors the template's `haConversionConfig.supportedImageMajorVersions`.
 
 ### `redis-sentinel` (`redis-wrapper`)
 

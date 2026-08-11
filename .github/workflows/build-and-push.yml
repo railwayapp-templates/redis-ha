@@ -24,6 +24,13 @@ env:
   HAPROXY_VERSION: "3.2"
   # No suffix - publish to regular tags
   BETA_SUFFIX: ''
+  # The ONE policy knob in the version story, mirroring the template's
+  # haConversionConfig.supportedImageMajorVersions: a new major means
+  # validating the wrapper against it, so it is an explicit decision. The
+  # MINORS within these majors are mechanical (the wrapper is minor-agnostic
+  # — it always ran whatever the floating major bundled) and are discovered
+  # from Docker Hub at run time, never hardcoded.
+  REDIS_SUPPORTED_MAJORS: '7 8'
 
 jobs:
   # Detect which components changed to avoid unnecessary builds
@@ -134,6 +141,100 @@ jobs:
           cache-from: type=gha,scope=haproxy-rust-binaries
           cache-to: type=gha,mode=max,scope=haproxy-rust-binaries
 
+  # Enumerates every minor of the supported majors that upstream publishes a
+  # `redis:<major.minor>-bookworm` base for, straight from Docker Hub — a new
+  # upstream minor joins the build set on the next run with no code change.
+  # A hardcoded list here would be the mint-minor-alias failure mode again: a
+  # manual inventory someone forgets to extend, where the forgetting is
+  # silent and the cost lands on whichever customer converts first.
+  #
+  # Guards, because a too-small matrix silently freezes build lines:
+  # - a supported major discovering zero minors fails the run (API shape
+  #   change or Hub outage must be loud, never an empty matrix);
+  # - the discovered set must cover every `major.minor` tag this repo has
+  #   already published (upstream never deletes version tags, so a shrink
+  #   means the discovery broke, not the world changed).
+  discover-redis-minors:
+    needs: changes
+    if: ${{ needs.changes.outputs['redis-sentinel'] == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    outputs:
+      matrix: ${{ steps.minors.outputs.matrix }}
+    steps:
+      - name: Discover maintained Redis minors from Docker Hub
+        id: minors
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGE_VERSIONS_URL: https://api.github.com/orgs/${{ github.repository_owner }}/packages/container/redis-ha%2Fredis-sentinel/versions?per_page=100
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re, sys, urllib.request
+
+          majors = os.environ["REDIS_SUPPORTED_MAJORS"].split()
+
+          url = "https://hub.docker.com/v2/repositories/library/redis/tags?page_size=100&name=bookworm"
+          minors: set[tuple[int, int]] = set()
+          while url:
+              with urllib.request.urlopen(url, timeout=30) as r:
+                  page = json.load(r)
+              for entry in page.get("results", []):
+                  m = re.fullmatch(r"(\d+)\.(\d+)-bookworm", entry["name"])
+                  if m and m.group(1) in majors:
+                      minors.add((int(m.group(1)), int(m.group(2))))
+              url = page.get("next")
+
+          for major in majors:
+              if not any(str(mj) == major for mj, _ in minors):
+                  raise SystemExit(
+                      f"discovered no {major}.x-bookworm tags on Docker Hub — "
+                      "refusing to build an empty line for a supported major"
+                  )
+
+          # Never shrink below what this repo already publishes: a pinned
+          # cluster's build line going missing from the matrix is exactly the
+          # silent freeze this discovery exists to prevent. Best-effort read —
+          # an unreachable packages API proves nothing and must not block the
+          # rebuild of everything Docker Hub did enumerate.
+          try:
+              req = urllib.request.Request(
+                  os.environ["PACKAGE_VERSIONS_URL"],
+                  headers={
+                      "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                      "Accept": "application/vnd.github.v3+json",
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  versions = json.load(r)
+              published = {
+                  (int(m.group(1)), int(m.group(2)))
+                  for v in versions
+                  for tag in (v.get("metadata", {}).get("container", {}).get("tags", []))
+                  if (m := re.fullmatch(r"(\d+)\.(\d+)", tag)) and m.group(1) in majors
+              }
+              missing = published - minors
+              if missing:
+                  raise SystemExit(
+                      f"already-published minors missing from discovery: {sorted(missing)} — "
+                      "the discovery is broken; refusing to freeze their build lines"
+                  )
+          except SystemExit:
+              raise
+          except Exception as err:  # noqa: BLE001 — unknown is not a violation
+              print(f"::warning::could not cross-check published tags: {err}")
+
+          newest = {mj: max(mn for m2, mn in minors if m2 == mj) for mj, _ in minors}
+          include = [
+              {"redis_version": f"{mj}.{mn}"}
+              | ({"floating_major": str(mj)} if newest[mj] == mn else {})
+              for mj, mn in sorted(minors)
+          ]
+          # stdout is $GITHUB_OUTPUT — only the key=value line may go there.
+          print(f"discovered: {json.dumps(include)}", file=sys.stderr)
+          print("matrix=" + json.dumps({"include": include}))
+          PY
+
   # Build redis-sentinel for AMD64 — one continuously rebuilt image per Redis
   # MINOR, not per major. RDB streams are not backward-readable across minors
   # (7.0=RDB10, 7.2=11, 7.4=12), so the platform's HA conversion pins a
@@ -144,14 +245,14 @@ jobs:
   # cluster pinned to a non-current minor without security updates of any
   # kind — see the deleted mint-minor-alias.yml for the old semantics.
   #
-  # The floating :<major> tag rides the newest minor of its major (the
-  # `floating_major` matrix entries). Extend the matrix when upstream
-  # publishes a new minor — the mono-side conversion pre-flight refuses (with
-  # a clear error, before touching anything) sources whose minor has no
-  # published build, so the only cost of lagging is conversions of that
-  # brand-new minor being blocked until the entry lands.
+  # The matrix comes from discover-redis-minors above; the floating :<major>
+  # tag rides the newest discovered minor of its major. A brand-new upstream
+  # minor is buildable at latest one weekly run after Docker Hub publishes it
+  # (or immediately via workflow_dispatch) — until then the mono-side
+  # conversion pre-flight refuses sources on it with a clear error, before
+  # touching anything.
   build-redis-sentinel-amd64:
-    needs: [changes, build-rust-binaries-redis-sentinel-amd64]
+    needs: [changes, build-rust-binaries-redis-sentinel-amd64, discover-redis-minors]
     if: ${{ needs.changes.outputs['redis-sentinel'] == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     permissions:
@@ -159,16 +260,7 @@ jobs:
       packages: write
 
     strategy:
-      matrix:
-        include:
-          - redis_version: "7.0"
-          - redis_version: "7.2"
-          - redis_version: "7.4"
-            floating_major: "7"
-          - redis_version: "8.0"
-          - redis_version: "8.2"
-          - redis_version: "8.4"
-            floating_major: "8"
+      matrix: ${{ fromJson(needs.discover-redis-minors.outputs.matrix) }}
 
     steps:
       - name: Checkout repository
