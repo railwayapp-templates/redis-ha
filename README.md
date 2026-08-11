@@ -61,18 +61,19 @@ Scale from 2–5 replicas via the cluster overview. Sentinel uses gossip to disc
 
 | Image | GHCR tag | Base |
 |---|---|---|
-| `redis-sentinel` | `ghcr.io/railwayapp-templates/redis-ha/redis-sentinel:<major.minor>` (7.0, 7.2, 7.4, 8.0, 8.2, 8.4) | `redis:<major.minor>-bookworm` |
-| `redis-sentinel` | `ghcr.io/railwayapp-templates/redis-ha/redis-sentinel:7` / `:8` (floating — newest minor of the major) | `redis:7.4-bookworm` / `redis:8.4-bookworm` |
+| `redis-sentinel` | `ghcr.io/railwayapp-templates/redis-ha/redis-sentinel:<major.minor>` (every `X.Y` minor Docker Hub publishes a `X.Y-bookworm` tag for, majors 7 and 8) | `redis:<major.minor>-bookworm` |
+| `redis-sentinel` | `ghcr.io/railwayapp-templates/redis-ha/redis-sentinel:7` / `:8` (floating — newest minor of the major) | `redis:<newest minor>-bookworm` |
 | `haproxy` | `ghcr.io/railwayapp-templates/redis-ha/haproxy:3.2-alpine` | `haproxy:3.2-alpine` |
 
 Both images are thin wrappers on official upstream images. The Rust entrypoints handle config rendering, process management, and health serving.
 
-Every `major.minor` tag is a real, continuously rebuilt build line (weekly + on
+Every `major.minor` tag is a real, continuously rebuilt build line (daily + on
 every wrapper change), not a frozen alias: RDB streams are not
 backward-readable across minors, so the platform's HA conversion pins a
 converted service to its own minor, and that pin must keep receiving upstream
-patch, base-image and wrapper updates for its whole life. Extend the CI matrix
-in `.github/workflows/build-and-push.yml` when upstream publishes a new minor.
+patch, base-image and wrapper updates for its whole life. The minor list is
+discovered from Docker Hub on every run; `REDIS_SUPPORTED_MAJORS` in
+`.github/workflows/build-and-push.yml` is the only policy knob.
 
 ### `redis-sentinel` (`redis-wrapper`)
 
