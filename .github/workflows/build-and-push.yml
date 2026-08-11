@@ -26,6 +26,11 @@ env:
   REGISTRY: ghcr.io
   IMAGE_PREFIX: ghcr.io/${{ github.repository }}
   HAPROXY_VERSION: "3.2"
+  # The single policy knob for which Redis majors get per-minor builds —
+  # mirrors the template's supportedImageMajorVersions. The `X.Y` minors
+  # within each major are discovered from Docker Hub on every run, never
+  # hardcoded here.
+  REDIS_SUPPORTED_MAJORS: "7 8"
   # No suffix - publish to regular tags
   BETA_SUFFIX: ''
 
@@ -54,6 +59,114 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.github/workflows/build-and-push.yml'
+
+  # Enumerate every `X.Y` minor Docker Hub publishes a `redis:X.Y-bookworm`
+  # tag for (the exact tag the wrapper builds FROM) within the supported
+  # majors. The list is discovered per run instead of hardcoded so a new
+  # upstream minor starts building the day Docker Hub carries it — the
+  # platform's HA conversion pins the adopted service's own `major.minor`
+  # minor, so a minor with no published image is a minor whose users cannot
+  # convert. Old minors stay in the set for the same reason: building a
+  # minor a user already runs is strictly better than stranding their
+  # conversion.
+  #
+  # The job also marks the newest minor of each major so the floating
+  # :<major> tags keep riding it, exactly as the hardcoded matrix's
+  # `floating_major` entries did.
+  discover-redis-minors:
+    needs: changes
+    if: ${{ needs.changes.outputs['redis-sentinel'] == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    outputs:
+      matrix: ${{ steps.discover.outputs.matrix }}
+
+    steps:
+      - name: Discover Redis minor tags on Docker Hub
+        id: discover
+        run: |
+          page="https://hub.docker.com/v2/repositories/library/redis/tags?page_size=100"
+          : > /tmp/hub-tags.txt
+          pages=0
+          while [ -n "$page" ] && [ "$page" != "null" ]; do
+            if [ "$pages" -ge 50 ]; then
+              echo "more than 50 pages of Docker Hub tags; refusing to loop forever" >&2
+              exit 1
+            fi
+            # --retry-all-errors: Docker Hub rate-limits shared runner IPs
+            # with transient 403/429s, which plain --retry does not retry.
+            resp=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "$page")
+            echo "$resp" | jq -r '.results[].name' >> /tmp/hub-tags.txt
+            page=$(echo "$resp" | jq -r '.next')
+            pages=$((pages + 1))
+          done
+
+          # Emit a matrix-include array: every minor gets a plain entry, the
+          # newest minor of each major additionally carries floating_major so
+          # the :<major> tag minting below keeps working unchanged. Values
+          # come from a digits-and-dots regex, so hand-building the JSON is
+          # safe.
+          : > /tmp/minors.txt
+          matrix="["
+          sep=""
+          for major in $REDIS_SUPPORTED_MAJORS; do
+            found=$(grep -E "^${major}\.[0-9]+-bookworm$" /tmp/hub-tags.txt | sed 's/-bookworm$//' | sort -uV)
+            if [ -z "$found" ]; then
+              # Anti-shrink: an empty result for a supported major means the
+              # discovery is broken (API change, filter regression), not that
+              # the major vanished upstream — fail loudly rather than
+              # silently stop building its minors.
+              echo "no X.Y-bookworm minors discovered for supported major ${major}" >&2
+              exit 1
+            fi
+            echo "$found" >> /tmp/minors.txt
+            newest=$(echo "$found" | tail -n 1)
+            for minor in $found; do
+              if [ "$minor" = "$newest" ]; then
+                entry="{\"redis_version\":\"${minor}\",\"floating_major\":\"${major}\"}"
+              else
+                entry="{\"redis_version\":\"${minor}\"}"
+              fi
+              matrix="${matrix}${sep}${entry}"
+              sep=","
+            done
+          done
+          matrix="${matrix}]"
+
+          echo "discovered minors:"
+          cat /tmp/minors.txt
+          echo "matrix: $matrix"
+
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+      # A published :X.Y tag is a build line users are pinned to. If the
+      # discovered set ever fails to cover one (Docker Hub API glitch, filter
+      # regression), that minor would silently stop receiving builds — fail
+      # the run instead. Best-effort on the listing side only: a ghcr API
+      # hiccup warns and proceeds so it cannot block image builds. Published
+      # minors outside REDIS_SUPPORTED_MAJORS are exempt, so retiring a major
+      # stays a one-knob policy change.
+      - name: Refuse to shrink the published minor set (best-effort)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          endpoint="/orgs/${{ github.repository_owner }}/packages/container/redis-ha%2Fredis-sentinel/versions?per_page=100"
+          if published=$(gh api --paginate "$endpoint" --jq '.[].metadata.container.tags[]' 2>/dev/null); then
+            majors_re=$(echo "$REDIS_SUPPORTED_MAJORS" | tr ' ' '|')
+            published_minors=$(echo "$published" | grep -E "^(${majors_re})\.[0-9]+$" | sort -uV || true)
+            missing=""
+            for tag in $published_minors; do
+              grep -qx "$tag" /tmp/minors.txt || missing="$missing $tag"
+            done
+            if [ -n "$missing" ]; then
+              echo "discovered set does not cover already-published minors:$missing" >&2
+              exit 1
+            fi
+            echo "coverage ok: all published minors are in the discovered set"
+          else
+            echo "warning: could not list published ghcr tags; skipping coverage guard"
+          fi
 
   # Build Rust binary for redis-sentinel (AMD64 - bookworm, native, fast ~2-3min)
   # The binary is version-agnostic — one build covers all Redis major versions.
@@ -148,14 +261,16 @@ jobs:
   # cluster pinned to a non-current minor without security updates of any
   # kind — see the deleted mint-minor-alias.yml for the old semantics.
   #
+  # The minor list comes from discover-redis-minors, never from a hand-kept
+  # matrix: REDIS_SUPPORTED_MAJORS (env, above) is the single policy knob.
   # The floating :<major> tag rides the newest minor of its major (the
-  # `floating_major` matrix entries). Extend the matrix when upstream
-  # publishes a new minor — the mono-side conversion pre-flight refuses (with
-  # a clear error, before touching anything) sources whose minor has no
-  # published build, so the only cost of lagging is conversions of that
-  # brand-new minor being blocked until the entry lands.
+  # `floating_major` entries the discover job marks). The mono-side
+  # conversion pre-flight refuses (with a clear error, before touching
+  # anything) sources whose minor has no published build, so the only cost
+  # of a brand-new upstream minor is conversions of it being blocked until
+  # the next daily run has discovered, built, and published it.
   build-redis-sentinel-amd64:
-    needs: [changes, build-rust-binaries-redis-sentinel-amd64]
+    needs: [changes, build-rust-binaries-redis-sentinel-amd64, discover-redis-minors]
     if: ${{ needs.changes.outputs['redis-sentinel'] == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     permissions:
@@ -163,16 +278,11 @@ jobs:
       packages: write
 
     strategy:
+      # Each minor is an independent build line — one broken minor must not
+      # cancel the others' builds.
+      fail-fast: false
       matrix:
-        include:
-          - redis_version: "7.0"
-          - redis_version: "7.2"
-          - redis_version: "7.4"
-            floating_major: "7"
-          - redis_version: "8.0"
-          - redis_version: "8.2"
-          - redis_version: "8.4"
-            floating_major: "8"
+        include: ${{ fromJson(needs.discover-redis-minors.outputs.matrix) }}
 
     steps:
       - name: Checkout repository
