@@ -100,6 +100,49 @@ pub fn min_replicas_to_write(sentinel_quorum: u32) -> u32 {
     sentinel_quorum.saturating_sub(1).max(1)
 }
 
+/// The `requirepass` a previous boot's generated redis.conf carries,
+/// unquoted. None on a fresh volume (no conf yet), when the line is absent,
+/// or when the value is empty. Only the wrapper's own generated conf — or
+/// Redis's `CONFIG REWRITE` of it, which writes the same escaping — is ever
+/// parsed here, so the quoting dialect is exactly `quote_conf_value`'s.
+pub fn persisted_requirepass(data_dir: &str) -> Option<String> {
+    let conf = std::fs::read_to_string(format!("{}/redis.conf", data_dir)).ok()?;
+    parse_requirepass(&conf).filter(|p| !p.is_empty())
+}
+
+fn parse_requirepass(conf: &str) -> Option<String> {
+    for line in conf.lines() {
+        let mut fields = line.trim().splitn(2, char::is_whitespace);
+        if !matches!(fields.next(), Some(kw) if kw.eq_ignore_ascii_case("requirepass")) {
+            continue;
+        }
+        let Some(value) = fields.next() else { continue };
+        return Some(unquote_conf_value(value.trim()));
+    }
+    None
+}
+
+/// Inverse of [`quote_conf_value`]: strips the surrounding quotes and the
+/// `\\`/`\"` escapes. An unquoted value (a hand-edited conf) passes through
+/// as-is.
+fn unquote_conf_value(value: &str) -> String {
+    let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) else {
+        return value.to_string();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(escaped) = chars.next() {
+                out.push(escaped);
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Renders `value` as a double-quoted config-file token, safe for any byte
 /// value a password could actually contain — space, `#`, a bare `'` or `"`,
 /// all of which corrupt or truncate an unquoted `requirepass`/`masterauth`
@@ -708,5 +751,54 @@ mod tests {
         // intact line — nothing got swallowed into a comment or merged.
         assert!(conf.lines().any(|l| l == "protected-mode yes"));
         assert!(conf.lines().any(|l| l.starts_with("dir ")));
+    }
+
+    #[test]
+    fn persisted_requirepass_round_trips_a_generated_conf() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        let mut config = config_at(data_dir);
+        config.redis_password = "p# w\"or\\d".to_string();
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        std::fs::write(format!("{}/redis.conf", data_dir), conf).unwrap();
+        assert_eq!(
+            persisted_requirepass(data_dir),
+            Some("p# w\"or\\d".to_string())
+        );
+    }
+
+    #[test]
+    fn persisted_requirepass_is_none_on_a_fresh_volume() {
+        let dir = tempdir().unwrap();
+        assert_eq!(persisted_requirepass(dir.path().to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn persisted_requirepass_is_none_when_the_line_is_absent_or_empty() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        std::fs::write(format!("{}/redis.conf", data_dir), "port 6379\n").unwrap();
+        assert_eq!(persisted_requirepass(data_dir), None);
+        std::fs::write(
+            format!("{}/redis.conf", data_dir),
+            "port 6379\nrequirepass \"\"\n",
+        )
+        .unwrap();
+        assert_eq!(persisted_requirepass(data_dir), None);
+        // A bare keyword with no value must not abort the scan or panic.
+        std::fs::write(format!("{}/redis.conf", data_dir), "requirepass\n").unwrap();
+        assert_eq!(persisted_requirepass(data_dir), None);
+    }
+
+    #[test]
+    fn persisted_requirepass_accepts_an_unquoted_hand_edited_value() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        std::fs::write(
+            format!("{}/redis.conf", data_dir),
+            "REQUIREPASS hunter2\n",
+        )
+        .unwrap();
+        assert_eq!(persisted_requirepass(data_dir), Some("hunter2".to_string()));
     }
 }

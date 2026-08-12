@@ -23,7 +23,8 @@ use redis_sentinel::{
     process_manager::{enable_aof_after_rdb_load, spawn_redis, spawn_sentinel, supervise},
     quorum,
     redis_conf::{
-        generate_redis_conf, needs_rdb_to_aof_migration, quarantine_manifestless_aof_dir,
+        generate_redis_conf, needs_rdb_to_aof_migration, persisted_requirepass,
+        quarantine_manifestless_aof_dir,
     },
     sentinel_auth,
     sentinel_conf::{conf_requires_auth, generate_sentinel_conf},
@@ -37,8 +38,45 @@ use tracing::info;
 async fn main() -> Result<()> {
     let _guard = init_logging("redis-wrapper");
 
-    let config = Config::from_env().context("invalid configuration")?;
+    let mut config = Config::from_env().context("invalid configuration")?;
     let telemetry = Telemetry::from_env("redis-ha");
+
+    // The password this node actually runs with is the one already persisted
+    // on the volume, not whatever REDIS_PASSWORD holds right now. The
+    // platform's contract for database services is that editing a credential
+    // variable does NOT rotate the live credential (the dashboard's variable
+    // editor warns exactly that), and half-applying an edit here is worse
+    // than not applying it: sentinel.conf is written once at first boot and
+    // owned by Sentinel afterwards, so a regenerated redis.conf carrying a
+    // new password strands every Sentinel (outbound auth-pass) and every
+    // wrapper watcher (health server, link-heal, quorum-sync) on the old one
+    // — a full write outage through /role going 503 on every node, with
+    // Redis itself perfectly healthy. Pinning to the persisted requirepass
+    // keeps the whole node coherent, and a future orchestrated rotation that
+    // goes through `CONFIG SET requirepass` + `CONFIG REWRITE` updates the
+    // persisted conf and is honored here on the next boot.
+    //
+    // A fresh volume (scale-up, conversion) has no conf and takes the
+    // variable as-is — so after an unapplied variable edit, a NEW node joins
+    // with the new value and cannot authenticate against its peers. The
+    // warning below is the durable signal that the variable has drifted from
+    // the active password.
+    if let Some(active_password) = persisted_requirepass(&config.data_dir) {
+        if active_password != config.redis_password {
+            tracing::warn!(
+                "REDIS_PASSWORD differs from the password this node's dataset already runs \
+                 with — keeping the active password; variable edits do not rotate the \
+                 database password"
+            );
+            telemetry.send(TelemetryEvent::ComponentError {
+                component: "redis-wrapper".to_string(),
+                error: "REDIS_PASSWORD variable drifted from the active password; kept the active one"
+                    .to_string(),
+                context: "startup".to_string(),
+            });
+            config.redis_password = active_password;
+        }
+    }
 
     info!(
         is_primary = config.is_primary(),
