@@ -420,7 +420,7 @@ t_fresh_boot() {
     || { ko "$t" "lone master must refuse writes (min-replicas-to-write fence)" "$n"; return; }
   [ "$(rcli "$n" CONFIG GET appendonly | tail -1)" = "yes" ] \
     || { ko "$t" "appendonly should be yes on a fresh volume" "$n"; return; }
-  docker logs "$n" 2>&1 | grep -q "adopted dataset" \
+  docker logs "$n" 2>&1 | grep "adopted dataset" >/dev/null \
     && { ko "$t" "migration must not trigger on a fresh volume" "$n"; return; }
   docker rm -f "$n" >/dev/null 2>&1
   ok "$t"
@@ -516,7 +516,7 @@ t_adoption_at_custom_mount() {
   [ "$(rcli "$n" GET bitkey)" = "bitvalue" ] || { ko "$t" "adopted key lost" "$n"; return; }
   wait_for_file_in_volume custom-vol appendonlydir/appendonly.aof.manifest 30 \
     || { ko "$t" "manifest not written to the custom mount" "$n"; return; }
-  docker logs "$n" 2>&1 | grep -q "data directory is outside" \
+  docker logs "$n" 2>&1 | grep "data directory is outside" >/dev/null \
     && { ko "$t" "false persistence warning at a followed mount" "$n"; return; }
   docker rm -f "$n" >/dev/null 2>&1
   ok "$t"
@@ -830,9 +830,12 @@ t_sigterm_master_demotes_before_exit() {
   # timing. graceful_shutdown (and its own kill fallbacks) only run after
   # demote_before_shutdown returns, so this line existing at all means it
   # returned before redis-server or sentinel were ever signaled to stop.
-  docker logs demote-1 2>&1 | grep -q "demote-on-shutdown: master shutting down" \
+  # Not `grep -q` — see t_restart_old_master_rejoins_as_replica on the
+  # SIGPIPE false negative (this exact assertion flaked red in CI with the
+  # demote line demonstrably present in the dumped log).
+  docker logs demote-1 2>&1 | grep -F "demote-on-shutdown: master shutting down" >/dev/null \
     || { ko "$t" "demote-1 never attempted the pre-shutdown failover" demote-1; return; }
-  docker logs demote-1 2>&1 | grep -q "demote-on-shutdown: failover confirmed" \
+  docker logs demote-1 2>&1 | grep -F "demote-on-shutdown: failover confirmed" >/dev/null \
     || { ko "$t" "demote-1 never confirmed the failover before exiting" demote-1; return; }
 
   # And it must have actually been fast — nowhere near the -t budget, which
@@ -1632,7 +1635,7 @@ t_paused_majority_keeps_the_fence() {
   # inside this window).
   sleep 45
 
-  if docker logs hold-1 2>&1 | grep -q "reset the local sentinel to forget peers down past the dwell"; then
+  if docker logs hold-1 2>&1 | grep "reset the local sentinel to forget peers down past the dwell" >/dev/null; then
     docker unpause hold-3 hold-4 hold-5 >/dev/null 2>&1
     ko "$t" "the minority pruned a majority that still resolves" hold-1; return;
   fi
@@ -2046,6 +2049,11 @@ RUNLIST=("${@:-${ALL_TESTS[@]}}")
 for t in "${RUNLIST[@]}"; do
   log "running ${t}"
   "$t"
+  # A ko returns without the scenario's own cleanup, and the stragglers (up
+  # to 5 nodes x redis+sentinel+wrapper each) then starve every later
+  # scenario of CPU — one flake cascades into a 16-fail run whose root cause
+  # is a single scenario. Sweep between scenarios so each starts clean.
+  cleanup_test_resources
 done
 
 echo
