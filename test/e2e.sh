@@ -420,7 +420,7 @@ t_fresh_boot() {
     || { ko "$t" "lone master must refuse writes (min-replicas-to-write fence)" "$n"; return; }
   [ "$(rcli "$n" CONFIG GET appendonly | tail -1)" = "yes" ] \
     || { ko "$t" "appendonly should be yes on a fresh volume" "$n"; return; }
-  docker logs "$n" 2>&1 | grep -q "adopted dataset" \
+  docker logs "$n" 2>&1 | grep "adopted dataset" >/dev/null \
     && { ko "$t" "migration must not trigger on a fresh volume" "$n"; return; }
   docker rm -f "$n" >/dev/null 2>&1
   ok "$t"
@@ -516,7 +516,7 @@ t_adoption_at_custom_mount() {
   [ "$(rcli "$n" GET bitkey)" = "bitvalue" ] || { ko "$t" "adopted key lost" "$n"; return; }
   wait_for_file_in_volume custom-vol appendonlydir/appendonly.aof.manifest 30 \
     || { ko "$t" "manifest not written to the custom mount" "$n"; return; }
-  docker logs "$n" 2>&1 | grep -q "data directory is outside" \
+  docker logs "$n" 2>&1 | grep "data directory is outside" >/dev/null \
     && { ko "$t" "false persistence warning at a followed mount" "$n"; return; }
   docker rm -f "$n" >/dev/null 2>&1
   ok "$t"
@@ -830,9 +830,12 @@ t_sigterm_master_demotes_before_exit() {
   # timing. graceful_shutdown (and its own kill fallbacks) only run after
   # demote_before_shutdown returns, so this line existing at all means it
   # returned before redis-server or sentinel were ever signaled to stop.
-  docker logs demote-1 2>&1 | grep -q "demote-on-shutdown: master shutting down" \
+  # Not `grep -q` — see t_restart_old_master_rejoins_as_replica on the
+  # SIGPIPE false negative (this exact assertion flaked red in CI with the
+  # demote line demonstrably present in the dumped log).
+  docker logs demote-1 2>&1 | grep -F "demote-on-shutdown: master shutting down" >/dev/null \
     || { ko "$t" "demote-1 never attempted the pre-shutdown failover" demote-1; return; }
-  docker logs demote-1 2>&1 | grep -q "demote-on-shutdown: failover confirmed" \
+  docker logs demote-1 2>&1 | grep -F "demote-on-shutdown: failover confirmed" >/dev/null \
     || { ko "$t" "demote-1 never confirmed the failover before exiting" demote-1; return; }
 
   # And it must have actually been fast — nowhere near the -t budget, which
@@ -956,6 +959,94 @@ t_restart_old_master_rejoins_as_replica() {
     || { ko "$t" "promoted master lost data when the old master rejoined" "$promoted"; return; }
 
   docker rm -f rejoin-1 rejoin-2 rejoin-3 >/dev/null 2>&1
+  ok "$t"
+}
+
+# A master that is DOWN for the whole failover never observes the
+# +switch-master, so its volume's sentinel.conf still names ITSELF. Before the
+# peer cross-check that boot came back as a second master until the peers'
+# higher config epoch demoted it — a real stale-master window observed in
+# production on a redeployed ex-master, held off the write path only by the
+# health server's 503. The boot must now ask the peer Sentinels first and come
+# back as a replica of the promoted node on the FIRST answer.
+t_down_for_failover_master_boots_as_replica() {
+  local t=t_down_for_failover_master_boots_as_replica
+  local hosts="stale-1:26379,stale-2:26379,stale-3:26379"
+  start_ha_trio stale \
+    || { dump_sentinel_view stale-2 stale-3
+         ko "$t" "cluster never became failover-ready" stale-1 stale-2 stale-3; return; }
+  write_key stale-1 prekey prevalue \
+    || { ko "$t" "master never accepted the pre-failover write" stale-1; return; }
+  wait_for_key stale-2 prekey prevalue || { ko "$t" "stale-2 never synced" stale-1 stale-2; return; }
+  wait_for_key stale-3 prekey prevalue || { ko "$t" "stale-3 never synced" stale-1 stale-3; return; }
+
+  # Hard-remove the master: its own Sentinel must never observe the failover,
+  # so its volume keeps the pre-failover sentinel.conf naming ITSELF. (Not
+  # pause: an unpaused Sentinel resumes and rewrites the conf, which is the
+  # t_restart_old_master_rejoins_as_replica scenario, not this one.)
+  docker rm -f stale-1 >/dev/null 2>&1
+
+  local i n promoted=""
+  # Same budget as promote_by_pausing: sdown at ~5s, but a tied first
+  # election only retries after the template's 30s failover-timeout.
+  for i in $(seq 1 180); do
+    for n in stale-2 stale-3; do
+      docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
+        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+    done
+    sleep 1
+  done
+  [ -n "$promoted" ] || {
+    dump_sentinel_view stale-2 stale-3
+    ko "$t" "no replica was promoted after removing the master" stale-2 stale-3
+    return
+  }
+  note "promoted: ${promoted}"
+
+  # Precondition, not an assertion of the fix: the down node's volume still
+  # names the node itself — the stale state the boot has to distrust.
+  [ "$(sentinel_conf_master_host stale-vol-1)" = "stale-1" ] \
+    || { note "stale-vol-1 sentinel monitor host: '$(sentinel_conf_master_host stale-vol-1)'"
+         ko "$t" "precondition broke: stale-1's volume no longer names itself"; return; }
+
+  # Only the new master has this write — the rejoined node cannot end up with
+  # it by any route other than syncing from the promoted node.
+  write_key "$promoted" postkey postvalue \
+    || { ko "$t" "post-failover write never succeeded on $promoted" "$promoted"; return; }
+
+  # The redeploy: same volume, same deploy-time env (REPLICA_OF still empty).
+  start_node stale-1 stale-vol-1 /data -e SENTINEL_HOSTS="$hosts"
+  wait_for_ping stale-1 || { ko "$t" "rejoined node never answered PING" stale-1; return; }
+
+  # Asserted on the FIRST answer, not after a convergence wait: Sentinel's
+  # higher config epoch would eventually demote a stale master, and waiting
+  # for that would pass with or without the peer cross-check. The role has to
+  # be right because the boot asked the peers before serving.
+  local role host
+  role=$(redis_role stale-1)
+  host=$(master_host_of stale-1)
+  [ "$role" = "slave" ] \
+    || { ko "$t" "rejoined node came back as '${role}', expected slave of ${promoted}" stale-1; return; }
+  [ "$host" = "$promoted" ] \
+    || { ko "$t" "rejoined node points at '${host}', expected ${promoted}" stale-1; return; }
+  # Not `grep -q` in a pipeline off docker logs — see
+  # t_restart_old_master_rejoins_as_replica on the SIGPIPE false negative.
+  docker logs stale-1 2>&1 \
+    | grep -F "peer sentinels contradict this node's sentinel.conf" >/dev/null \
+    || { ko "$t" "peer cross-check decision was not logged" stale-1; return; }
+
+  wait_for_link_status stale-1 up 60 \
+    || { ko "$t" "rejoined replica never linked to ${promoted}" stale-1 "$promoted"; return; }
+  wait_for_key stale-1 postkey postvalue \
+    || { ko "$t" "post-failover write never reached the rejoined node" stale-1 "$promoted"; return; }
+  wait_for_key stale-1 prekey prevalue 30 \
+    || { ko "$t" "pre-failover key missing after the rejoin" stale-1; return; }
+  # The promoted master keeps its dataset — the rejoining node syncs from it,
+  # never the other way round.
+  [ "$(rcli "$promoted" GET postkey)" = "postvalue" ] && [ "$(rcli "$promoted" GET prekey)" = "prevalue" ] \
+    || { ko "$t" "promoted master lost data when the stale master rejoined" "$promoted"; return; }
+
+  docker rm -f stale-1 stale-2 stale-3 >/dev/null 2>&1
   ok "$t"
 }
 
@@ -1544,7 +1635,7 @@ t_paused_majority_keeps_the_fence() {
   # inside this window).
   sleep 45
 
-  if docker logs hold-1 2>&1 | grep -q "reset the local sentinel to forget peers down past the dwell"; then
+  if docker logs hold-1 2>&1 | grep "reset the local sentinel to forget peers down past the dwell" >/dev/null; then
     docker unpause hold-3 hold-4 hold-5 >/dev/null 2>&1
     ko "$t" "the minority pruned a majority that still resolves" hold-1; return;
   fi
@@ -1935,6 +2026,7 @@ ALL_TESTS=(
   t_switchover_promotes_requested_node
   t_sigterm_master_demotes_before_exit
   t_restart_old_master_rejoins_as_replica
+  t_down_for_failover_master_boots_as_replica
   t_cold_restart_preserves_promoted_master
   t_link_heal_recovers_broken_replica_link
   t_link_heal_recovers_from_partition_during_failover
@@ -1956,7 +2048,18 @@ setup
 RUNLIST=("${@:-${ALL_TESTS[@]}}")
 for t in "${RUNLIST[@]}"; do
   log "running ${t}"
+  fail_before=$FAIL
   "$t"
+  # A ko returns without the scenario's own cleanup, and the stragglers (up
+  # to 5 nodes x redis+sentinel+wrapper each) then starve every later
+  # scenario of CPU — one flake cascades into a 16-fail run whose root cause
+  # is a single scenario. Sweep after a FAILED scenario so the next one
+  # starts clean; a passing scenario's leftovers stay untouched, because
+  # some chain on purpose (t_adoption_survives_restart reuses what
+  # t_rdb_adoption leaves behind).
+  if [ "$FAIL" -gt "$fail_before" ]; then
+    cleanup_test_resources
+  fi
 done
 
 echo
