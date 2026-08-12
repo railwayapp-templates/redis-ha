@@ -2048,12 +2048,18 @@ setup
 RUNLIST=("${@:-${ALL_TESTS[@]}}")
 for t in "${RUNLIST[@]}"; do
   log "running ${t}"
+  fail_before=$FAIL
   "$t"
   # A ko returns without the scenario's own cleanup, and the stragglers (up
   # to 5 nodes x redis+sentinel+wrapper each) then starve every later
   # scenario of CPU — one flake cascades into a 16-fail run whose root cause
-  # is a single scenario. Sweep between scenarios so each starts clean.
-  cleanup_test_resources
+  # is a single scenario. Sweep after a FAILED scenario so the next one
+  # starts clean; a passing scenario's leftovers stay untouched, because
+  # some chain on purpose (t_adoption_survives_restart reuses what
+  # t_rdb_adoption leaves behind).
+  if [ "$FAIL" -gt "$fail_before" ]; then
+    cleanup_test_resources
+  fi
 done
 
 echo
