@@ -12,11 +12,19 @@
 # The scenarios encode the conversion behaviors this image guarantees:
 # adopting an RDB-only dataset (a standalone Railway redis being converted to
 # HA), surviving the CONFIG SET → manifest-commit crash window, following the
-# volume mount path, and Sentinel failover preserving adopted data.
+# volume mount path, and Sentinel failover preserving adopted data — plus the
+# live-traffic contracts: conversion and failover under a continuously
+# writing client (through the real HAProxy edge for the failover case), and
+# maxmemory pressure degrading writes without destabilizing the cluster.
 
 set -uo pipefail
 
 IMAGE="${IMAGE:-redis-sentinel-e2e:local}"
+# The edge (HAProxy) image, exercised by the through-the-edge scenarios. CI
+# pre-builds it (cache-warmed) under this tag; a local run that doesn't have
+# it builds it on first use — inside the scenario, not setup, so subset runs
+# of unrelated scenarios never pay the cargo build.
+EDGE_IMAGE="${EDGE_IMAGE:-haproxy-e2e:local}"
 SEED_IMAGE="redis:8.2.1"
 NET="redis-ha-test-net"
 LABEL="redis-ha-e2e=1"
@@ -405,6 +413,81 @@ wait_for_replica_attached_host() { # wait_for_replica_attached_host NODE EXPECTE
   return 1
 }
 
+# ----- write-load helpers -----------------------------------------------------
+# A paced sequential writer for the "under live traffic" scenarios: SETs
+# w:1, w:2, ... against TARGET (a node name or an edge alias) and appends
+# "<seq> <epoch>" to /acked inside its own container for every reply that
+# came back OK. The ledger is the contract under test: an acked write is the
+# server's promise, an unacked one is the client's retry problem — so every
+# assertion downstream is phrased over /acked, never over what was attempted.
+# ~10 writes/s keeps a failover window populated with in-flight traffic
+# without turning the post-run ledger scan into the slow part of the suite.
+start_seq_writer() { # start_seq_writer NAME TARGET_HOST
+  docker run -d --name "$1" --label "$LABEL" --network "$NET" \
+    -e PW="$PW" -e TARGET="$2" "$SEED_IMAGE" sh -c '
+      : > /acked
+      i=0
+      while :; do
+        i=$((i+1))
+        out=$(redis-cli -a "$PW" -h "$TARGET" SET "w:$i" "$i" 2>/dev/null)
+        [ "$out" = "OK" ] && echo "$i $(date +%s)" >> /acked
+        sleep 0.1
+      done' >/dev/null
+}
+
+acked_count() { # acked_count WRITER
+  docker exec "$1" sh -c 'wc -l < /acked' 2>/dev/null | tr -d '[:space:]'
+}
+
+last_acked() { # last_acked WRITER  ->  highest acked sequence number
+  docker exec "$1" sh -c 'tail -1 /acked' 2>/dev/null | awk '{print $1}'
+}
+
+wait_for_new_ack() { # wait_for_new_ack WRITER PREV_COUNT [timeout]
+  local i c
+  for i in $(seq 1 "${3:-90}"); do
+    c=$(acked_count "$1")
+    [ -n "$c" ] && [ "$c" -gt "$2" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# Freeze the writer and verify its whole ledger through CHECK_NODE (a
+# container with redis-cli), reading via CHECK_HOST — the same path a client
+# would use. SIGKILL, not stop: the ledger only ever gains a line AFTER a
+# reply arrived, so killing mid-write can at worst lose an entry the server
+# acked (ledger ⊆ acked — safe direction), never record one it didn't.
+# The ledger is copied INTO the checking container so the whole scan is one
+# `docker exec` with in-container round trips, not one exec per key.
+# Echoes the missing "seq:epoch" entries (empty output = ledger fully intact);
+# the copied ledger is left at /tmp/acked-<writer> on CHECK_NODE for callers
+# that need the raw entries afterwards.
+freeze_and_find_missing() { # freeze_and_find_missing WRITER CHECK_NODE CHECK_HOST
+  local ledger="/tmp/acked-$1"
+  docker kill "$1" >/dev/null 2>&1
+  docker cp "$1:/acked" "${TMPDIR:-/tmp}/e2e-acked-$$" >/dev/null 2>&1 || return 1
+  # World-readable before it lands in the checking container: `docker cp`
+  # preserves the tar's owner (root), and the checker may exec as a non-root
+  # user (the edge image runs as `haproxy`) — an unreadable ledger would make
+  # the scan silently vacuous, which the sentinel below also guards against.
+  chmod 644 "${TMPDIR:-/tmp}/e2e-acked-$$"
+  docker cp "${TMPDIR:-/tmp}/e2e-acked-$$" "$2:${ledger}" >/dev/null 2>&1 || return 1
+  rm -f "${TMPDIR:-/tmp}/e2e-acked-$$"
+  # A ledger the scan cannot read MUST come back as a failure the caller
+  # trips over, never as "nothing missing": echo a sentinel entry (sorts as
+  # seq 0 — behind every barrier, outside every window) instead of exiting.
+  docker exec -e PW="$PW" -e CHECK_HOST="$3" -e LEDGER="$ledger" "$2" sh -c '
+    if [ ! -r "$LEDGER" ] || [ ! -s "$LEDGER" ]; then
+      echo "0:LEDGER-UNREADABLE-OR-EMPTY"
+      exit 0
+    fi
+    while read -r i ts; do
+      v=$(redis-cli -a "$PW" -h "$CHECK_HOST" GET "w:$i" 2>/dev/null)
+      [ "$v" = "$i" ] || echo "$i:$ts"
+    done < "$LEDGER"'
+}
+
 # ----- scenarios --------------------------------------------------------------
 
 # A fresh volume boots straight into AOF with a Sentinel-confirmed master —
@@ -657,6 +740,72 @@ t_replication_of_adopted_data() {
   ok "$t"
 }
 
+# Conversion while a client is actively writing — the standalone→HA cutover as
+# the application experiences it, not as a quiesced lab exercise. A paced
+# writer runs against the standalone node (the Railway template's exact shape:
+# RDB-only `--save 60 1`, no AOF) through the graceful stop and into the HA
+# composition booting on the same volume and private domain.
+#
+# The zero-loss claim is strict and it is real: a save-point-configured Redis
+# performs SHUTDOWN SAVE on SIGTERM, and it is single-threaded — any write it
+# acked completed before the shutdown sequence started, so the shutdown RDB
+# contains every acked write by construction, including the ones newer than
+# any periodic BGSAVE. Adoption then carries that RDB into AOF. If any acked
+# key is missing after conversion, the conversion lost real data.
+#
+# During the gap the writer's SETs simply fail (unacked — the client's retry
+# problem, not a loss), and they must start succeeding again WITHOUT any
+# client-side reconfiguration once a replica attaches and the write fence
+# lifts — same hostname, same port, same credentials.
+t_conversion_under_active_writes() {
+  local t=t_conversion_under_active_writes
+  local hosts="conv-node:26379,conv-2:26379,conv-3:26379"
+  mkvol conv-vol-1; mkvol conv-vol-2; mkvol conv-vol-3
+  # The standalone template runs as uid 999 against a volume it didn't create.
+  docker run --rm -v conv-vol-1:/data alpine:latest chown 999:999 /data >/dev/null 2>&1
+  docker run -d --name conv-node --label "$LABEL" --network "$NET" \
+    --network-alias conv-node --hostname conv-node -v conv-vol-1:/data \
+    "$SEED_IMAGE" redis-server --requirepass "$PW" --save 60 1 --dir /data >/dev/null
+  wait_for_ping conv-node || { ko "$t" "standalone node never answered" conv-node; return; }
+
+  start_seq_writer conv-writer conv-node
+  wait_for_new_ack conv-writer 0 30 \
+    || { ko "$t" "writer never got an ack from the standalone node" conv-node conv-writer; return; }
+  sleep 5 # accumulate acked traffic strictly newer than any periodic save
+
+  # Railway's conversion: graceful stop (SIGTERM + grace window), then the HA
+  # composition takes over the volume and the root keeps the private domain.
+  docker stop -t 30 conv-node >/dev/null 2>&1
+  docker rm -f conv-node >/dev/null 2>&1
+  start_node conv-node conv-vol-1 /data -e SENTINEL_HOSTS="$hosts"
+  start_node conv-2 conv-vol-2 /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=conv-node:6379
+  start_node conv-3 conv-vol-3 /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=conv-node:6379
+  wait_for_log_line conv-node "enabled AOF after loading adopted RDB" 60 \
+    || { ko "$t" "adoption never completed on the converted root" conv-node; return; }
+
+  # Acks must resume with zero writer-side changes once the fence lifts.
+  # 180s: full sync of two fresh replicas has to finish first.
+  local resumed_from
+  resumed_from=$(acked_count conv-writer)
+  wait_for_new_ack conv-writer "$resumed_from" 180 \
+    || { ko "$t" "writes never resumed after the conversion" conv-node conv-2 conv-writer; return; }
+  sleep 3 # a little steady post-conversion traffic
+
+  local missing last
+  missing=$(freeze_and_find_missing conv-writer conv-node 127.0.0.1)
+  [ -z "$missing" ] \
+    || { ko "$t" "acked writes lost across the conversion: ${missing}" conv-node conv-2 conv-3; return; }
+  note "ledger: $(docker exec conv-node sh -c 'wc -l < /tmp/acked-conv-writer' | tr -d '[:space:]') acked writes, all intact across the conversion"
+  # And the converted dataset — pre-stop and post-conversion writes alike —
+  # must actually be replicated, not just present on the root.
+  last=$(docker exec conv-node sh -c 'tail -1 /tmp/acked-conv-writer' | awk '{print $1}')
+  wait_for_key conv-2 "w:$last" "$last" \
+    || { ko "$t" "converted dataset never reached the replica" conv-node conv-2; return; }
+
+  docker rm -f conv-node conv-2 conv-3 conv-writer >/dev/null 2>&1
+  ok "$t"
+}
+
 # The full conversion story: adopted primary + two replicas + Sentinel quorum.
 # Kill the primary; a replica must be promoted and still serve the adopted key.
 t_sentinel_failover() {
@@ -709,6 +858,111 @@ t_sentinel_failover() {
   note "promoted: ${promoted}"
   docker unpause ha-1 >/dev/null 2>&1
   docker rm -f ha-1 ha-2 ha-3 >/dev/null 2>&1
+  ok "$t"
+}
+
+# A client through the REAL edge (the repo's HAProxy image, /role-checked
+# routing) across an unplanned failover. Every other failover scenario talks
+# to the nodes directly; this one asserts the only endpoint a customer
+# application actually holds: one hostname, one port, dumb retries, no
+# Sentinel awareness — and the edge alone must reconverge it to the new
+# master.
+#
+# What is asserted about the ledger is exactly what Sentinel + asynchronous
+# replication promises, no more: writes acked at or before the replication
+# barrier (a key CONFIRMED on both replicas before the master is paused) can
+# never be lost; writes acked after it ride a single connection, so any loss
+# the promotion cut inflicts is a FIFO tail — at most ONE contiguous run in
+# acked order, timestamped inside the failover window. Scattered loss, loss
+# behind the barrier, or loss of post-failover acks would each mean a bug
+# (in the edge's routing, in promotion, or in replication) rather than the
+# documented async-replication tradeoff.
+t_edge_client_writes_survive_failover() {
+  local t=t_edge_client_writes_survive_failover
+  if ! docker image inspect "$EDGE_IMAGE" >/dev/null 2>&1; then
+    log "building ${EDGE_IMAGE}"
+    docker build -q -f "${REPO_ROOT}/haproxy/Dockerfile" -t "$EDGE_IMAGE" "$REPO_ROOT" >/dev/null || {
+      ko "$t" "edge image build failed"; return;
+    }
+  fi
+  start_ha_trio edgec \
+    || { ko "$t" "trio never reached failover-ready state" edgec-1 edgec-2 edgec-3; return; }
+  docker run -d --name edgec-edge --label "$LABEL" --network "$NET" \
+    --network-alias edgec-edge --hostname edgec-edge \
+    -e REDIS_NODES="edgec-1:6379,edgec-2:6379,edgec-3:6379" \
+    "$EDGE_IMAGE" >/dev/null
+
+  # The edge is routing to the master when a write THROUGH it lands.
+  local i
+  for i in $(seq 1 60); do
+    docker exec -e PW="$PW" edgec-edge sh -c \
+      'redis-cli -a "$PW" -h 127.0.0.1 SET edgeprobe ok 2>/dev/null' | grep -q OK && break
+    sleep 1
+  done
+  docker exec -e PW="$PW" edgec-edge sh -c \
+    'redis-cli -a "$PW" -h 127.0.0.1 GET edgeprobe 2>/dev/null' | grep -q ok \
+    || { ko "$t" "edge never routed a write to the master" edgec-edge edgec-1; return; }
+
+  start_seq_writer edgec-writer edgec-edge
+  wait_for_new_ack edgec-writer 0 60 \
+    || { ko "$t" "writer never got an ack through the edge" edgec-edge edgec-writer; return; }
+
+  # Replication barrier: everything acked up to `mark` is on BOTH replicas,
+  # so no failover — whichever candidate wins — may lose it.
+  local mark
+  mark=$(last_acked edgec-writer)
+  wait_for_key edgec-2 "w:$mark" "$mark" \
+    || { ko "$t" "replica edgec-2 never caught up to the barrier" edgec-1 edgec-2; return; }
+  wait_for_key edgec-3 "w:$mark" "$mark" \
+    || { ko "$t" "replica edgec-3 never caught up to the barrier" edgec-1 edgec-3; return; }
+
+  local pre_count pause_ts promoted
+  pre_count=$(acked_count edgec-writer)
+  pause_ts=$(date +%s)
+  promoted=$(promote_by_pausing edgec-1 edgec-2 edgec-3)
+  [ -n "$promoted" ] || {
+    dump_sentinel_view edgec-2 edgec-3
+    ko "$t" "no replica was promoted" edgec-2 edgec-3
+    return
+  }
+  note "promoted: ${promoted}"
+
+  # The same writer, still pointed at the same edge alias, must start
+  # collecting acks again with no client-side action at all.
+  wait_for_new_ack edgec-writer "$pre_count" 90 \
+    || { ko "$t" "writes never resumed through the edge after the failover" edgec-edge "$promoted" edgec-writer; return; }
+  sleep 3 # a little steady post-failover traffic
+
+  # Ledger verification THROUGH the edge — reading via the edge is itself the
+  # proof that it converged to the promoted node.
+  local missing
+  missing=$(freeze_and_find_missing edgec-writer edgec-edge 127.0.0.1)
+  if [ -n "$missing" ]; then
+    local miss_count barrier_violation window_violation runs
+    miss_count=$(echo "$missing" | wc -l | tr -d '[:space:]')
+    # Nothing at or behind the replication barrier may be missing.
+    barrier_violation=$(echo "$missing" | awk -F: -v m="$mark" '$1 <= m' | head -1)
+    [ -z "$barrier_violation" ] \
+      || { ko "$t" "write acked BEFORE the replication barrier lost: ${barrier_violation} (barrier w:${mark})" "$promoted" edgec-2 edgec-3; return; }
+    # Every missing ack must sit inside the failover window.
+    window_violation=$(echo "$missing" | awk -F: -v p="$pause_ts" '$2 < p - 5 || $2 > p + 90' | head -1)
+    [ -z "$window_violation" ] \
+      || { ko "$t" "write lost OUTSIDE the failover window: ${window_violation} (pause at ${pause_ts})" "$promoted" edgec-edge; return; }
+    # FIFO loss: the missing entries must be ONE contiguous run in acked order.
+    runs=$(docker exec edgec-edge sh -c 'cat /tmp/acked-edgec-writer' \
+      | awk -v miss="$(echo "$missing" | awk -F: "{printf \"%s \", \$1}")" '
+          BEGIN { n = split(miss, m, " "); for (k = 1; k <= n; k++) mm[m[k]] = 1 }
+          { if (mm[$1]) { if (!inrun) runs++; inrun = 1 } else inrun = 0 }
+          END { print runs + 0 }')
+    [ "$runs" = "1" ] \
+      || { ko "$t" "acked-write loss is scattered (${runs} runs, ${miss_count} keys) — not a single promotion cut" "$promoted" edgec-edge; return; }
+    note "async-replication tail loss across the failover: ${miss_count} acked write(s), one contiguous run"
+  else
+    note "ledger: $(docker exec edgec-edge sh -c 'wc -l < /tmp/acked-edgec-writer' | tr -d '[:space:]') acked writes through the edge, zero lost across the failover"
+  fi
+
+  docker unpause edgec-1 >/dev/null 2>&1
+  docker rm -f edgec-1 edgec-2 edgec-3 edgec-edge edgec-writer >/dev/null 2>&1
   ok "$t"
 }
 
@@ -2010,6 +2264,87 @@ t_wiped_master_volume_does_not_wipe_cluster() {
   ok "$t"
 }
 
+# maxmemory pressure at runtime must degrade WRITES, not the cluster. The
+# wrapper stamps `maxmemory` (MAXMEMORY_MB, or 75% of the cgroup limit) with
+# `maxmemory-policy noeviction` — so a full node rejects writes with -OOM
+# instead of silently evicting. What must NOT happen when the ceiling is hit:
+# no failover (a loaded master is not a dead master — +odown/+switch-master
+# appearing here would mean pressure alone tips the cluster over), no broken
+# replication (replicas ignore maxmemory for the master's stream by Redis
+# default and must stay linked), no broken reads, and no broken persistence
+# (a BGSAVE that starts failing under pressure escalates to MISCONF, which
+# rejects even the writes that would free memory). And it must be a state,
+# not a ratchet: freeing memory has to restore writes with no restart.
+t_maxmemory_pressure_keeps_cluster_stable() {
+  local t=t_maxmemory_pressure_keeps_cluster_stable
+  start_ha_trio mm -e MAXMEMORY_MB=24 \
+    || { ko "$t" "trio never reached steady state" mm-1 mm-2 mm-3; return; }
+  [ "$(rcli mm-1 CONFIG GET maxmemory | tail -1)" = "25165824" ] \
+    || { ko "$t" "maxmemory was not stamped from MAXMEMORY_MB" mm-1; return; }
+  [ "$(rcli mm-1 CONFIG GET maxmemory-policy | tail -1)" = "noeviction" ] \
+    || { ko "$t" "maxmemory-policy is not noeviction" mm-1; return; }
+
+  # Fill past the ceiling: 40k × 1KiB values ≈ 40MiB attempted against a
+  # 24MiB ceiling, pushed through one in-container `redis-cli --pipe` (the
+  # fill itself is not the thing under test). --pipe exits non-zero once the
+  # ceiling starts rejecting — expected, that IS the pressure.
+  docker exec -e PW="$PW" mm-1 sh -c '
+    pad=$(head -c 1024 /dev/zero | tr "\0" "x")
+    for i in $(seq 1 40000); do echo "SET pad:$i $pad"; done \
+      | redis-cli -a "$PW" --pipe' >/dev/null 2>&1 || true
+
+  # The ceiling is enforced: a plain write is refused with -OOM.
+  rcli mm-1 SET mmprobe v 2>&1 | grep -qi "OOM" \
+    || { ko "$t" "write at the ceiling was not refused with -OOM" mm-1; return; }
+
+  # Reads keep working on the full node.
+  [ -n "$(rcli mm-1 GET pad:1)" ] \
+    || { ko "$t" "read failed on the full node" mm-1; return; }
+
+  # Persistence keeps working under pressure: BGSAVE completes with status ok
+  # (its failure mode, MISCONF, would lock out even the freeing writes).
+  rcli mm-1 BGSAVE >/dev/null 2>&1
+  local i
+  for i in $(seq 1 60); do
+    rcli mm-1 INFO persistence | grep -q "rdb_bgsave_in_progress:0" && break
+    sleep 1
+  done
+  rcli mm-1 INFO persistence | grep -q "rdb_last_bgsave_status:ok" \
+    || { ko "$t" "BGSAVE failed under maxmemory pressure" mm-1; return; }
+
+  # Hold the pressure and prove the cluster does NOT react to it: master
+  # keeps its role, both replication links stay up, and no Sentinel ever
+  # escalates past subjective suspicion (a +sdown blip under load is
+  # tolerated; +odown or +switch-master is a failover and fails the test).
+  sleep 20
+  [ "$(redis_role mm-1)" = "master" ] \
+    || { ko "$t" "master lost its role under memory pressure" mm-1 mm-2 mm-3; return; }
+  [ "$(link_status mm-2)" = "up" ] && [ "$(link_status mm-3)" = "up" ] \
+    || { ko "$t" "replication link broke under memory pressure" mm-1 mm-2 mm-3; return; }
+  local escalations
+  # Not `grep -q` — see t_restart_old_master_rejoins_as_replica on the
+  # SIGPIPE false negative; read both logs to completion.
+  escalations=$(docker logs mm-2 2>&1 | grep -c -e "+odown" -e "+switch-master")
+  [ "$escalations" = "0" ] \
+    || { ko "$t" "memory pressure alone escalated to a failover on mm-2's sentinel" mm-1 mm-2; return; }
+  escalations=$(docker logs mm-3 2>&1 | grep -c -e "+odown" -e "+switch-master")
+  [ "$escalations" = "0" ] \
+    || { ko "$t" "memory pressure alone escalated to a failover on mm-3's sentinel" mm-1 mm-3; return; }
+
+  # Recoverable without a restart: free the data, writes come back, and the
+  # recovery write replicates.
+  docker exec -e PW="$PW" mm-1 sh -c '
+    for i in $(seq 1 40000); do echo "UNLINK pad:$i"; done \
+      | redis-cli -a "$PW" --pipe' >/dev/null 2>&1 || true
+  write_key mm-1 mmafter recovered 30 \
+    || { ko "$t" "writes never recovered after freeing memory" mm-1; return; }
+  wait_for_key mm-2 mmafter recovered \
+    || { ko "$t" "post-recovery write never replicated" mm-1 mm-2; return; }
+
+  docker rm -f mm-1 mm-2 mm-3 >/dev/null 2>&1
+  ok "$t"
+}
+
 # ----- runner ------------------------------------------------------------------
 ALL_TESTS=(
   t_fresh_boot
@@ -2022,7 +2357,9 @@ ALL_TESTS=(
   t_large_rdb_loading_retry
   t_rewrite_failure_recovers
   t_replication_of_adopted_data
+  t_conversion_under_active_writes
   t_sentinel_failover
+  t_edge_client_writes_survive_failover
   t_switchover_promotes_requested_node
   t_sigterm_master_demotes_before_exit
   t_restart_old_master_rejoins_as_replica
@@ -2042,6 +2379,7 @@ ALL_TESTS=(
   t_sentinel_auth_on_by_default_for_fresh_cluster
   t_scale_up_of_unauthed_cluster_stays_unauthed
   t_password_variable_edit_does_not_rotate
+  t_maxmemory_pressure_keeps_cluster_stable
 )
 
 setup

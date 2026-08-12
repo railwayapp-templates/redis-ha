@@ -33,8 +33,23 @@ jobs:
           platforms: linux/amd64
           tags: redis-sentinel-e2e:local
           load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=e2e-node
+          cache-to: type=gha,mode=max,scope=e2e-node
+
+      # The through-the-edge scenarios run the real HAProxy image. Pre-build
+      # it here, cache-warmed, so the harness's lazy in-scenario build (meant
+      # for local subset runs) finds the tag and skips a cold cargo build on
+      # the runner.
+      - name: Build edge image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: haproxy/Dockerfile
+          platforms: linux/amd64
+          tags: haproxy-e2e:local
+          load: true
+          cache-from: type=gha,scope=e2e-edge
+          cache-to: type=gha,mode=max,scope=e2e-edge
 
       - name: Run e2e harness
         # GitHub's default `run:` shell has no pipefail, so without it the
