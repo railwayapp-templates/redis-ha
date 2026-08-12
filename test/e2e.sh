@@ -47,7 +47,32 @@ fail_dump() {
       cstate=$(docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}}' "$c" 2>/dev/null)
       echo "${R}--- docker logs ${c} (${cstate}) (last 40) ---${N}" >&2
       docker logs --tail 40 "$c" 2>&1 | sed 's/^/    /' >&2
+      # Sentinel floods its log with resolve errors on any failure, pushing
+      # the wrapper's own decisions out of the 40-line window — surface the
+      # watcher lines (quorum-sync, prune, dns probe) separately; they are
+      # what the membership/fence scenarios need to be triaged from CI.
+      echo "${R}--- wrapper watcher lines ${c} (last 15) ---${N}" >&2
+      docker logs "$c" 2>&1 | grep -aE "quorum|prune|dns|fence|min-replicas" \
+        | tail -15 | sed 's/^/    /' >&2
+      # The local sentinel's own membership view: peer/replica counts and the
+      # quorum it holds explain a wrong fence value directly (the fence
+      # follows majority(known membership) - 1).
+      echo "${R}--- sentinel view ${c} ---${N}" >&2
+      {
+        scli "$c" SENTINEL master mymaster 2>/dev/null | paste - - \
+          | grep -aE "^(quorum|num-other-sentinels|num-slaves|flags)\b" || true
+        echo "sentinels-known: $(scli "$c" SENTINEL sentinels mymaster 2>/dev/null | grep -ac '^name$' || true)"
+      } | sed 's/^/    /' >&2
     fi
+  done
+  # A failed scenario returns without reaching its own cleanup, leaving a
+  # whole cluster (up to 5 nodes x redis+sentinel+wrapper each) running until
+  # the exit trap. Later scenarios then compete with the stragglers for the
+  # runner's CPU — the resource-heavy membership scenarios run last and are
+  # exactly the ones that time out under that load. Remove the dumped
+  # containers now that their logs are captured.
+  for c in "$@"; do
+    docker rm -f "$c" >/dev/null 2>&1
   done
 }
 
@@ -1408,14 +1433,16 @@ t_deleted_majority_unfences_via_nxdomain() {
   done
   wait_for_role_master gone-1 || { ko "$t" "gone-1 never became master" gone-1; return; }
 
-  # The 5-node fence must be up first, or the test proves nothing.
+  # The 5-node fence must be up first, or the test proves nothing. 240s, not
+  # 120: five nodes x three processes each converge much slower on a shared
+  # CI runner than locally, and this setup gate was the top flake on GH.
   local f
-  for i in $(seq 1 120); do
+  for i in $(seq 1 240); do
     f=$(rcli gone-1 CONFIG GET min-replicas-to-write | tail -1)
     [ "$f" = "2" ] && break
     sleep 1
   done
-  [ "$f" = "2" ] || { ko "$t" "fence never reached 2 before the deletion (got '\''${f}'\'')" gone-1; return; }
+  [ "$f" = "2" ] || { ko "$t" "fence never reached 2 before the deletion (got '\''${f}'\'')" gone-1 gone-2 gone-3 gone-4 gone-5; return; }
 
   # Delete the majority, DNS names and all.
   docker rm -f gone-3 gone-4 gone-5 >/dev/null 2>&1
@@ -1435,8 +1462,8 @@ t_deleted_majority_unfences_via_nxdomain() {
   # fence follows the shrunken membership back to 1. Writes resume.
   local n converged
   for n in gone-1 gone-2; do
-    wait_for_log_line "$n" "reset the local sentinel to forget peers down past the dwell" 120 \
-      || { ko "$t" "${n} never pruned the deleted majority" "$n"; return; }
+    wait_for_log_line "$n" "reset the local sentinel to forget peers down past the dwell" 240 \
+      || { ko "$t" "${n} never pruned the deleted majority" gone-1 gone-2; return; }
     converged=""
     for i in $(seq 1 120); do
       f=$(rcli "$n" CONFIG GET min-replicas-to-write | tail -1)
@@ -1477,13 +1504,15 @@ t_paused_majority_keeps_the_fence() {
   done
   wait_for_role_master hold-1 || { ko "$t" "hold-1 never became master" hold-1; return; }
 
+  # Same 240s setup gate as t_deleted_majority_unfences_via_nxdomain: the
+  # 5-node convergence is CPU-bound on a shared CI runner.
   local f
-  for i in $(seq 1 120); do
+  for i in $(seq 1 240); do
     f=$(rcli hold-1 CONFIG GET min-replicas-to-write | tail -1)
     [ "$f" = "2" ] && break
     sleep 1
   done
-  [ "$f" = "2" ] || { ko "$t" "fence never reached 2 before the pause (got '\''${f}'\'')" hold-1; return; }
+  [ "$f" = "2" ] || { ko "$t" "fence never reached 2 before the pause (got '\''${f}'\'')" hold-1 hold-2 hold-3 hold-4 hold-5; return; }
 
   docker pause hold-3 hold-4 hold-5 >/dev/null 2>&1
 
