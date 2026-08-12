@@ -1754,6 +1754,46 @@ t_scale_up_of_unauthed_cluster_stays_unauthed() {
   ok "$t"
 }
 
+# Editing REDIS_PASSWORD and redeploying must NOT rotate the password the
+# dataset already runs with. The platform's variable editor warns exactly
+# that ("changes the variable without updating the actual database
+# password"), and half-applying the edit is the worst outcome: redis.conf is
+# regenerated from env while sentinel.conf is first-boot-only, so a rotated
+# requirepass strands Sentinel's outbound auth-pass and every wrapper watcher
+# on the old password — a full write outage through /role 503 on every node,
+# with Redis itself healthy. The wrapper pins the active password from the
+# volume's own previous conf instead; an orchestrated rotation that goes
+# through CONFIG SET requirepass + CONFIG REWRITE updates that conf and is
+# honored on the next boot.
+t_password_variable_edit_does_not_rotate() {
+  local t=t_password_variable_edit_does_not_rotate n=pin-1
+  mkvol pin-vol
+  start_node "$n" pin-vol /data
+  wait_for_role_master "$n" || { ko "$t" "never became master on first boot" "$n"; return; }
+
+  docker rm -f "$n" >/dev/null 2>&1
+  # start_node stamps -e REDIS_PASSWORD="$PW" first; the extra -e appended
+  # here wins (docker takes the last occurrence) — this IS the redeploy
+  # after a Variables-tab edit.
+  start_node "$n" pin-vol /data -e REDIS_PASSWORD=rotated-by-variable-edit
+  wait_for_role_master "$n" 90 \
+    || { ko "$t" "never became master after the variable-edit reboot" "$n"; return; }
+
+  # The active password still authenticates...
+  rcli "$n" PING | grep -q PONG \
+    || { ko "$t" "active password no longer authenticates after the reboot" "$n"; return; }
+  # ...the edited variable's value does not...
+  docker exec "$n" redis-cli -a rotated-by-variable-edit --no-auth-warning PING 2>/dev/null \
+    | grep -q PONG \
+    && { ko "$t" "the edited variable value authenticated — the password rotated" "$n"; return; }
+  # ...and the wrapper said why, durably.
+  wait_for_log_line "$n" "variable edits do not rotate the database password" 10 \
+    || { ko "$t" "drift warning never logged" "$n"; return; }
+
+  docker rm -f "$n" >/dev/null 2>&1
+  ok "$t"
+}
+
 # The membership probe's discriminator is the shared password, not DNS: a
 # foreign service that happens to reuse the hostname of a dead member
 # resolves and answers, but refuses the cluster's AUTH — that state is a
@@ -1897,6 +1937,7 @@ ALL_TESTS=(
   t_wiped_master_volume_does_not_wipe_cluster
   t_sentinel_auth_on_by_default_for_fresh_cluster
   t_scale_up_of_unauthed_cluster_stays_unauthed
+  t_password_variable_edit_does_not_rotate
 )
 
 setup
