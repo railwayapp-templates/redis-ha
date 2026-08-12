@@ -37,10 +37,13 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Run e2e harness
-        run: ./test/e2e.sh 2>&1 | tee e2e.log
+        # GitHub's default `run:` shell has no pipefail, so without it the
+        # pipe to tee swallows the harness's failure-count exit code and the
+        # job reports success no matter how many scenarios failed.
+        run: set -o pipefail; ./test/e2e.sh 2>&1 | tee e2e.log
 
-      - name: Upload log on failure
-        if: failure()
+      - name: Upload log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-log
