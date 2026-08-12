@@ -687,6 +687,61 @@ t_sentinel_failover() {
   ok "$t"
 }
 
+# POST /switchover must promote THE REQUESTED node, not merely trigger some
+# failover. Sentinel selects its candidate from a CACHED view of each
+# replica's INFO (refreshed every 10s): a FAILOVER issued right after the
+# priority bias races that refresh, and on a tie selection falls back to
+# replication offset and then run-id — the OTHER replica about half the
+# time. The wrapper therefore waits for its local Sentinel to observe the
+# bias before failing over. This scenario targets the replica the run-id
+# tie-break would NOT pick, so a regression back to the racy order shows up
+# as the wrong node winning.
+t_switchover_promotes_requested_node() {
+  local t=t_switchover_promotes_requested_node
+  start_ha_trio swo || { ko "$t" "cluster never became ready" swo-1 swo-2 swo-3; return; }
+  write_key swo-1 swokey swovalue || { ko "$t" "seed write failed" swo-1; return; }
+  wait_for_key swo-2 swokey swovalue || { ko "$t" "swo-2 never synced the seed key" swo-2; return; }
+  wait_for_key swo-3 swokey swovalue || { ko "$t" "swo-3 never synced the seed key" swo-3; return; }
+
+  # Equal offsets on an idle cluster, so a tie falls to the lexicographically
+  # smaller run_id — target the LARGER one, the node an unbiased election
+  # would not choose.
+  local run2 run3 target
+  run2=$(rcli swo-2 INFO server | tr -d '\r' | grep '^run_id:' | cut -d: -f2)
+  run3=$(rcli swo-3 INFO server | tr -d '\r' | grep '^run_id:' | cut -d: -f2)
+  if [[ "$run2" < "$run3" ]]; then target=swo-3; else target=swo-2; fi
+  note "requesting promotion of ${target} (the run-id tie-break loser)"
+
+  # The POST blocks through the bias-visibility wait (~7-11s) before the 202.
+  local resp
+  resp=$(docker exec "$target" sh -c \
+    "wget -qO- --post-data='' http://127.0.0.1:8080/switchover" 2>/dev/null)
+  echo "$resp" | grep -q '"status":"failover-initiated"' \
+    || { ko "$t" "switchover not accepted: ${resp:-<no 2xx response>}" "$target"; return; }
+
+  wait_for_role_master "$target" 90 || {
+    dump_sentinel_view swo-2 swo-3
+    ko "$t" "the requested node was not the one promoted" swo-1 swo-2 swo-3
+    return
+  }
+
+  # The election bias must not outlive the switchover: the settle watch
+  # restores the pre-bias replica-priority once /role confirms.
+  local i prio=""
+  for i in $(seq 1 90); do
+    prio=$(rcli "$target" CONFIG GET replica-priority | tail -1)
+    [ "$prio" = "100" ] && break
+    sleep 1
+  done
+  [ "$prio" = "100" ] \
+    || { ko "$t" "replica-priority bias not restored (still ${prio})" "$target"; return; }
+
+  wait_for_key "$target" swokey swovalue 30 \
+    || { ko "$t" "seed key lost across the switchover" "$target"; return; }
+  docker rm -f swo-1 swo-2 swo-3 >/dev/null 2>&1
+  ok "$t"
+}
+
 # The planned-shutdown counterpart of t_sentinel_failover: `docker stop`
 # sends SIGTERM (not SIGKILL) and gives the container up to `-t` seconds to
 # exit on its own — exactly the redeploy path `demote_on_shutdown` targets.
@@ -1796,6 +1851,7 @@ ALL_TESTS=(
   t_rewrite_failure_recovers
   t_replication_of_adopted_data
   t_sentinel_failover
+  t_switchover_promotes_requested_node
   t_sigterm_master_demotes_before_exit
   t_restart_old_master_rejoins_as_replica
   t_cold_restart_preserves_promoted_master

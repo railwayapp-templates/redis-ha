@@ -12,12 +12,24 @@
 //!                      clusterWiring.dataNodeSwitchover contract). Sentinel
 //!                      has no "promote node X" command, only "start an
 //!                      election", so this biases the one lever the election
-//!                      reads — this node's own replica-priority — then
-//!                      triggers `SENTINEL FAILOVER` and restores the
+//!                      reads — this node's own replica-priority — waits for
+//!                      the local Sentinel to OBSERVE that bias (Sentinel
+//!                      selects from its cached view of each replica's INFO,
+//!                      refreshed every 10s; a FAILOVER issued before the
+//!                      refresh races it and can promote a different node),
+//!                      then triggers `SENTINEL FAILOVER` and restores the
 //!                      priority once the election settles (or times out).
 //!                      200 = already primary, 202 = election started
-//!                      (confirmation is /role flipping), 409 = a previous
-//!                      switchover is still settling, 503 = refused.
+//!                      (confirmation is /role flipping; the response
+//!                      normally lands ~8-12s after the POST because of the
+//!                      visibility wait — the dashboard's client allows 35s),
+//!                      409 = a previous switchover is still settling,
+//!                      503 = refused.
+//!
+//! The pre-bias priority is stashed in shared state before it is
+//! overwritten, so every path out of a switchover — refusal, the handler
+//! timeout dropping the in-flight future, settle, settle timeout — restores
+//! it exactly once; no path can leave the election bias behind.
 //!
 //! ## What the /role dual check actually fences
 //! `SENTINEL get-master-addr-by-name` answers from the local Sentinel's own
@@ -82,6 +94,12 @@ struct AppState {
     /// Single-flight latch for /switchover: a second promote while the first
     /// election is still settling would fight its priority bias.
     switchover_in_flight: Arc<AtomicBool>,
+    /// The replica-priority to restore after a switchover, stashed BEFORE the
+    /// bias overwrites it so any path out of the attempt — including the
+    /// handler timeout dropping the in-flight future after the CONFIG SET
+    /// already landed — can restore it. `take()`-based so exactly one
+    /// restorer wins.
+    bias_restore: Arc<Mutex<Option<String>>>,
 }
 
 impl AppState {
@@ -99,6 +117,7 @@ impl AppState {
             redis_conn: Arc::new(Mutex::new(None)),
             sentinel_conn: Arc::new(Mutex::new(None)),
             switchover_in_flight: Arc::new(AtomicBool::new(false)),
+            bias_restore: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -272,6 +291,19 @@ const DEFAULT_REPLICA_PRIORITY: &str = "100";
 /// minute of bias left behind is the failure mode being bounded here.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SETTLE_POLL: Duration = Duration::from_secs(1);
+/// How long to wait for the local Sentinel to observe the priority bias
+/// before issuing the FAILOVER. Sentinel refreshes each replica's INFO every
+/// 10s on a healthy cluster (the 1Hz refresh only kicks in once a failover
+/// is already in progress — too late for candidate selection), so one full
+/// cycle plus margin. Measured: the bias becomes visible ~7s after the
+/// CONFIG SET.
+const BIAS_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(15);
+const BIAS_VISIBILITY_POLL: Duration = Duration::from_millis(500);
+/// Outer bound on the synchronous part of /switchover: the visibility wait
+/// (up to 15s) plus the CONFIG and FAILOVER round-trips. The dashboard's
+/// client waits 35s on the POST precisely so a coordinator can block through
+/// its own consensus, so 25s stays comfortably inside it.
+const SWITCHOVER_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// The value half of a `CONFIG GET replica-priority` reply
 /// (`["replica-priority", "<value>"]`), falling back to Redis's default when
@@ -286,10 +318,91 @@ fn priority_from_config_get(reply: &[String]) -> String {
 
 enum SwitchoverOutcome {
     AlreadyPrimary,
-    /// Election triggered; carries the priority to restore once it settles.
-    Initiated {
-        previous_priority: String,
-    },
+    /// Election triggered; the settle watch restores the stashed priority.
+    Initiated,
+}
+
+/// The `slave-priority` this Sentinel currently holds for `host`, from a
+/// `SENTINEL REPLICAS <master>` reply (one flat field/value array per
+/// replica). With announce-hostnames the `ip` field carries the announced
+/// private domain; the `name` field (`host:port`) is the fallback for any
+/// reply shape that differs. Host comparison is the same tolerant
+/// `normalize_host` every node-identity check in this crate uses. Pure and
+/// zero-I/O so the parsing is unit-testable.
+fn observed_priority_for_host(entries: &[Vec<String>], host: &str) -> Option<String> {
+    let wanted = crate::boot_role::normalize_host(host);
+    for entry in entries {
+        let mut fields = std::collections::HashMap::new();
+        for pair in entry.chunks(2) {
+            if let [key, value] = pair {
+                fields.insert(key.as_str(), value.as_str());
+            }
+        }
+        let entry_host = fields.get("ip").copied().or_else(|| {
+            fields
+                .get("name")
+                .map(|name| name.rsplit_once(':').map_or(*name, |(h, _)| h))
+        });
+        let Some(entry_host) = entry_host else {
+            continue;
+        };
+        if crate::boot_role::normalize_host(entry_host) == wanted {
+            return fields.get("slave-priority").map(|p| p.to_string());
+        }
+    }
+    None
+}
+
+/// Wait until the local Sentinel's own cached view reports this node's
+/// replica-priority as [`PROMOTE_PRIORITY`]. `SENTINEL FAILOVER` selects its
+/// candidate from that cache, not from a fresh INFO — issuing it before the
+/// cache catches up races the refresh, and on a tie the election falls back
+/// to replication offset and then run-id, promoting whichever node those
+/// favor instead of this one (measured at ~25% of immediate failovers in a
+/// controlled lab; 0% once the bias was confirmed visible first).
+async fn wait_for_bias_visible(state: &AppState) -> anyhow::Result<()> {
+    let deadline = Instant::now() + BIAS_VISIBILITY_TIMEOUT;
+    loop {
+        if let Some(mut conn) = state.get_sentinel_conn().await {
+            let reply: redis::RedisResult<Vec<Vec<String>>> = redis::cmd("SENTINEL")
+                .arg("REPLICAS")
+                .arg(&state.redis_master_name)
+                .query_async(&mut conn)
+                .await;
+            match reply {
+                Ok(entries) => {
+                    if observed_priority_for_host(&entries, &state.private_domain).as_deref()
+                        == Some(PROMOTE_PRIORITY)
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "switchover: SENTINEL REPLICAS failed while confirming the bias is visible");
+                    *state.sentinel_conn.lock().await = None;
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "sentinel did not observe this node's replica-priority bias within {}s",
+                BIAS_VISIBILITY_TIMEOUT.as_secs()
+            );
+        }
+        sleep(BIAS_VISIBILITY_POLL).await;
+    }
+}
+
+/// Restore the pre-switchover replica-priority stashed in shared state.
+/// `take()` under the lock means exactly one caller restores — the others
+/// see the slot already empty and no-op — so the settle watch, an error
+/// path inside the attempt, and the handler's timeout arm can all call this
+/// unconditionally.
+async fn restore_bias(state: &AppState) {
+    let stashed = state.bias_restore.lock().await.take();
+    if let Some(priority) = stashed {
+        restore_priority(state, &priority).await;
+    }
 }
 
 async fn restore_priority(state: &AppState, priority: &str) {
@@ -331,6 +444,10 @@ async fn initiate_switchover(state: &AppState) -> anyhow::Result<SwitchoverOutco
         .await
         .context("CONFIG GET replica-priority failed")?;
     let previous_priority = priority_from_config_get(&reply);
+    // Stash BEFORE the overwrite: if the handler's timeout drops this future
+    // anywhere past the next command, the timeout arm still knows what to
+    // restore.
+    *state.bias_restore.lock().await = Some(previous_priority);
     redis::cmd("CONFIG")
         .arg("SET")
         .arg("replica-priority")
@@ -339,8 +456,16 @@ async fn initiate_switchover(state: &AppState) -> anyhow::Result<SwitchoverOutco
         .await
         .context("CONFIG SET replica-priority failed")?;
 
+    // The FAILOVER selects from Sentinel's cached view — don't issue it
+    // until that view actually contains the bias, or the election can pick
+    // a different node.
+    if let Err(e) = wait_for_bias_visible(state).await {
+        restore_bias(state).await;
+        return Err(e);
+    }
+
     let Some(mut sentinel_conn) = state.get_sentinel_conn().await else {
-        restore_priority(state, &previous_priority).await;
+        restore_bias(state).await;
         anyhow::bail!("local sentinel unreachable");
     };
     if let Err(e) = redis::cmd("SENTINEL")
@@ -350,16 +475,16 @@ async fn initiate_switchover(state: &AppState) -> anyhow::Result<SwitchoverOutco
         .await
     {
         *state.sentinel_conn.lock().await = None;
-        restore_priority(state, &previous_priority).await;
+        restore_bias(state).await;
         anyhow::bail!("SENTINEL FAILOVER refused: {e}");
     }
-    Ok(SwitchoverOutcome::Initiated { previous_priority })
+    Ok(SwitchoverOutcome::Initiated)
 }
 
 /// Watches the election settle in the background, then restores the priority
 /// and releases the single-flight latch — success or timeout, so a failed
 /// election can't leave a permanent bias (or a wedged latch) behind.
-fn spawn_settle_watch(state: AppState, previous_priority: String) {
+fn spawn_settle_watch(state: AppState) {
     tokio::spawn(async move {
         let deadline = Instant::now() + SETTLE_TIMEOUT;
         let mut promoted = false;
@@ -370,7 +495,7 @@ fn spawn_settle_watch(state: AppState, previous_priority: String) {
                 break;
             }
         }
-        restore_priority(&state, &previous_priority).await;
+        restore_bias(&state).await;
         state.switchover_in_flight.store(false, Ordering::SeqCst);
         if promoted {
             info!("switchover settled: this node is now master");
@@ -390,20 +515,23 @@ async fn switchover(State(state): State<AppState>) -> impl IntoResponse {
             Json(json!({"status": "switchover-in-progress"})),
         );
     }
-    match timeout(Duration::from_secs(5), initiate_switchover(&state)).await {
+    match timeout(SWITCHOVER_TIMEOUT, initiate_switchover(&state)).await {
         Ok(Ok(SwitchoverOutcome::AlreadyPrimary)) => {
             state.switchover_in_flight.store(false, Ordering::SeqCst);
             (StatusCode::OK, Json(json!({"status": "already-primary"})))
         }
-        Ok(Ok(SwitchoverOutcome::Initiated { previous_priority })) => {
+        Ok(Ok(SwitchoverOutcome::Initiated)) => {
             // The latch is released by the settle watch, not here.
-            spawn_settle_watch(state.clone(), previous_priority);
+            spawn_settle_watch(state.clone());
             (
                 StatusCode::ACCEPTED,
                 Json(json!({"status": "failover-initiated"})),
             )
         }
         Ok(Err(e)) => {
+            // The attempt restored the bias on its own way out; this is a
+            // no-op unless it bailed between the stash and its restore.
+            restore_bias(&state).await;
             state.switchover_in_flight.store(false, Ordering::SeqCst);
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -411,9 +539,14 @@ async fn switchover(State(state): State<AppState>) -> impl IntoResponse {
             )
         }
         Err(_) => {
-            state.switchover_in_flight.store(false, Ordering::SeqCst);
+            // The dropped future may have applied the bias and never reached
+            // its own restore — the stash is exactly for this arm. Clear the
+            // possibly-hung connections FIRST so the restore reconnects
+            // fresh instead of blocking on whatever caused the timeout.
             *state.redis_conn.lock().await = None;
             *state.sentinel_conn.lock().await = None;
+            restore_bias(&state).await;
+            state.switchover_in_flight.store(false, Ordering::SeqCst);
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(
@@ -604,6 +737,79 @@ mod answer_confirms_self_tests {
             "redis-2.railway.internal",
             "redis-1.railway.internal"
         ));
+    }
+}
+
+#[cfg(test)]
+mod observed_priority_for_host_tests {
+    use super::*;
+
+    fn entry(pairs: &[(&str, &str)]) -> Vec<String> {
+        pairs
+            .iter()
+            .flat_map(|(k, v)| [k.to_string(), v.to_string()])
+            .collect()
+    }
+
+    #[test]
+    fn reads_priority_by_announced_ip_field() {
+        let entries = vec![
+            entry(&[
+                ("name", "redis-2.railway.internal:6379"),
+                ("ip", "redis-2.railway.internal"),
+                ("slave-priority", "100"),
+            ]),
+            entry(&[
+                ("name", "redis-3.railway.internal:6379"),
+                ("ip", "redis-3.railway.internal"),
+                ("slave-priority", "1"),
+            ]),
+        ];
+        assert_eq!(
+            observed_priority_for_host(&entries, "redis-3.railway.internal"),
+            Some("1".to_string())
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_name_field_host() {
+        let entries = vec![entry(&[
+            ("name", "redis-2.railway.internal:6379"),
+            ("slave-priority", "42"),
+        ])];
+        assert_eq!(
+            observed_priority_for_host(&entries, "redis-2.railway.internal"),
+            Some("42".to_string())
+        );
+    }
+
+    #[test]
+    fn host_comparison_is_normalized() {
+        let entries = vec![entry(&[
+            ("ip", "Redis-2.Railway.Internal."),
+            ("slave-priority", "1"),
+        ])];
+        assert_eq!(
+            observed_priority_for_host(&entries, "redis-2.railway.internal"),
+            Some("1".to_string())
+        );
+    }
+
+    #[test]
+    fn absent_host_is_none() {
+        let entries = vec![entry(&[
+            ("ip", "redis-2.railway.internal"),
+            ("slave-priority", "1"),
+        ])];
+        assert_eq!(
+            observed_priority_for_host(&entries, "redis-3.railway.internal"),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_reply_is_none() {
+        assert_eq!(observed_priority_for_host(&[], "redis-2"), None);
     }
 }
 
