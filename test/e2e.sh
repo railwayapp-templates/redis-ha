@@ -1420,50 +1420,62 @@ t_scale_down_prunes_dead_sentinels() {
 # answering NXDOMAIN for the whole prune dwell waives the majority gate.
 # Modeled here as 5→2: delete 3 of 5 services outright, leaving the master
 # plus one replica — a live minority of the known membership.
+#
+# The node names live under the reserved `.invalid` TLD so a deleted name is
+# NXDOMAIN on ANY resolver: docker's embedded DNS forwards unknown names
+# upstream, and what the upstream answers for a deleted bare container name
+# is environment luck — GitHub runners' resolver answers SERVFAIL (measured
+# via the prune-gate evidence log: `Rcode(2)` continuously), which the
+# waiver rightly treats as a possible partition, wedging this scenario on
+# CI only. A dotted name under `.invalid` resolves normally through the
+# embedded DNS while the container exists, and after deletion the upstream
+# forward hits a TLD that does not exist in the root — authoritative
+# NXDOMAIN everywhere, which is exactly the deletion semantics Railway's
+# own resolver provides in production.
 t_deleted_majority_unfences_via_nxdomain() {
   local t=t_deleted_majority_unfences_via_nxdomain
   local fast=(-e QUORUM_SYNC_POLL_SECONDS=2 -e QUORUM_SYNC_DWELL_SECONDS=5 -e SENTINEL_PRUNE_DWELL_SECONDS=10 -e SENTINEL_PRUNE_BACKOFF_SECONDS=5)
-  local hosts="gone-1:26379,gone-2:26379,gone-3:26379,gone-4:26379,gone-5:26379"
+  local hosts="gone-1.gone.invalid:26379,gone-2.gone.invalid:26379,gone-3.gone.invalid:26379,gone-4.gone.invalid:26379,gone-5.gone.invalid:26379"
   local i
   for i in 1 2 3 4 5; do mkvol "gone-vol-${i}"; done
-  start_node gone-1 gone-vol-1 /data -e SENTINEL_HOSTS="$hosts" "${fast[@]}"
+  start_node gone-1.gone.invalid gone-vol-1 /data -e SENTINEL_HOSTS="$hosts" "${fast[@]}"
   for i in 2 3 4 5; do
-    start_node "gone-${i}" "gone-vol-${i}" /data \
-      -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=gone-1:6379 "${fast[@]}"
+    start_node "gone-${i}.gone.invalid" "gone-vol-${i}" /data \
+      -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=gone-1.gone.invalid:6379 "${fast[@]}"
   done
-  wait_for_role_master gone-1 || { ko "$t" "gone-1 never became master" gone-1; return; }
+  wait_for_role_master gone-1.gone.invalid || { ko "$t" "gone-1.gone.invalid never became master" gone-1.gone.invalid; return; }
 
   # The 5-node fence must be up first, or the test proves nothing. 240s, not
   # 120: five nodes x three processes each converge much slower on a shared
   # CI runner than locally, and this setup gate was the top flake on GH.
   local f
   for i in $(seq 1 240); do
-    f=$(rcli gone-1 CONFIG GET min-replicas-to-write | tail -1)
+    f=$(rcli gone-1.gone.invalid CONFIG GET min-replicas-to-write | tail -1)
     [ "$f" = "2" ] && break
     sleep 1
   done
-  [ "$f" = "2" ] || { ko "$t" "fence never reached 2 before the deletion (got '\''${f}'\'')" gone-1 gone-2 gone-3 gone-4 gone-5; return; }
+  [ "$f" = "2" ] || { ko "$t" "fence never reached 2 before the deletion (got '\''${f}'\'')" gone-1.gone.invalid gone-2.gone.invalid gone-3.gone.invalid gone-4.gone.invalid gone-5.gone.invalid; return; }
 
   # Delete the majority, DNS names and all.
-  docker rm -f gone-3 gone-4 gone-5 >/dev/null 2>&1
+  docker rm -f gone-3.gone.invalid gone-4.gone.invalid gone-5.gone.invalid >/dev/null 2>&1
   docker volume rm -f gone-vol-3 gone-vol-4 gone-vol-5 >/dev/null 2>&1
 
   # One acking replica < fence 2: the master must reject writes first —
   # this is the wedge the waiver exists to resolve.
   local fenced=""
   for i in $(seq 1 60); do
-    rcli gone-1 SET gonekey gonevalue | grep -q NOREPLICAS && { fenced=1; break; }
+    rcli gone-1.gone.invalid SET gonekey gonevalue | grep -q NOREPLICAS && { fenced=1; break; }
     sleep 1
   done
-  [ -n "$fenced" ] || { ko "$t" "master never fenced after losing the majority" gone-1; return; }
+  [ -n "$fenced" ] || { ko "$t" "master never fenced after losing the majority" gone-1.gone.invalid; return; }
 
   # Both survivors independently: serve the sdown dwell, observe continuous
   # NXDOMAIN for the deleted three, waive the majority gate, RESET, and the
   # fence follows the shrunken membership back to 1. Writes resume.
   local n converged
-  for n in gone-1 gone-2; do
+  for n in gone-1.gone.invalid gone-2.gone.invalid; do
     wait_for_log_line "$n" "reset the local sentinel to forget peers down past the dwell" 240 \
-      || { ko "$t" "${n} never pruned the deleted majority" gone-1 gone-2; return; }
+      || { ko "$t" "${n} never pruned the deleted majority" gone-1.gone.invalid gone-2.gone.invalid; return; }
     converged=""
     for i in $(seq 1 120); do
       f=$(rcli "$n" CONFIG GET min-replicas-to-write | tail -1)
@@ -1475,12 +1487,12 @@ t_deleted_majority_unfences_via_nxdomain() {
   done
   local write_ok=""
   for i in $(seq 1 60); do
-    [ "$(rcli gone-1 SET gonekey gonevalue)" = "OK" ] && { write_ok=1; break; }
+    [ "$(rcli gone-1.gone.invalid SET gonekey gonevalue)" = "OK" ] && { write_ok=1; break; }
     sleep 1
   done
-  [ -n "$write_ok" ] || { ko "$t" "writes never resumed after the fence shrank" gone-1; return; }
+  [ -n "$write_ok" ] || { ko "$t" "writes never resumed after the fence shrank" gone-1.gone.invalid; return; }
 
-  docker rm -f gone-1 gone-2 >/dev/null 2>&1
+  docker rm -f gone-1.gone.invalid gone-2.gone.invalid >/dev/null 2>&1
   ok "$t"
 }
 
