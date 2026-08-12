@@ -65,15 +65,16 @@ fail_dump() {
       } | sed 's/^/    /' >&2
     fi
   done
-  # A failed scenario returns without reaching its own cleanup, leaving a
-  # whole cluster (up to 5 nodes x redis+sentinel+wrapper each) running until
-  # the exit trap. Later scenarios then compete with the stragglers for the
-  # runner's CPU — the resource-heavy membership scenarios run last and are
-  # exactly the ones that time out under that load. Remove the dumped
-  # containers now that their logs are captured.
-  for c in "$@"; do
-    docker rm -f "$c" >/dev/null 2>&1
-  done
+  # A failed scenario returns without reaching its own cleanup. Removing only
+  # the containers named for dumping is WORSE than removing nothing: their
+  # freed IPs get recycled to the NEXT scenario's containers while the failed
+  # test's unnamed stragglers keep running, reconnect to the recycled IPs,
+  # and publish sentinel hellos into the new cluster — observed in CI as a
+  # 5-node cluster whose sentinel knew 15 peers and sized its quorum to 9,
+  # fencing every write and cascading the failure through the rest of the
+  # run. The only straggler-proof boundary between scenarios is the same
+  # label-wide sweep the exit trap uses.
+  cleanup_test_resources
 }
 
 # ----- infra -----------------------------------------------------------------
