@@ -56,23 +56,46 @@ pub enum NameVerdict {
     ExistsOrUnknown,
 }
 
+/// What the probe actually observed — the operator-facing detail behind an
+/// [`NameVerdict::ExistsOrUnknown`], which by itself is not actionable when
+/// a prune refuses to arm: "SERVFAIL for 4 minutes" and "resolves fine" call
+/// for opposite responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeDetail {
+    /// The peer is announced by a raw IP literal — never provable as deleted.
+    IpLiteral,
+    /// No `nameserver` entry in resolv.conf.
+    NoResolver,
+    /// No well-formed matching reply within the deadline.
+    Timeout,
+    /// The resolver's RCODE (0 = records/NODATA, 2 = SERVFAIL, 3 = NXDOMAIN,
+    /// 5 = REFUSED, ...).
+    Rcode(u8),
+}
+
 /// Probe `name` against the system resolver, bounding the whole attempt by
 /// `deadline`. Never errors: anything that prevents a verdict is
 /// [`NameVerdict::ExistsOrUnknown`].
 pub async fn probe_name(name: &str, deadline: Duration) -> NameVerdict {
+    probe_name_detailed(name, deadline).await.0
+}
+
+/// [`probe_name`] plus the observed [`ProbeDetail`] for logging.
+pub async fn probe_name_detailed(name: &str, deadline: Duration) -> (NameVerdict, ProbeDetail) {
     // An IP literal is not a name and can never be proven deleted — querying
     // one AS a name would NXDOMAIN unconditionally and fabricate deletion
     // proof. Guards against any peer still announced by raw address (e.g. a
     // Sentinel from an image predating `sentinel announce-ip`).
     if name.parse::<IpAddr>().is_ok() {
-        return NameVerdict::ExistsOrUnknown;
+        return (NameVerdict::ExistsOrUnknown, ProbeDetail::IpLiteral);
     }
     let Some(nameserver) = first_nameserver(&read_resolv_conf()) else {
-        return NameVerdict::ExistsOrUnknown;
+        return (NameVerdict::ExistsOrUnknown, ProbeDetail::NoResolver);
     };
     match timeout(deadline, query_rcode(name, nameserver)).await {
-        Ok(Some(3)) => NameVerdict::Gone,
-        _ => NameVerdict::ExistsOrUnknown,
+        Ok(Some(3)) => (NameVerdict::Gone, ProbeDetail::Rcode(3)),
+        Ok(Some(rcode)) => (NameVerdict::ExistsOrUnknown, ProbeDetail::Rcode(rcode)),
+        _ => (NameVerdict::ExistsOrUnknown, ProbeDetail::Timeout),
     }
 }
 

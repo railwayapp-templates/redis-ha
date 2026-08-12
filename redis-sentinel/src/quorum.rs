@@ -124,6 +124,9 @@ const CALL_DEADLINE: Duration = Duration::from_secs(5);
 // DNS probes are loopback-to-local-resolver; anything slower than this is
 // "no answer", which the verdict already treats as "keep the fence".
 const PROBE_DEADLINE: Duration = Duration::from_secs(3);
+// A held prune is a state, not an event — report it (with the probe
+// evidence) at most this often.
+const GATE_LOG_EVERY_SECS: i64 = 30;
 
 /// The strict majority of a membership of `live_other_sentinels + 1`, or
 /// `None` when this node knows no live peer and must not act.
@@ -352,6 +355,10 @@ struct WatcherState {
     /// time never counts toward the deletion dwell.
     gone_since: std::collections::HashMap<String, i64>,
     last_reset_at: Option<i64>,
+    /// Rate limit for the blocked-prune log below — the gate re-evaluates
+    /// every poll once the dwell is served, and a held prune is a state, not
+    /// an event.
+    last_gate_log_at: Option<i64>,
 }
 
 impl WatcherState {
@@ -749,13 +756,18 @@ async fn prune_dead_sentinels(
     // continuous-NXDOMAIN windows on every poll, not just once the sdown
     // dwell is served — deletion evidence accumulates in parallel with it.
     let mut verdicts = Vec::new();
+    let mut probe_details = Vec::new();
     for peer in peers.iter().filter(|p| p.s_down) {
-        let verdict = if peer.host.is_empty() {
-            crate::dns_probe::NameVerdict::ExistsOrUnknown
+        let (verdict, detail) = if peer.host.is_empty() {
+            (
+                crate::dns_probe::NameVerdict::ExistsOrUnknown,
+                crate::dns_probe::ProbeDetail::IpLiteral,
+            )
         } else {
-            crate::dns_probe::probe_name(&peer.host, PROBE_DEADLINE).await
+            crate::dns_probe::probe_name_detailed(&peer.host, PROBE_DEADLINE).await
         };
         verdicts.push((peer.id.clone(), verdict));
+        probe_details.push((peer, detail));
     }
     step_gone(&verdicts, &mut state.gone_since, now);
 
@@ -773,6 +785,33 @@ async fn prune_dead_sentinels(
         // and a deleted majority (a multi-pair scale-down like 7→3) passes
         // once every missing peer has answered NXDOMAIN for the whole dwell —
         // the one proof that there is no other side to fail over to.
+        //
+        // A held prune is invisible from outside without saying WHY — a
+        // wedge here reads as "never pruned" with no evidence to triage, so
+        // report what every probe actually observed, rate-limited (this
+        // branch re-runs every poll once the dwell is served).
+        let should_log = state
+            .last_gate_log_at
+            .is_none_or(|t| now.saturating_sub(t) >= GATE_LOG_EVERY_SECS);
+        if should_log {
+            let evidence: Vec<String> = probe_details
+                .iter()
+                .map(|(peer, detail)| {
+                    let name = if peer.host.is_empty() { &peer.id } else { &peer.host };
+                    let gone_secs = state
+                        .gone_since
+                        .get(&peer.id)
+                        .map(|since| now.saturating_sub(*since));
+                    format!("{name}: {detail:?}, continuous_gone_secs={gone_secs:?}")
+                })
+                .collect();
+            info!(
+                sdown_peers = ?evidence,
+                prune_dwell_secs = cfg.prune_dwell_secs,
+                "quorum-sync: prune held — survivors are a minority and not every s_down peer is provably deleted"
+            );
+            state.last_gate_log_at = Some(now);
+        }
         return;
     }
     if !master_is_healthy(master_fields) {
