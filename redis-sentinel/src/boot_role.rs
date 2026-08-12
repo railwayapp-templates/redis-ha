@@ -58,10 +58,13 @@
 //! ## Limits
 //! This is local state, not consensus. A node that was *down* for the whole
 //! failover never saw the switch-master event, so its `sentinel.conf` still
-//! names itself and it comes back as a master — Sentinel demotes it within a
-//! failover-timeout, exactly as it does today. What this module fixes is every
-//! case where the node's own Sentinel did observe the switch, which includes
-//! the promoted node itself and any node that outlived the failover.
+//! names itself — that boot is cross-checked against the peer Sentinels
+//! ([`peer_check_self_master`]) and demoted to a replica of whoever they
+//! name, so it never serves as a second master. The residual limit is the
+//! case where no peer answers (whole-cluster cold start, or this node
+//! partitioned from every peer): the boot keeps the master role, exactly as
+//! it did before the cross-check, and Sentinel's higher config epoch demotes
+//! it within a failover-timeout once the partition heals.
 //!
 //! The empty-primary guard only covers a boot that reached the peer query:
 //! a volume that kept its sentinel.conf but lost its dataset resolves
@@ -311,6 +314,12 @@ pub const PEER_BOOT_ENV: &str = "BOOT_ROLE_FROM_PEER_SENTINELS";
 /// pre-#19 behavior.
 pub const MEMBER_PROBE_ENV: &str = "BOOT_ROLE_PROBE_UNDECLARED_MASTER";
 
+/// Kill switch for the peer cross-check on a boot whose local state names
+/// THIS node as master. Same semantics as [`BOOT_ROLE_ENV`]: only the
+/// literal `false` disables it — disabled, a self-is-master sentinel.conf is
+/// trusted as-is, the pre-check behavior.
+pub const SELF_MASTER_PEER_CHECK_ENV: &str = "BOOT_ROLE_SELF_MASTER_PEER_CHECK";
+
 const DEFAULT_PEER_QUERY_TIMEOUT_MS: u64 = 2000;
 
 const DEFAULT_MEMBER_PROBE_TIMEOUT_MS: u64 = 2000;
@@ -519,6 +528,11 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
             }
         }
     };
+    if matches!(resolved, BootMaster::SelfIsMaster) {
+        if let Some(demoted) = peer_check_self_master(config).await {
+            return BootResolution::of(demoted);
+        }
+    }
     if !matches!(resolved, BootMaster::NoLocalState) {
         info!("{}", boot_role_log_line(config, &resolved));
         return BootResolution::of(resolved);
@@ -595,6 +609,91 @@ pub(crate) fn boot_master_from_peer_answer(
         return None;
     }
     Some(BootMaster::ReplicaOf(host, port))
+}
+
+/// What a peer answer means for a boot whose own sentinel.conf names THIS
+/// node as master — the opposite reading from
+/// [`boot_master_from_peer_answer`]: here a peer naming this node CONFIRMS
+/// the local state, and a peer naming another node contradicts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SelfMasterPeerAnswer {
+    ConfirmsSelf,
+    NamesOther(String, u16),
+}
+
+pub(crate) fn classify_self_master_peer_answer(
+    config: &Config,
+    host: String,
+    port: u16,
+) -> SelfMasterPeerAnswer {
+    if addr_is_self(config, &host, port) {
+        SelfMasterPeerAnswer::ConfirmsSelf
+    } else {
+        SelfMasterPeerAnswer::NamesOther(host, port)
+    }
+}
+
+/// Cross-check a self-is-master sentinel.conf against the peer Sentinels
+/// before this boot serves writes. `Some(ReplicaOf)` demotes the boot; `None`
+/// keeps the master role.
+///
+/// This closes the one stale-state case the local file cannot: a master that
+/// was DOWN for the whole failover never saw the `+switch-master`, so its
+/// sentinel.conf still names itself, and it boots as a second master until
+/// the peers' higher config epoch demotes it — observed in production as a
+/// ~10s standalone-master window on a redeployed ex-master, held off the
+/// write path only by the health server's own Sentinel cross-check. Asking
+/// the peers first turns that window into a normal replica boot.
+///
+/// The conservative arm of every outcome keeps today's behavior:
+///   - no peer answers → keep the master role (whole-cluster cold start —
+///     this node may genuinely be the master everyone else is waiting for);
+///   - the majority answer names this node → keep it (a fast restart the
+///     peers never even declared down);
+///   - the answer names a node that is neither declared nor probes as a live
+///     member → keep it (a peer resuming a dead world must not demote us
+///     onto a ghost — the same bar every other peer answer gets).
+///
+/// Only a vetted answer naming another live node demotes the boot. The local
+/// Sentinel still starts off the stale conf, and converges the moment the
+/// peers' hello messages carry their higher config epoch — Redis itself just
+/// never serves as master in the meantime.
+async fn peer_check_self_master(config: &Config) -> Option<BootMaster> {
+    if !enabled(std::env::var(SELF_MASTER_PEER_CHECK_ENV).ok().as_deref()) {
+        return None;
+    }
+    let Some((host, port)) = query_peer_sentinels(config).await else {
+        info!(
+            "sentinel.conf names this node as master and no peer sentinel answered — \
+             keeping the master role"
+        );
+        return None;
+    };
+    match classify_self_master_peer_answer(config, host, port) {
+        SelfMasterPeerAnswer::ConfirmsSelf => {
+            info!("peer sentinels confirm this node as master");
+            None
+        }
+        SelfMasterPeerAnswer::NamesOther(host, port) => {
+            if !master_is_declared(config, &host)
+                && !undeclared_master_is_member(config, &host, port).await
+            {
+                info!(
+                    "peer sentinels name {}:{} as master — outside the declared topology \
+                     and not a live member; keeping the master role from sentinel.conf",
+                    host, port
+                );
+                return None;
+            }
+            info!(
+                "boot role: replica of {}:{} (peer sentinels contradict this node's \
+                 sentinel.conf, which still names this node as master — the failover \
+                 happened while this node was down)",
+                host, port
+            );
+            Some(BootMaster::ReplicaOf(host, port))
+        }
+    }
 }
 
 // ====================================================================
@@ -770,6 +869,47 @@ mod tests {
                 "redis-1.railway.internal".to_string(),
                 6380
             ))
+        );
+    }
+
+    // --- classify_self_master_peer_answer ---
+
+    #[test]
+    fn a_peer_answer_naming_this_node_confirms_the_self_master_boot() {
+        let config = Config::for_tests(); // self = redis-1.railway.internal:6379
+        assert_eq!(
+            classify_self_master_peer_answer(
+                &config,
+                "Redis-1.railway.internal.".to_string(),
+                6379
+            ),
+            SelfMasterPeerAnswer::ConfirmsSelf
+        );
+    }
+
+    #[test]
+    fn a_peer_answer_naming_another_node_contradicts_the_self_master_boot() {
+        let config = Config::for_tests();
+        assert_eq!(
+            classify_self_master_peer_answer(
+                &config,
+                "redis-2.railway.internal".to_string(),
+                6379
+            ),
+            SelfMasterPeerAnswer::NamesOther("redis-2.railway.internal".to_string(), 6379)
+        );
+    }
+
+    #[test]
+    fn a_peer_answer_naming_this_host_on_another_port_contradicts_it_too() {
+        let config = Config::for_tests();
+        assert_eq!(
+            classify_self_master_peer_answer(
+                &config,
+                "redis-1.railway.internal".to_string(),
+                6380
+            ),
+            SelfMasterPeerAnswer::NamesOther("redis-1.railway.internal".to_string(), 6380)
         );
     }
 
