@@ -67,6 +67,17 @@ pub enum TelemetryEvent {
     /// link_heal hit its attempt cap and is leaving the node for a human (or
     /// backboard's redis-ha monitor fallback)
     LinkHealGaveUp { node: String, attempts: u32 },
+
+    /// ghost_master restarted this node through the boot path so the
+    /// boot-time sanitizer can quarantine dead sentinel state
+    GhostMasterRestart {
+        node: String,
+        attempt: u32,
+        master: String,
+    },
+
+    /// ghost_master hit its restart cap and left the node running
+    GhostMasterGaveUp { node: String, attempts: u32 },
 }
 
 impl TelemetryEvent {
@@ -83,6 +94,8 @@ impl TelemetryEvent {
             Self::LinkHealRequestFailed { .. } => "redis_ha.link_heal_request_failed",
             Self::LinkHealRecovered { .. } => "redis_ha.link_heal_recovered",
             Self::LinkHealGaveUp { .. } => "redis_ha.link_heal_gave_up",
+            Self::GhostMasterRestart { .. } => "redis_ha.ghost_master_restart",
+            Self::GhostMasterGaveUp { .. } => "redis_ha.ghost_master_gave_up",
         }
     }
 
@@ -140,6 +153,17 @@ impl TelemetryEvent {
             }
             Self::LinkHealGaveUp { node, attempts } => {
                 format!("{node}: link-heal gave up after {attempts} attempt(s)")
+            }
+            Self::GhostMasterRestart {
+                node,
+                attempt,
+                master,
+            } => format!(
+                "{node}: ghost-master restart {attempt} — sentinel consensus names {master} \
+                 and no member is master"
+            ),
+            Self::GhostMasterGaveUp { node, attempts } => {
+                format!("{node}: ghost-master gave up after {attempts} restart(s)")
             }
         }
     }
@@ -362,6 +386,15 @@ mod tests {
             TelemetryEvent::LinkHealGaveUp {
                 node: "redis-3".into(),
                 attempts: 5,
+            },
+            TelemetryEvent::GhostMasterRestart {
+                node: "redis-1".into(),
+                attempt: 1,
+                master: "ghost.example.internal:6379".into(),
+            },
+            TelemetryEvent::GhostMasterGaveUp {
+                node: "redis-1".into(),
+                attempts: 1,
             },
         ]
     }

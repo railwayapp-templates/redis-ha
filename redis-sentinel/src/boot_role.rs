@@ -343,7 +343,17 @@ const DEFAULT_MEMBER_PROBE_TIMEOUT_MS: u64 = 2000;
 /// the quarantine. Two attempts, because boot is exactly when a peer
 /// container may be mid-restart and one refused handshake must not condemn
 /// a live member.
-async fn undeclared_master_is_member(config: &Config, host: &str, port: u16) -> bool {
+///
+/// `pub(crate)`: the ghost-master watcher applies this same discriminator
+/// at runtime, so a scaled-up master the env undercounts is preserved
+/// there under exactly the rules it gets here. Takes the shared password
+/// rather than the whole `Config` because that is the one input the probe
+/// reads.
+pub(crate) async fn undeclared_master_is_member(
+    redis_password: &str,
+    host: &str,
+    port: u16,
+) -> bool {
     use common::ConfigExt;
 
     if !enabled(std::env::var(MEMBER_PROBE_ENV).ok().as_deref()) {
@@ -353,7 +363,7 @@ async fn undeclared_master_is_member(config: &Config, host: &str, port: u16) -> 
         "UNDECLARED_MASTER_PROBE_TIMEOUT_MS",
         DEFAULT_MEMBER_PROBE_TIMEOUT_MS,
     ));
-    let url = crate::sentinel_query::build_redis_url(host, port, &config.redis_password);
+    let url = crate::sentinel_query::build_redis_url(host, port, redis_password);
     for _ in 0..2 {
         if crate::sentinel_query::authenticated_ping(&url, deadline).await {
             return true;
@@ -515,7 +525,7 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
     let resolved = match classify_local_state(config) {
         LocalSentinelState::Usable(resolved) => resolved,
         LocalSentinelState::UndeclaredMaster(host, port) => {
-            if undeclared_master_is_member(config, &host, port).await {
+            if undeclared_master_is_member(&config.redis_password, &host, port).await {
                 info!(
                     "sentinel.conf names {}:{} — outside the declared topology, but it \
                      authenticates as a live member of this cluster (scaled-up membership); \
@@ -548,7 +558,7 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
             // cluster (a failover onto a scale-up node the env topology
             // never learned about).
             if !master_is_declared(config, &host)
-                && !undeclared_master_is_member(config, &host, port).await
+                && !undeclared_master_is_member(&config.redis_password, &host, port).await
             {
                 info!(
                     "peer sentinels name {}:{} as master — outside the declared topology \
@@ -676,7 +686,7 @@ async fn peer_check_self_master(config: &Config) -> Option<BootMaster> {
         }
         SelfMasterPeerAnswer::NamesOther(host, port) => {
             if !master_is_declared(config, &host)
-                && !undeclared_master_is_member(config, &host, port).await
+                && !undeclared_master_is_member(&config.redis_password, &host, port).await
             {
                 info!(
                     "peer sentinels name {}:{} as master — outside the declared topology \
