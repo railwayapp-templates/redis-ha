@@ -116,6 +116,13 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&config.data_dir)
         .context("failed to create data directory")?;
 
+    // At most one container runs against this dataset at a time: wait for a
+    // previous container's supervisor to release the volume before reading
+    // or writing anything under it (see volume_lock for the overlap
+    // rationale). Fail-stop on timeout — the restart policy retries the
+    // boot; two engines on one dataset is the outcome that must not happen.
+    redis_sentinel::volume_lock::acquire_volume_runtime_lock(&config.data_dir)?;
+
     // Who is master right now, according to the best record available at
     // boot: the sentinel.conf Sentinel itself rewrites after every failover,
     // or — on a first boot with no local state — the answer of the peer
