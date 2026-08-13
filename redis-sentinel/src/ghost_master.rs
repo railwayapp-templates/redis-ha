@@ -17,32 +17,47 @@
 //! majority to agree a REAL member failed — a ghost is not a member).
 //!
 //! ## Detection
-//! Poll-driven, mirroring `link_heal`/`quorum`. A poll confirms the ghost
-//! condition only when ALL of these hold:
+//! Poll-driven, mirroring `link_heal`/`quorum`. Every confirming poll
+//! requires ALL of these:
 //!  - the LOCAL Sentinel's `get-master-addr-by-name` names an address that
 //!    is outside the declared topology (`boot_role::master_is_declared`) —
 //!    the cheap pre-filter that keeps the healthy-cluster poll to one local
 //!    round-trip;
-//!  - a strict majority of the Sentinel membership (the declared
-//!    `SENTINEL_HOSTS` peers united with the peers the local Sentinel
-//!    currently knows — the union covers scale-ups the env never learned
-//!    about) answers with that SAME address: quorum consensus, never one
-//!    Sentinel's view. Fewer answers than a majority — a partitioned
-//!    minority, a lone node, unreachable peers — fails closed;
-//!  - the named address fails the authenticated live-member probe
+//!  - that address fails the authenticated live-member probe
 //!    (`boot_role::undeclared_master_is_member`): the same discriminator
 //!    the boot path uses, so a failover onto a scaled-up member the env
 //!    undercounts is preserved here exactly as it is at boot;
 //!  - the local Sentinel reports no failover in progress (an unreadable
 //!    flags reply also fails closed);
-//!  - no data node of the consensus-named world reports `role:master`: not
-//!    this node, not any replica the local Sentinel lists, and not the
-//!    named master itself (already covered — a live master answers the
-//!    membership probe). A master OUTSIDE that world is deliberately not a
-//!    veto: it is what a peer that already self-healed re-founds, and the
-//!    remaining ghost-world nodes re-attach to it precisely by restarting.
+//!  - the local Redis does not itself hold the master role;
+//!  - a strict majority of the Sentinel membership (the declared
+//!    `SENTINEL_HOSTS` peers united with the peers the local Sentinel
+//!    currently knows — the union covers scale-ups the env never learned
+//!    about) is readable and agrees on one master address: quorum
+//!    consensus, never one Sentinel's view. Fewer answers than a majority —
+//!    a partitioned minority, a lone node, unreachable peers — fails
+//!    closed.
 //!
-//! The full condition must hold on every consecutive poll for the dwell —
+//! What that consensus names decides which wedge this is:
+//!  - **Consensus names the same ghost.** The whole world is headless. It
+//!    confirms only if no data node of that world reports `role:master`
+//!    either — the named master is dead (the membership probe just
+//!    failed), this node is not master, and every replica the local
+//!    Sentinel lists is probed; a master among them means a recovery is
+//!    already under way.
+//!  - **Consensus names a real member (declared, or live under the shared
+//!    password) that disagrees with the local Sentinel.** This node is
+//!    provably wedged on a ghost world the quorum has already left — the
+//!    tail of this watcher's own staggered recovery, or a lone node that
+//!    resumed dead state into an otherwise healthy cluster. Nothing else
+//!    re-anchors it: Sentinel cannot fix a replica it cannot discover, and
+//!    every local watcher's fix target — the local Sentinel's answer — IS
+//!    the ghost. The healthy master is expected here, not a veto; the
+//!    restart is what re-attaches this node to it. A consensus master that
+//!    is neither declared nor live proves nothing, and ambiguity fails
+//!    closed.
+//!
+//! The condition must hold on every consecutive poll for the dwell —
 //! any poll that fails to re-confirm (including fail-closed ambiguity)
 //! clears the window, so a normal failover, a boot transient, or a
 //! partition can never accrue toward a restart. The window lives in
@@ -338,6 +353,12 @@ enum Verdict {
     Clear(&'static str),
     Confirmed {
         master: (String, u16),
+        /// Which wedge this poll saw (see the module doc): the whole quorum
+        /// naming the ghost, or this node alone wedged outside a live
+        /// consensus. Both count toward the same window — the second is
+        /// what the first turns into as peers heal — so this is for the
+        /// logs, never for the dwell.
+        shape: &'static str,
     },
 }
 
@@ -409,7 +430,7 @@ async fn observe(ctx: &WatcherContext) -> Verdict {
             .await
         });
     }
-    let mut answers: Vec<(String, u16)> = vec![local_answer];
+    let mut answers: Vec<(String, u16)> = vec![local_answer.clone()];
     while let Some(joined) = set.join_next().await {
         if let Ok(Some(answer)) = joined {
             answers.push(answer);
@@ -418,25 +439,23 @@ async fn observe(ctx: &WatcherContext) -> Verdict {
     let Some(consensus) = consensus_answer(&answers, membership) else {
         return Verdict::Clear("no quorum consensus on the master address");
     };
-    if (normalize_host(&consensus.0), consensus.1) != local_key {
-        // The majority sees a different world than this node's own Sentinel
-        // — whatever is wrong here, restarting THIS node is not the cure.
-        return Verdict::Clear("consensus disagrees with the local sentinel");
-    }
 
     // The boot path's own discriminator, unchanged: an address that
     // authenticates with the cluster's shared password is a live member —
     // the scaled-up master the declared topology undercounts — and must
     // never be treated as a ghost.
-    if crate::boot_role::undeclared_master_is_member(&ctx.redis_password, &consensus.0, consensus.1)
-        .await
+    if crate::boot_role::undeclared_master_is_member(
+        &ctx.redis_password,
+        &local_answer.0,
+        local_answer.1,
+    )
+    .await
     {
-        return Verdict::Clear("consensus master is a live cluster member");
+        return Verdict::Clear("named master is a live cluster member");
     }
 
-    // No data node of this world may hold the master role: this node
-    // itself, or any replica the local Sentinel lists. (The consensus
-    // master is already covered — a live one passes the membership probe.)
+    // Never restart a node that is itself serving as master, whatever the
+    // sentinels think.
     let Some(mut redis_conn) = sentinel_query::connect(&ctx.redis_url, CALL_DEADLINE).await else {
         return Verdict::Clear("local redis unreachable");
     };
@@ -452,6 +471,43 @@ async fn observe(ctx: &WatcherContext) -> Verdict {
         Ok(Ok(_)) => return Verdict::Clear("this node is master"),
         _ => return Verdict::Clear("local replication info unreadable"),
     }
+
+    if (normalize_host(&consensus.0), consensus.1) != local_key {
+        // The majority sees a different master than this node's own
+        // Sentinel. When that consensus master is real — a declared member,
+        // or a live one the declared topology undercounts — this node is
+        // provably wedged on a ghost world the rest of the cluster has
+        // already left (the tail of a staggered recovery, or a lone node
+        // that resumed dead state into an otherwise healthy cluster).
+        // Nothing else re-anchors it: Sentinel cannot fix a replica it
+        // cannot discover, and the local watchers' fix target — the local
+        // Sentinel's answer — IS the ghost. The healthy master here is
+        // expected, not a veto; the restart is what re-attaches this node
+        // to it. A consensus master that is neither declared nor live says
+        // nothing trustworthy, and ambiguity fails closed.
+        let consensus_is_declared = ctx.declared_hosts.contains(&normalize_host(&consensus.0));
+        if consensus_is_declared
+            || crate::boot_role::undeclared_master_is_member(
+                &ctx.redis_password,
+                &consensus.0,
+                consensus.1,
+            )
+            .await
+        {
+            return Verdict::Confirmed {
+                master: local_answer,
+                shape: "wedged outside a live consensus",
+            };
+        }
+        return Verdict::Clear("consensus names neither this node's master nor a live member");
+    }
+
+    // The whole world agrees on the ghost. The condition is only a wedge if
+    // no data node of that world holds the master role: this node was
+    // checked above, the consensus master is dead (the membership probe
+    // just failed), and the replicas the local Sentinel lists are probed
+    // here. A master among them means some recovery is already under way —
+    // leave it alone.
     let replicas: Vec<(String, u16)> = match redis::cmd("SENTINEL")
         .arg("replicas")
         .arg(&ctx.master_name)
@@ -480,7 +536,10 @@ async fn observe(ctx: &WatcherContext) -> Verdict {
         }
     }
 
-    Verdict::Confirmed { master: consensus }
+    Verdict::Confirmed {
+        master: local_answer,
+        shape: "quorum consensus names the ghost",
+    }
 }
 
 // ====================================================================
@@ -504,16 +563,17 @@ async fn iteration(ctx: &WatcherContext, state: &mut WatcherState, cfg: &Watcher
             state.ghost_since = None;
             state.gave_up_emitted = false;
         }
-        Verdict::Confirmed { master } => {
+        Verdict::Confirmed { master, shape } => {
             let since = *state.ghost_since.get_or_insert_with(|| {
                 info!(
                     master = %format!("{}:{}", master.0, master.1),
+                    shape,
                     rank = ctx.rank,
                     hold_secs =
                         cfg.thresholds.dwell_secs
                             + u64::from(ctx.rank) * cfg.thresholds.stagger_secs,
-                    "ghost-master: sentinel consensus names a master that is not a live \
-                     cluster member and no member is master — dwell started"
+                    "ghost-master: sentinel state names a master that is not a live \
+                     cluster member — dwell started"
                 );
                 now
             });
@@ -542,6 +602,7 @@ async fn iteration(ctx: &WatcherContext, state: &mut WatcherState, cfg: &Watcher
                     append_restart_marker(&ctx.state_path, now);
                     warn!(
                         master = %master,
+                        shape,
                         ghost_for_secs,
                         attempt,
                         "ghost-master: restarting through the boot path so the boot-time \
@@ -552,10 +613,8 @@ async fn iteration(ctx: &WatcherContext, state: &mut WatcherState, cfg: &Watcher
                         attempt,
                         master: master.clone(),
                     });
-                    let reason = format!(
-                        "ghost master {master} held for {ghost_for_secs}s with no live master \
-                         anywhere"
-                    );
+                    let reason =
+                        format!("ghost master {master} held for {ghost_for_secs}s ({shape})");
                     if ctx.restart_tx.send(reason).await.is_err() {
                         warn!("ghost-master: restart request could not be delivered");
                     }

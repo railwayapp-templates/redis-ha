@@ -1791,6 +1791,12 @@ t_ghost_selfheal_ignores_normal_failover() {
 # says ghost, and it still must not restart, because a lone node's view is
 # exactly what a partition fakes. The reachable majority keeps its real
 # master, keeps taking writes, and must not restart either.
+#
+# Then the flip side: the moment the partition closes and quorum consensus
+# is readable again — naming a real declared member the wedged node's own
+# sentinel disagrees with — the node re-anchors ITSELF: restart, sanitizer,
+# rejoin. Nothing else could; its local sentinel's answer, the fix target
+# every local watcher trusts, is the ghost itself.
 t_ghost_selfheal_fails_closed_on_isolated_minority() {
   local t=t_ghost_selfheal_fails_closed_on_isolated_minority
   local fast=(--restart on-failure -e GHOST_MASTER_POLL_SECONDS=1 -e GHOST_MASTER_DWELL_SECONDS=5 -e GHOST_MASTER_STAGGER_SECONDS=5)
@@ -1827,7 +1833,23 @@ t_ghost_selfheal_fails_closed_on_isolated_minority() {
   write_key iso-1 isokey isovalue \
     || { ko "$t" "majority side stopped accepting writes" iso-1; return; }
 
+  # Heal the partition; with consensus readable again the wedged node must
+  # self-restart through the boot path and re-attach to the real master.
   docker network connect "$NET" iso-3 --alias iso-3 >/dev/null 2>&1
+  local i restarted=""
+  for i in $(seq 1 90); do
+    [ "$(docker inspect -f '{{.RestartCount}}' iso-3)" -ge 1 ] 2>/dev/null && { restarted=1; break; }
+    sleep 1
+  done
+  [ -n "$restarted" ] \
+    || { ko "$t" "iso-3 never healed itself once the partition closed" iso-3; return; }
+  wait_for_log_line iso-3 "moved ghost sentinel.conf aside" 60 \
+    || { ko "$t" "boot sanitizer never ran on the rejoining node" iso-3; return; }
+  wait_for_replica_repointed iso-3 iso-1 120 \
+    || { ko "$t" "iso-3 never re-attached to the real master" iso-3 iso-1; return; }
+  wait_for_key iso-3 isokey isovalue \
+    || { ko "$t" "iso-3 never resynced after healing itself" iso-3 iso-1; return; }
+
   docker rm -f iso-1 iso-2 iso-3 >/dev/null 2>&1
   ok "$t"
 }
