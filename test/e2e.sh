@@ -14,8 +14,10 @@
 # HA), surviving the CONFIG SET → manifest-commit crash window, following the
 # volume mount path, and Sentinel failover preserving adopted data — plus the
 # live-traffic contracts: conversion and failover under a continuously
-# writing client (through the real HAProxy edge for the failover case), and
-# maxmemory pressure degrading writes without destabilizing the cluster.
+# writing client (through the real HAProxy edge for the failover case),
+# maxmemory pressure degrading writes without destabilizing the cluster, and
+# the in-image self-heal contract that a ghost-mastered cluster restarts
+# itself back to writable with no external actor.
 
 set -uo pipefail
 
@@ -1632,6 +1634,226 @@ t_link_heal_repoints_wrong_master_attachment() {
   ok "$t"
 }
 
+# The runtime ghost-master wedge: every sentinel's consensus names a master
+# that no longer exists while no data node holds the master role — the state
+# a volume reused across a template revert resumes, manufactured live here
+# by repointing every sentinel at a soon-deleted host and demoting the
+# master onto it. The cluster is unwritable and Sentinel can never elect a
+# way out (a ghost is not a member whose failure a majority can agree on).
+# With NO external action after the manufacture, the wrappers themselves
+# must detect it on quorum consensus, restart through the boot path — root
+# first, replicas on staggered clocks — let the boot-time sanitizer
+# quarantine the ghost state, and re-form a writable cluster with the
+# dataset intact. Restart policy is on-failure: the wrapper's exit code on
+# this path must be non-zero or the container would simply strand stopped.
+t_ghost_master_selfheal_restores_writes() {
+  local t=t_ghost_master_selfheal_restores_writes
+  local fast=(--restart on-failure -e GHOST_MASTER_POLL_SECONDS=2 -e GHOST_MASTER_DWELL_SECONDS=10 -e GHOST_MASTER_STAGGER_SECONDS=25)
+  start_ha_trio ghostm "${fast[@]}" \
+    || { ko "$t" "trio never became failover-ready" ghostm-1 ghostm-2 ghostm-3; return; }
+  write_key ghostm-1 ghostkey ghostvalue || { ko "$t" "seed write failed" ghostm-1; return; }
+  wait_for_key ghostm-2 ghostkey ghostvalue || { ko "$t" "ghostm-2 never synced" ghostm-1 ghostm-2; return; }
+  wait_for_key ghostm-3 ghostkey ghostvalue || { ko "$t" "ghostm-3 never synced" ghostm-1 ghostm-3; return; }
+
+  # The ghost must resolve while the sentinels adopt it (SENTINEL MONITOR
+  # validates the address at command time) and be deleted afterwards — a
+  # dotted name under .invalid so the deleted name is authoritative
+  # NXDOMAIN on any resolver (see t_deleted_majority_unfences_via_nxdomain).
+  docker run -d --name ghostm-x --label "$LABEL" --network "$NET" \
+    --network-alias ghostm-x.gone.invalid alpine:latest sleep 600 >/dev/null
+
+  # Every sentinel first — while the master set is being repointed no
+  # sentinel monitors the real master anymore, so nothing re-promotes it or
+  # fixes its replication target when it is demoted right after.
+  local n
+  for n in ghostm-1 ghostm-2 ghostm-3; do
+    scli "$n" SENTINEL REMOVE mymaster >/dev/null
+    scli "$n" SENTINEL MONITOR mymaster ghostm-x.gone.invalid 6379 2 >/dev/null
+  done
+  rcli ghostm-1 REPLICAOF ghostm-x.gone.invalid 6379 >/dev/null
+  docker rm -f ghostm-x >/dev/null 2>&1
+
+  # The wedge is real before anything may heal it: no node holds the master
+  # role and writes are refused everywhere.
+  local i wedged=""
+  for i in $(seq 1 30); do
+    [ "$(redis_role ghostm-1)" = "slave" ] \
+      && rcli ghostm-1 SET wedgeprobe v | grep -q "READONLY" \
+      && { wedged=1; break; }
+    sleep 1
+  done
+  [ -n "$wedged" ] \
+    || { ko "$t" "manufacture failed: a master remains or writes still land" ghostm-1 ghostm-2 ghostm-3; return; }
+
+  # Root first: the env-primary restarts alone, and at that moment neither
+  # replica may have fired — each higher seed rank holds one more stagger.
+  local restarted=""
+  for i in $(seq 1 90); do
+    [ "$(docker inspect -f '{{.RestartCount}}' ghostm-1)" -ge 1 ] 2>/dev/null && { restarted=1; break; }
+    sleep 1
+  done
+  [ -n "$restarted" ] || { ko "$t" "root wrapper never self-restarted" ghostm-1 ghostm-2 ghostm-3; return; }
+  [ "$(docker inspect -f '{{.RestartCount}}' ghostm-2)" = "0" ] \
+    || { ko "$t" "ghostm-2 restarted before (or with) the root — stagger broken" ghostm-2; return; }
+  [ "$(docker inspect -f '{{.RestartCount}}' ghostm-3)" = "0" ] \
+    || { ko "$t" "ghostm-3 restarted before (or with) the root — stagger broken" ghostm-3; return; }
+
+  # The restart was the watcher's decision, not a crash...
+  docker logs ghostm-1 2>&1 | grep -F "ghost-master: restarting through the boot path" >/dev/null \
+    || { ko "$t" "root restart was not the ghost-master watcher's decision" ghostm-1; return; }
+  # ...and the cure is the existing boot-time sanitizer: the ghost state is
+  # quarantined on the volume (preserved, never deleted).
+  wait_for_log_line ghostm-1 "moved ghost sentinel.conf aside" 60 \
+    || { ko "$t" "boot sanitizer never quarantined the root's ghost state" ghostm-1; return; }
+  docker run --rm -v ghostm-vol-1:/v alpine:latest sh -c 'ls /v/sentinel.conf.ghost-*' >/dev/null 2>&1 \
+    || { ko "$t" "quarantined sentinel.conf missing from the root volume" ghostm-1; return; }
+
+  # Replicas follow on their own staggered clocks and get the same cure.
+  local ok_restart
+  for n in ghostm-2 ghostm-3; do
+    ok_restart=""
+    for i in $(seq 1 120); do
+      [ "$(docker inspect -f '{{.RestartCount}}' "$n")" -ge 1 ] 2>/dev/null && { ok_restart=1; break; }
+      sleep 1
+    done
+    [ -n "$ok_restart" ] || { ko "$t" "${n} never self-restarted" "$n"; return; }
+    wait_for_log_line "$n" "moved ghost sentinel.conf aside" 60 \
+      || { ko "$t" "boot sanitizer never ran on ${n}" "$n"; return; }
+  done
+
+  # Convergence with zero external action: a sentinel-confirmed master,
+  # both replicas re-attached, writes flowing, dataset intact.
+  wait_for_role_master ghostm-1 120 \
+    || { ko "$t" "no sentinel-confirmed master re-formed" ghostm-1 ghostm-2 ghostm-3; return; }
+  wait_for_replica_repointed ghostm-2 ghostm-1 120 \
+    || { ko "$t" "ghostm-2 never re-attached to the re-founded master" ghostm-2 ghostm-1; return; }
+  wait_for_replica_repointed ghostm-3 ghostm-1 120 \
+    || { ko "$t" "ghostm-3 never re-attached to the re-founded master" ghostm-3 ghostm-1; return; }
+  write_key ghostm-1 healedkey healedvalue 30 \
+    || { ko "$t" "writes never resumed after the self-heal" ghostm-1; return; }
+  wait_for_key ghostm-2 healedkey healedvalue \
+    || { ko "$t" "post-heal write never replicated" ghostm-1 ghostm-2; return; }
+  [ "$(rcli ghostm-1 GET ghostkey)" = "ghostvalue" ] \
+    || { ko "$t" "pre-wedge data lost across the self-heal" ghostm-1; return; }
+
+  # The persisted cap held: exactly one self-restart per node, even though
+  # each node kept observing the condition until its peers converged.
+  for n in ghostm-1 ghostm-2 ghostm-3; do
+    [ "$(docker inspect -f '{{.RestartCount}}' "$n")" = "1" ] \
+      || { ko "$t" "${n} restarted more than once — the persisted cap failed" "$n"; return; }
+  done
+
+  docker rm -f ghostm-1 ghostm-2 ghostm-3 >/dev/null 2>&1
+  ok "$t"
+}
+
+# Guard: an ordinary unplanned failover must never read as a ghost master.
+# Throughout the election the consensus answer names a real declared member
+# (first the dead master, then the promoted replica), so the watcher —
+# running with a dwell short enough that any false positive would fire well
+# inside this scenario — must never open a dwell, let alone restart.
+t_ghost_selfheal_ignores_normal_failover() {
+  local t=t_ghost_selfheal_ignores_normal_failover
+  local fast=(--restart on-failure -e GHOST_MASTER_POLL_SECONDS=1 -e GHOST_MASTER_DWELL_SECONDS=5 -e GHOST_MASTER_STAGGER_SECONDS=5)
+  start_ha_trio nogho "${fast[@]}" \
+    || { ko "$t" "trio never became failover-ready" nogho-1 nogho-2 nogho-3; return; }
+  local promoted
+  promoted=$(promote_by_pausing nogho-1 nogho-2 nogho-3) || {
+    dump_sentinel_view nogho-2 nogho-3
+    ko "$t" "no replica was promoted" nogho-2 nogho-3
+    return
+  }
+  note "promoted: ${promoted}"
+
+  # The longest hold in this cluster is dwell + 3×stagger = 20s; double it
+  # so a false positive on ANY rank would have fired and restarted by now.
+  sleep 45
+
+  local n
+  for n in nogho-2 nogho-3; do
+    [ "$(docker inspect -f '{{.RestartCount}}' "$n")" = "0" ] \
+      || { ko "$t" "${n} self-restarted across a normal failover" "$n"; return; }
+    docker logs "$n" 2>&1 | grep -F "ghost-master: restarting" >/dev/null \
+      && { ko "$t" "${n} decided to restart across a normal failover" "$n"; return; }
+    docker logs "$n" 2>&1 | grep -F "ghost-master: sentinel consensus names" >/dev/null \
+      && { ko "$t" "${n} opened a ghost dwell across a normal failover" "$n"; return; }
+  done
+
+  docker unpause nogho-1 >/dev/null 2>&1
+  docker rm -f nogho-1 nogho-2 nogho-3 >/dev/null 2>&1
+  ok "$t"
+}
+
+# Guard: quorum consensus is the license to act, and a node that cannot
+# read it must fail closed. The isolated node gets the WORST local view —
+# its own sentinel repointed at a ghost address, its redis replicating that
+# ghost — while cut off from every peer: everything its local world can see
+# says ghost, and it still must not restart, because a lone node's view is
+# exactly what a partition fakes. The reachable majority keeps its real
+# master, keeps taking writes, and must not restart either.
+#
+# Then the flip side: the moment the partition closes and quorum consensus
+# is readable again — naming a real declared member the wedged node's own
+# sentinel disagrees with — the node re-anchors ITSELF: restart, sanitizer,
+# rejoin. Nothing else could; its local sentinel's answer, the fix target
+# every local watcher trusts, is the ghost itself.
+t_ghost_selfheal_fails_closed_on_isolated_minority() {
+  local t=t_ghost_selfheal_fails_closed_on_isolated_minority
+  local fast=(--restart on-failure -e GHOST_MASTER_POLL_SECONDS=1 -e GHOST_MASTER_DWELL_SECONDS=5 -e GHOST_MASTER_STAGGER_SECONDS=5)
+  start_ha_trio iso "${fast[@]}" \
+    || { ko "$t" "trio never became failover-ready" iso-1 iso-2 iso-3; return; }
+
+  docker network disconnect "$NET" iso-3 >/dev/null 2>&1
+  wait_for_partition iso-1 iso-3 \
+    || { ko "$t" "iso-3 was not actually unreachable after disconnect" iso-1 iso-3; return; }
+
+  # Doctor the victim's local state over docker exec (loopback still works
+  # off-network). An IP-literal ghost on purpose: the disconnected container
+  # has no DNS for SENTINEL MONITOR's command-time validation, and doctoring
+  # after the disconnect is what keeps the majority's sentinels from
+  # spotting and fixing the wrong replication target before the test starts.
+  scli iso-3 SENTINEL REMOVE mymaster >/dev/null
+  scli iso-3 SENTINEL MONITOR mymaster 192.0.2.9 6379 2 >/dev/null
+  rcli iso-3 REPLICAOF 192.0.2.9 6379 >/dev/null
+  [ "$(master_host_of iso-3)" = "192.0.2.9" ] \
+    || { ko "$t" "fault injection did not take on iso-3" iso-3; return; }
+
+  # Same budget as the failover guard: any false positive fires inside it.
+  sleep 45
+
+  [ "$(docker inspect -f '{{.RestartCount}}' iso-3)" = "0" ] \
+    || { ko "$t" "the isolated node self-restarted without quorum consensus" iso-3; return; }
+  docker logs iso-3 2>&1 | grep -F "ghost-master: restarting" >/dev/null \
+    && { ko "$t" "the isolated node decided to restart without quorum consensus" iso-3; return; }
+  local n
+  for n in iso-1 iso-2; do
+    [ "$(docker inspect -f '{{.RestartCount}}' "$n")" = "0" ] \
+      || { ko "$t" "${n} self-restarted while the cluster had a live master" "$n"; return; }
+  done
+  write_key iso-1 isokey isovalue \
+    || { ko "$t" "majority side stopped accepting writes" iso-1; return; }
+
+  # Heal the partition; with consensus readable again the wedged node must
+  # self-restart through the boot path and re-attach to the real master.
+  docker network connect "$NET" iso-3 --alias iso-3 >/dev/null 2>&1
+  local i restarted=""
+  for i in $(seq 1 90); do
+    [ "$(docker inspect -f '{{.RestartCount}}' iso-3)" -ge 1 ] 2>/dev/null && { restarted=1; break; }
+    sleep 1
+  done
+  [ -n "$restarted" ] \
+    || { ko "$t" "iso-3 never healed itself once the partition closed" iso-3; return; }
+  wait_for_log_line iso-3 "moved ghost sentinel.conf aside" 60 \
+    || { ko "$t" "boot sanitizer never ran on the rejoining node" iso-3; return; }
+  wait_for_replica_repointed iso-3 iso-1 120 \
+    || { ko "$t" "iso-3 never re-attached to the real master" iso-3 iso-1; return; }
+  wait_for_key iso-3 isokey isovalue \
+    || { ko "$t" "iso-3 never resynced after healing itself" iso-3 iso-1; return; }
+
+  docker rm -f iso-1 iso-2 iso-3 >/dev/null 2>&1
+  ok "$t"
+}
+
 # Every sentinel.conf freezes the quorum its first boot computed, and a
 # preserved conf never rereads the restamped env — after a 3→5 scale the old
 # nodes kept quorum 2 while the new ones wrote 3. The quorum-sync watcher
@@ -2369,6 +2591,9 @@ ALL_TESTS=(
   t_link_heal_recovers_from_partition_during_failover
   t_new_node_boot_asks_peer_sentinels
   t_link_heal_repoints_wrong_master_attachment
+  t_ghost_master_selfheal_restores_writes
+  t_ghost_selfheal_ignores_normal_failover
+  t_ghost_selfheal_fails_closed_on_isolated_minority
   t_quorum_follows_registered_membership
   t_scale_down_prunes_dead_sentinels
   t_deleted_majority_unfences_via_nxdomain

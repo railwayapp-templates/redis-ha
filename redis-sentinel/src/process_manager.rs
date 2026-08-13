@@ -206,14 +206,25 @@ pub async fn spawn_sentinel(data_dir: &str) -> Result<Child> {
 
 /// Run the supervisor loop.
 ///
-/// Waits for either child to exit or for a termination signal. On SIGTERM/SIGINT,
-/// a colocated master first gets a chance to trigger its own failover
-/// (`demote_on_shutdown`) before both children are forwarded the signal and we
-/// wait briefly before exiting.
+/// Waits for either child to exit, for a termination signal, or for a
+/// self-heal restart request. On SIGTERM/SIGINT, a colocated master first
+/// gets a chance to trigger its own failover (`demote_on_shutdown`) before
+/// both children are forwarded the signal and we wait briefly before
+/// exiting.
+///
+/// `restart_rx` is how an in-process watcher (the ghost-master watcher)
+/// asks for a restart through the boot path: the children are shut down
+/// gracefully and the process exits NON-zero, because the restart is a
+/// recovery action — under an on-failure restart policy a clean exit would
+/// strand the container stopped instead of rebooting it into the boot-time
+/// sanitizer the restart exists to run. `demote_on_shutdown` is skipped on
+/// this path on purpose: the trigger condition is "no node is master", so
+/// there is nothing to demote and no live consensus to run an election.
 pub async fn supervise(
     mut redis: Child,
     mut sentinel: Option<Child>,
     demote_target: DemoteTarget,
+    mut restart_rx: tokio::sync::mpsc::Receiver<String>,
 ) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -253,6 +264,13 @@ pub async fn supervise(
                     let _ = signal::kill(pid, Signal::SIGTERM);
                     let _ = redis.wait().await;
                 }
+                std::process::exit(1);
+            }
+
+            Some(reason) = restart_rx.recv() => {
+                warn!(%reason, "self-heal requested a restart through the boot path");
+                graceful_shutdown(redis_pid, sentinel_pid, &mut redis, &mut sentinel).await;
+                // Non-zero on purpose — see the function doc.
                 std::process::exit(1);
             }
 

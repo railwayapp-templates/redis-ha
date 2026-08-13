@@ -7,7 +7,9 @@
 //!      failovers so the new master address survives container restarts.
 //!   4. Spawn redis-server and (if SENTINEL_ENABLED) redis-sentinel.
 //!   5. Run an HTTP health server on HEALTH_PORT for HAProxy to probe.
-//!   6. Supervise both processes; exit the container if either dies.
+//!   6. Supervise both processes; exit the container if either dies, and
+//!      exit non-zero when the ghost-master watcher asks for a restart so
+//!      the boot-time sanitizer can run.
 
 use anyhow::{Context, Result};
 use common::{init_logging, RailwayEnv, Telemetry, TelemetryEvent};
@@ -18,6 +20,7 @@ use redis_sentinel::{
     },
     config::{data_dir_is_on_volume, Config},
     demote_on_shutdown::DemoteTarget,
+    ghost_master,
     health_server,
     link_heal,
     process_manager::{enable_aof_after_rdb_load, spawn_redis, spawn_sentinel, supervise},
@@ -285,6 +288,10 @@ async fn main() -> Result<()> {
         None
     };
 
+    // How an in-process watcher asks `supervise` for a restart through the
+    // boot path (currently only the ghost-master watcher sends on it).
+    let (restart_tx, restart_rx) = tokio::sync::mpsc::channel::<String>(1);
+
     // Local self-heal for a replica whose replication link is durably down
     // or durably attached to the wrong master — only meaningful with
     // Sentinel colocated, since it is Sentinel's answer that supplies the
@@ -296,7 +303,7 @@ async fn main() -> Result<()> {
             config.redis_password.clone(),
             config.sentinel_port,
             config.redis_master_name.clone(),
-            telemetry,
+            telemetry.clone(),
             local_sentinel_password.clone(),
         );
         // Keep this Sentinel's odown quorum a majority of the Sentinels it
@@ -311,6 +318,16 @@ async fn main() -> Result<()> {
             config.private_domain.clone(),
             local_sentinel_password.clone(),
         );
+        // Runtime cure for a ghost-mastered cluster: when quorum consensus
+        // durably names a master that is not a live member and no node holds
+        // the master role, restart through the boot path so the boot-time
+        // sanitizer (dead-world quarantine + role re-resolution) runs.
+        ghost_master::spawn(
+            &config,
+            telemetry,
+            local_sentinel_password.clone(),
+            restart_tx,
+        );
     }
 
     // What a graceful stop needs to trigger its own failover before
@@ -324,6 +341,7 @@ async fn main() -> Result<()> {
         local_sentinel_password,
     };
 
-    // Block until a process exits or we receive a signal
-    supervise(redis_proc, sentinel_proc, demote_target).await
+    // Block until a process exits, we receive a signal, or a watcher asks
+    // for a restart through the boot path.
+    supervise(redis_proc, sentinel_proc, demote_target, restart_rx).await
 }
