@@ -10,6 +10,11 @@ on:
     - cron: '0 0 * * *'
   # Allow manual trigger
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Bypass the content gate and rebuild+push everything"
+        type: boolean
+        default: false
   # Build on push to main
   push:
     branches:
@@ -322,15 +327,67 @@ jobs:
         id: sha
         run: echo "short=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
 
+      # Skip the build entirely — same digest, no fleet redeploys — unless
+      # something REAL moved: the repo code that reaches the image, the
+      # upstream base image, or Debian's pending-security-fix set for that
+      # base (a superseded minor's base never re-mints upstream, so apt
+      # fixes are the only way OS updates reach it). The key is planted on
+      # the published image as a label; digest-tracking consumers
+      # (autoUpdates tagMode "sha") therefore only see a new digest when
+      # there is something worth redeploying for. Fails OPEN to building —
+      # a gate error must never silently freeze a tag.
+      - name: Content gate
+        id: gate
+        run: |
+          set -o pipefail
+          IMG="${{ env.IMAGE_PREFIX }}/redis-sentinel"
+          TAG="${{ matrix.redis_version }}${{ env.BETA_SUFFIX }}"
+          BASE="redis:${{ matrix.redis_version }}-bookworm"
+
+          GATE_OK=true
+          CODE_KEY=$(git rev-parse HEAD:redis-sentinel HEAD:common HEAD:Cargo.toml HEAD:Cargo.lock | sha256sum | cut -c1-16) || GATE_OK=false
+          BASE_DIGEST=$(docker buildx imagetools inspect "$BASE" --format '{{json .Manifest.Digest}}' | tr -d '"') || GATE_OK=false
+          docker pull -q "$BASE" >/dev/null || GATE_OK=false
+          PKG_KEY=$(docker run --rm "$BASE" bash -c "apt-get update -qq >/dev/null 2>&1; apt list --upgradable 2>/dev/null | sort" | sha256sum | cut -c1-16) || GATE_OK=false
+
+          if [ "$GATE_OK" != "true" ] || [ -z "$CODE_KEY" ] || [ -z "$BASE_DIGEST" ] || [ -z "$PKG_KEY" ]; then
+            echo "::warning::content gate failed for ${TAG}; building unconditionally"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "key=gate-error-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          KEY=$(printf '%s\n' "$CODE_KEY" "$BASE_DIGEST" "$PKG_KEY" | sha256sum | cut -c1-32)
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+          PUBLISHED_KEY=$(docker buildx imagetools inspect "$IMG:$TAG" --format '{{json .Image}}' 2>/dev/null \
+            | jq -r '(.config // .["linux/amd64"].config) | .Labels["railway.content-key"] // empty' 2>/dev/null || true)
+
+          if [ "${{ github.event.inputs.force || 'false' }}" = "true" ]; then
+            echo "force requested — building"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$KEY" = "$PUBLISHED_KEY" ]; then
+            echo "unchanged (key $KEY) — skipping build; digest stays put"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed (key $KEY, published ${PUBLISHED_KEY:-<none>}) — building"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # Push only the immutable sha tag here; the resolvable tags (:X.Y and,
       # for the newest minor, :X) are minted below AFTER the bundled-version
       # guard, so a base-image mixup can never reach a tag the platform pins.
       - name: Build and push redis-sentinel for amd64
+        if: steps.gate.outputs.changed == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./redis-sentinel/Dockerfile
-          build-args: REDIS_VERSION=${{ matrix.redis_version }}
+          build-args: |
+            REDIS_VERSION=${{ matrix.redis_version }}
+            PKG_REFRESH=${{ steps.gate.outputs.key }}
+          labels: |
+            railway.content-key=${{ steps.gate.outputs.key }}
           build-contexts: |
             rust-binaries=docker-image://${{ env.IMAGE_PREFIX }}/redis-sentinel-rust-binaries:${{ steps.sha.outputs.short }}
           platforms: linux/amd64
@@ -340,10 +397,27 @@ jobs:
           cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/redis-sentinel:${{ matrix.redis_version }}${{ env.BETA_SUFFIX }}
           cache-to: type=inline
 
+      # Unchanged image: keep the per-commit pin tag and the floating major
+      # pointer current WITHOUT minting a new digest — imagetools create only
+      # adds tag references to the existing manifest. The digest already
+      # passed the bundled-version guard when it was first published.
+      - name: Refresh pin tags on unchanged image
+        if: steps.gate.outputs.changed == 'false'
+        run: |
+          IMG="${{ env.IMAGE_PREFIX }}/redis-sentinel"
+          SRC="$IMG:${{ matrix.redis_version }}${{ env.BETA_SUFFIX }}"
+          tags="-t $IMG:${{ matrix.redis_version }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}"
+          if [ -n "${{ matrix.floating_major }}" ]; then
+            tags="$tags -t $IMG:${{ matrix.floating_major }}${{ env.BETA_SUFFIX }}"
+            tags="$tags -t $IMG:${{ matrix.floating_major }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}"
+          fi
+          docker buildx imagetools create $tags "$SRC"
+
       # The tag IS the compatibility contract (the conversion pin trusts that
       # :8.2 bundles a Redis 8.2.x), so refuse to publish a build whose base
       # image bundles anything else rather than poison the tag.
       - name: Verify the bundled minor matches the matrix entry, then publish
+        if: steps.gate.outputs.changed == 'true'
         run: |
           img="${{ env.IMAGE_PREFIX }}/redis-sentinel:${{ matrix.redis_version }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}"
           version=$(docker run --rm --entrypoint redis-server "$img" --version)
@@ -394,12 +468,59 @@ jobs:
           echo "short=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
           echo "major=$(echo ${{ env.HAPROXY_VERSION }} | cut -d. -f1)" >> $GITHUB_OUTPUT
 
+      # Same content gate as redis-sentinel (see that job for rationale);
+      # package dimension via apk. The fleet's edge nodes run autoUpdates
+      # tagMode "sha" — a spuriously re-minted digest here rolls every
+      # HAProxy in every cluster for nothing.
+      - name: Content gate
+        id: gate
+        run: |
+          set -o pipefail
+          IMG="${{ env.IMAGE_PREFIX }}/haproxy"
+          TAG="${{ env.HAPROXY_VERSION }}${{ env.BETA_SUFFIX }}"
+          BASE="haproxy:${{ env.HAPROXY_VERSION }}-alpine"
+
+          GATE_OK=true
+          CODE_KEY=$(git rev-parse HEAD:haproxy HEAD:common HEAD:Cargo.toml HEAD:Cargo.lock | sha256sum | cut -c1-16) || GATE_OK=false
+          BASE_DIGEST=$(docker buildx imagetools inspect "$BASE" --format '{{json .Manifest.Digest}}' | tr -d '"') || GATE_OK=false
+          docker pull -q "$BASE" >/dev/null || GATE_OK=false
+          PKG_KEY=$(docker run --user root --rm "$BASE" sh -c "apk update -q >/dev/null 2>&1; apk version -l '<' 2>/dev/null | sort" | sha256sum | cut -c1-16) || GATE_OK=false
+
+          if [ "$GATE_OK" != "true" ] || [ -z "$CODE_KEY" ] || [ -z "$BASE_DIGEST" ] || [ -z "$PKG_KEY" ]; then
+            echo "::warning::content gate failed for haproxy; building unconditionally"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "key=gate-error-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          KEY=$(printf '%s\n' "$CODE_KEY" "$BASE_DIGEST" "$PKG_KEY" | sha256sum | cut -c1-32)
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+          PUBLISHED_KEY=$(docker buildx imagetools inspect "$IMG:$TAG" --format '{{json .Image}}' 2>/dev/null \
+            | jq -r '(.config // .["linux/amd64"].config) | .Labels["railway.content-key"] // empty' 2>/dev/null || true)
+
+          if [ "${{ github.event.inputs.force || 'false' }}" = "true" ]; then
+            echo "force requested — building"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$KEY" = "$PUBLISHED_KEY" ]; then
+            echo "unchanged (key $KEY) — skipping build; digest stays put"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed (key $KEY, published ${PUBLISHED_KEY:-<none>}) — building"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push haproxy for amd64
+        if: steps.gate.outputs.changed == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./haproxy/Dockerfile
-          build-args: HAPROXY_VERSION=${{ env.HAPROXY_VERSION }}
+          build-args: |
+            HAPROXY_VERSION=${{ env.HAPROXY_VERSION }}
+            PKG_REFRESH=${{ steps.gate.outputs.key }}
+          labels: |
+            railway.content-key=${{ steps.gate.outputs.key }}
           build-contexts: |
             rust-binaries=docker-image://${{ env.IMAGE_PREFIX }}/haproxy-rust-binaries:${{ steps.meta.outputs.short }}
           platforms: linux/amd64
@@ -410,3 +531,13 @@ jobs:
             ${{ env.IMAGE_PREFIX }}/haproxy:${{ env.HAPROXY_VERSION }}-${{ steps.meta.outputs.short }}${{ env.BETA_SUFFIX }}
           cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/haproxy:${{ env.HAPROXY_VERSION }}
           cache-to: type=inline
+
+      - name: Refresh pin tags on unchanged image
+        if: steps.gate.outputs.changed == 'false'
+        run: |
+          IMG="${{ env.IMAGE_PREFIX }}/haproxy"
+          SRC="$IMG:${{ env.HAPROXY_VERSION }}${{ env.BETA_SUFFIX }}"
+          docker buildx imagetools create \
+            -t "$IMG:${{ steps.meta.outputs.major }}${{ env.BETA_SUFFIX }}" \
+            -t "$IMG:${{ env.HAPROXY_VERSION }}-${{ steps.meta.outputs.short }}${{ env.BETA_SUFFIX }}" \
+            "$SRC"
