@@ -33,7 +33,16 @@ USER root
 # Install bash for Railway's Database UI SSH tunnel compatibility, and wget for
 # the HEALTHCHECK below (this base image, unlike the haproxy alpine one, doesn't
 # bundle it).
-RUN apt-get update && apt-get install -y --no-install-recommends bash wget && rm -rf /var/lib/apt/lists/*
+# CI passes its content key here (see the build workflow's content gate):
+# the value only changes when the repo code, the upstream base, or Debian's
+# pending-security-fix set moved, so this layer re-runs exactly when there is
+# something to pick up — and stays byte-cached (stable digest) otherwise.
+# A superseded minor's base never re-mints upstream, so the apt-get upgrade
+# below is the only way OS security updates reach a pinned old minor.
+ARG PKG_REFRESH=none
+RUN echo "refresh key: ${PKG_REFRESH}" \
+    && apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends bash wget && rm -rf /var/lib/apt/lists/*
 
 # Copy the Rust entrypoint
 COPY --from=rust-binaries --chmod=755 /redis-wrapper /usr/local/bin/redis-wrapper
