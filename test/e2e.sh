@@ -2441,9 +2441,19 @@ t_wiped_master_volume_does_not_wipe_cluster() {
   done
   [ "$state" = "exited:1" ] \
     || { ko "$t" "guard logged but the container did not exit(1) (state=${state})" wipe-1; return; }
-  # Fail-stop means hands off the volume: nothing written, nothing quarantined.
-  docker run --rm -v wipe-vol-1:/v alpine:latest sh -c 'ls -A /v' 2>/dev/null | grep -q . \
-    && { ko "$t" "the refused boot wrote to the wiped volume" wipe-1; return; }
+  # Fail-stop means hands off the dataset: nothing written, nothing
+  # quarantined. The one allowed artifact is the empty volume runtime lock
+  # file — the wrapper must hold the flock before it may even read the
+  # volume to decide the refusal, and a flock file is never unlinked on
+  # exit (recreating it would reopen the overlap race it exists to close).
+  local leftover
+  leftover=$(docker run --rm -v wipe-vol-1:/v alpine:latest sh -c 'ls -A /v' 2>/dev/null \
+    | grep -v '^\.railway-redis-runtime\.lock$')
+  [ -z "$leftover" ] \
+    || { ko "$t" "the refused boot wrote to the wiped volume: ${leftover}" wipe-1; return; }
+  docker run --rm -v wipe-vol-1:/v alpine:latest sh -c \
+      '[ ! -s /v/.railway-redis-runtime.lock ]' 2>/dev/null \
+    || { ko "$t" "the refused boot wrote data into the runtime lock file" wipe-1; return; }
 
   # An exited container drops its DNS record and Sentinel spins on NXDOMAIN
   # instead of counting the node down (see t_sentinel_failover on kill vs
