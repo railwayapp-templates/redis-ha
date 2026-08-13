@@ -10,3 +10,4 @@ pub mod redis_conf;
 pub mod sentinel_auth;
 pub mod sentinel_conf;
 pub mod sentinel_query;
+pub mod volume_lock;
