@@ -25,7 +25,12 @@ COPY --from=rust-builder-local-output / /
 # ============================================================
 # Final stage: Redis with colocated Sentinel
 # ============================================================
-FROM redis:${REDIS_VERSION}-bookworm
+# Bare minor tag on purpose — upstream rebases new minors onto new Debian
+# releases (8.6+ are trixie-only), and pinning a codename here + in CI
+# discovery froze the published tag set at 8.4 while HA conversions kept
+# pinning newer minors. The bare tag always tracks upstream's current
+# Debian variant for that minor.
+FROM redis:${REDIS_VERSION}
 
 USER root
 

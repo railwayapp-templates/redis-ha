@@ -65,15 +65,23 @@ jobs:
               - 'Cargo.lock'
               - '.github/workflows/build-and-push.yml'
 
-  # Enumerate every `X.Y` minor Docker Hub publishes a `redis:X.Y-bookworm`
+  # Enumerate every `X.Y` minor Docker Hub publishes a bare `redis:X.Y`
   # tag for (the exact tag the wrapper builds FROM) within the supported
-  # majors. The list is discovered per run instead of hardcoded so a new
-  # upstream minor starts building the day Docker Hub carries it — the
-  # platform's HA conversion pins the adopted service's own `major.minor`
-  # minor, so a minor with no published image is a minor whose users cannot
-  # convert. Old minors stay in the set for the same reason: building a
-  # minor a user already runs is strictly better than stranding their
-  # conversion.
+  # majors. The bare minor tag — not a Debian-codename variant — is the
+  # discovery key AND the build base: upstream rebases new minors onto new
+  # Debian releases (8.6+ ship `-trixie` only, no `-bookworm`), and pinning
+  # a codename silently stopped discovery at 8.4 while the platform's HA
+  # conversion kept pinning newer sources' minors — every such conversion
+  # died on an unpublished tag. The bare tag always exists for a released
+  # minor and always points at upstream's current Debian variant, so the
+  # codename can never strand discovery again.
+  #
+  # The list is discovered per run instead of hardcoded so a new upstream
+  # minor starts building the day Docker Hub carries it — the platform's HA
+  # conversion pins the adopted service's own `major.minor` minor, so a
+  # minor with no published image is a minor whose users cannot convert.
+  # Old minors stay in the set for the same reason: building a minor a user
+  # already runs is strictly better than stranding their conversion.
   #
   # The job also marks the newest minor of each major so the floating
   # :<major> tags keep riding it, exactly as the hardcoded matrix's
@@ -136,13 +144,13 @@ jobs:
           matrix="["
           sep=""
           for major in $REDIS_SUPPORTED_MAJORS; do
-            found=$(grep -E "^${major}\.[0-9]+-bookworm$" /tmp/hub-tags.txt | sed 's/-bookworm$//' | sort -uV)
+            found=$(grep -E "^${major}\.[0-9]+$" /tmp/hub-tags.txt | sort -uV)
             if [ -z "$found" ]; then
               # Anti-shrink: an empty result for a supported major means the
               # discovery is broken (API change, filter regression), not that
               # the major vanished upstream — fail loudly rather than
               # silently stop building its minors.
-              echo "no X.Y-bookworm minors discovered for supported major ${major}" >&2
+              echo "no X.Y minors discovered for supported major ${major}" >&2
               exit 1
             fi
             echo "$found" >> /tmp/minors.txt
@@ -289,11 +297,11 @@ jobs:
   # The minor list comes from discover-redis-minors, never from a hand-kept
   # matrix: REDIS_SUPPORTED_MAJORS (env, above) is the single policy knob.
   # The floating :<major> tag rides the newest minor of its major (the
-  # `floating_major` entries the discover job marks). The mono-side
-  # conversion pre-flight refuses (with a clear error, before touching
-  # anything) sources whose minor has no published build, so the only cost
-  # of a brand-new upstream minor is conversions of it being blocked until
-  # the next daily run has discovered, built, and published it.
+  # `floating_major` entries the discover job marks). There is NO mono-side
+  # registry pre-flight (rejected as fail-open cost per conversion): the
+  # platform pins the source's minor unconditionally and the deploy dies on
+  # an unpublished tag, so this workflow's continuous coverage of every
+  # released minor IS the guarantee that conversions succeed.
   build-redis-sentinel-amd64:
     needs: [changes, build-rust-binaries-redis-sentinel-amd64, discover-redis-minors]
     if: ${{ needs.changes.outputs['redis-sentinel'] == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
@@ -342,7 +350,7 @@ jobs:
           set -o pipefail
           IMG="${{ env.IMAGE_PREFIX }}/redis-sentinel"
           TAG="${{ matrix.redis_version }}${{ env.BETA_SUFFIX }}"
-          BASE="redis:${{ matrix.redis_version }}-bookworm"
+          BASE="redis:${{ matrix.redis_version }}"
 
           GATE_OK=true
           CODE_KEY=$(git rev-parse HEAD:redis-sentinel HEAD:common HEAD:Cargo.toml HEAD:Cargo.lock | sha256sum | cut -c1-16) || GATE_OK=false
