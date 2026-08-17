@@ -61,8 +61,8 @@ Scale from 2–5 replicas via the cluster overview. Sentinel uses gossip to disc
 
 | Image | GHCR tag | Base |
 |---|---|---|
-| `redis-sentinel` | `ghcr.io/railwayapp-templates/redis-ha/redis-sentinel:<major.minor>` (every `X.Y` minor Docker Hub publishes a `X.Y-bookworm` tag for, majors 7 and 8) | `redis:<major.minor>-bookworm` |
-| `redis-sentinel` | `ghcr.io/railwayapp-templates/redis-ha/redis-sentinel:7` / `:8` (floating — newest minor of the major) | `redis:<newest minor>-bookworm` |
+| `redis-sentinel` | `ghcr.io/railwayapp-templates/redis-ha/redis-sentinel:<major.minor>` (every `X.Y` minor Docker Hub publishes a bare `X.Y` tag for, majors 7 and 8) | `redis:<major.minor>` (upstream's current Debian variant for that minor — never a pinned codename) |
+| `redis-sentinel` | `ghcr.io/railwayapp-templates/redis-ha/redis-sentinel:7` / `:8` (floating — newest minor of the major) | `redis:<newest minor>` |
 | `haproxy` | `ghcr.io/railwayapp-templates/redis-ha/haproxy:3.2-alpine` | `haproxy:3.2-alpine` |
 
 Both images are thin wrappers on official upstream images. The Rust entrypoints handle config rendering, process management, and health serving.
