@@ -201,6 +201,69 @@ jobs:
             echo "warning: could not list published ghcr tags; skipping coverage guard"
           fi
 
+      # The guard above compares discovery against what we ALREADY publish, so
+      # it can only catch the set shrinking. It cannot catch the set failing to
+      # GROW — and that is the failure that actually happened: the discovery
+      # regex pinned a Debian codename (`X.Y-bookworm`), upstream rebased new
+      # minors onto trixie, and 8.6/8.8/8.10 were simply never seen. Nothing
+      # shrank, so the run stayed green for 12.6 days while every HA conversion
+      # of a current-version Redis died on an unpullable tag (station thread
+      # default-ha-redis-template-doesn-t-deploy-8baf2a01).
+      #
+      # This is the positive check that closes it, and it does not trust our own
+      # regex: upstream's floating `redis:<major>` tag IS the newest minor of
+      # that major, by definition and by the same path `docker pull` takes. If
+      # no discovered minor resolves to the same manifest digest, discovery has
+      # missed upstream's current minor — whatever the reason.
+      #
+      # Fails on a real miss; warns and proceeds if the digest lookup itself
+      # could not be performed, so a registry hiccup never blocks image builds.
+      - name: Refuse to miss upstream's current minor
+        run: |
+          accept='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+
+          token=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/redis:pull" \
+            | jq -r .token) || token=""
+          if [ -z "$token" ] || [ "$token" = "null" ]; then
+            echo "warning: could not obtain an anonymous pull token; skipping current-minor guard"
+            exit 0
+          fi
+
+          digest_of() {
+            curl -fsSL --retry 3 --retry-all-errors --retry-delay 3 -I \
+              -H "Authorization: Bearer $token" -H "Accept: ${accept}" \
+              "https://registry-1.docker.io/v2/library/redis/manifests/$1" 2>/dev/null \
+              | sed -nE 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *(.*)/\1/p' | tr -d '\r'
+          }
+
+          for major in $REDIS_SUPPORTED_MAJORS; do
+            want=$(digest_of "$major")
+            if [ -z "$want" ]; then
+              echo "warning: could not resolve redis:${major}; skipping guard for this major"
+              continue
+            fi
+
+            # Newest-first: a healthy run matches on the first probe.
+            matched=""
+            for minor in $(grep -E "^${major}\.[0-9]+$" /tmp/minors.txt | sort -urV); do
+              if [ "$(digest_of "$minor")" = "$want" ]; then
+                matched="$minor"
+                break
+              fi
+            done
+
+            if [ -z "$matched" ]; then
+              echo "redis:${major} (${want}) matches no discovered ${major}.x minor." >&2
+              echo "Discovered for ${major}:" >&2
+              grep -E "^${major}\.[0-9]+$" /tmp/minors.txt | sort -uV | sed 's/^/  /' >&2
+              echo "Discovery is missing upstream's current ${major}.x minor, so HA" >&2
+              echo "conversion will pin a redis-sentinel tag that was never built." >&2
+              exit 1
+            fi
+            echo "current-minor ok: redis:${major} == ${matched}"
+          done
+
   # Build Rust binary for redis-sentinel (AMD64 - bookworm, native, fast ~2-3min)
   # The binary is version-agnostic — one build covers all Redis major versions.
   build-rust-binaries-redis-sentinel-amd64:
