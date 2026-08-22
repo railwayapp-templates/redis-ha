@@ -2496,6 +2496,97 @@ t_wiped_master_volume_does_not_wipe_cluster() {
   ok "$t"
 }
 
+# The dataset-only wipe: dump.rdb/appendonlydir are lost but sentinel.conf
+# survives on the volume, so the boot resolves SelfIsMaster from its own conf
+# and never reaches the peer query — the guard's conf path, which
+# t_wiped_master_volume_does_not_wipe_cluster (whole volume gone, peer path)
+# never exercises. The replicas were never repointed and still follow this
+# node, so booting the empty dataset is the same cluster wipe; the guard must
+# refuse off the surviving conf, the peers fail over to a data-bearing
+# replica, and the refused node's next boot is demoted by the peer
+# cross-check and rejoins as a replica.
+t_wiped_dataset_with_surviving_conf_does_not_wipe_cluster() {
+  local t=t_wiped_dataset_with_surviving_conf_does_not_wipe_cluster
+  local hosts="dwipe-1:26379,dwipe-2:26379,dwipe-3:26379"
+  # Same shape as the whole-volume test: a longer down-after keeps the peers
+  # naming dwipe-1 master while the refused boot runs — the real trigger (a
+  # redeploy racing an rm of the dataset) has the node back well before sdown.
+  local slow=(-e SENTINEL_DOWN_AFTER_MS=15000)
+  start_ha_trio dwipe "${slow[@]}" \
+    || { dump_sentinel_view dwipe-2 dwipe-3
+         ko "$t" "cluster never became failover-ready" dwipe-1 dwipe-2 dwipe-3; return; }
+  write_key dwipe-1 dwipekey dwipevalue \
+    || { ko "$t" "master never accepted the marker write" dwipe-1; return; }
+  wait_for_key dwipe-2 dwipekey dwipevalue \
+    || { ko "$t" "dwipe-2 never synced" dwipe-1 dwipe-2; return; }
+  wait_for_key dwipe-3 dwipekey dwipevalue \
+    || { ko "$t" "dwipe-3 never synced" dwipe-1 dwipe-3; return; }
+
+  # The partial loss: every loadable dataset form removed, sentinel.conf
+  # kept — it still names dwipe-1 itself as master.
+  docker rm -f dwipe-1 >/dev/null 2>&1
+  docker run --rm -v dwipe-vol-1:/v alpine:latest sh -c \
+    'rm -rf /v/dump.rdb /v/appendonly.aof /v/appendonlydir && test -s /v/sentinel.conf' \
+    >/dev/null 2>&1 \
+    || { ko "$t" "dataset wipe did not leave sentinel.conf behind"; return; }
+  [ "$(sentinel_conf_master_host dwipe-vol-1)" = "dwipe-1" ] \
+    || { ko "$t" "precondition broke: the surviving conf no longer names dwipe-1"; return; }
+  start_node dwipe-1 dwipe-vol-1 /data -e SENTINEL_HOSTS="$hosts" "${slow[@]}"
+
+  wait_for_log_line dwipe-1 "refusing to boot as an empty master" 30 \
+    || { ko "$t" "guard never refused the empty-master boot" dwipe-1; return; }
+  # The conf path must be attributed to the conf, not to the peers.
+  docker logs dwipe-1 2>&1 | grep -q "own sentinel.conf names" \
+    || { ko "$t" "refusal did not attribute the mastership claim to the surviving conf" dwipe-1; return; }
+  local i state=""
+  for i in $(seq 1 30); do
+    state=$(docker inspect -f '{{.State.Status}}:{{.State.ExitCode}}' dwipe-1 2>/dev/null)
+    [ "$state" = "exited:1" ] && break
+    sleep 1
+  done
+  [ "$state" = "exited:1" ] \
+    || { ko "$t" "guard logged but the container did not exit(1) (state=${state})" dwipe-1; return; }
+
+  # Hold the crashlooping node's DNS name while the failover runs — same
+  # NXDOMAIN trap as the whole-volume test.
+  docker run -d --name dwipe-1-dns --label "$LABEL" --network "$NET" \
+    --network-alias dwipe-1 alpine:latest sleep 600 >/dev/null
+
+  local promoted="" n
+  for i in $(seq 1 180); do
+    for n in dwipe-2 dwipe-3; do
+      docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
+        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+    done
+    sleep 1
+  done
+  [ -n "$promoted" ] || {
+    dump_sentinel_view dwipe-2 dwipe-3
+    ko "$t" "no replica was promoted after the dataset-wiped master refused to boot" dwipe-2 dwipe-3
+    return
+  }
+  note "promoted: ${promoted}"
+  [ "$(rcli "$promoted" GET dwipekey)" = "dwipevalue" ] \
+    || { ko "$t" "marker data lost on the promoted master" "$promoted"; return; }
+
+  # The next boot (Railway's restart policy; same env, conf still naming
+  # this node): the self-master peer cross-check now contradicts the conf,
+  # demotes the boot to a replica of the promoted node, and the dataset
+  # resyncs — the refused node rejoins instead of crash-looping.
+  docker rm -f dwipe-1-dns >/dev/null 2>&1
+  docker start dwipe-1 >/dev/null 2>&1
+  wait_for_ping dwipe-1 || { ko "$t" "refused node never came back as a replica" dwipe-1; return; }
+  wait_for_replica_repointed dwipe-1 "$promoted" 90 \
+    || { ko "$t" "refused node never attached to ${promoted}" dwipe-1 "$promoted"; return; }
+  wait_for_key dwipe-1 dwipekey dwipevalue \
+    || { ko "$t" "marker data never resynced to the rejoined node" dwipe-1 "$promoted"; return; }
+  [ "$(rcli "$promoted" GET dwipekey)" = "dwipevalue" ] \
+    || { ko "$t" "promoted master lost data when the refused node rejoined" "$promoted"; return; }
+
+  docker rm -f dwipe-1 dwipe-2 dwipe-3 >/dev/null 2>&1
+  ok "$t"
+}
+
 # maxmemory pressure at runtime must degrade WRITES, not the cluster. The
 # wrapper stamps `maxmemory` (MAXMEMORY_MB, or 75% of the cgroup limit) with
 # `maxmemory-policy noeviction` — so a full node rejects writes with -OOM
@@ -2611,6 +2702,7 @@ ALL_TESTS=(
   t_scaled_member_master_is_preserved_at_boot
   t_foreign_host_reusing_member_name_is_quarantined
   t_wiped_master_volume_does_not_wipe_cluster
+  t_wiped_dataset_with_surviving_conf_does_not_wipe_cluster
   t_sentinel_auth_on_by_default_for_fresh_cluster
   t_scale_up_of_unauthed_cluster_stays_unauthed
   t_password_variable_edit_does_not_rotate
