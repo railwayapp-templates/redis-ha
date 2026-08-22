@@ -134,24 +134,31 @@ async fn main() -> Result<()> {
     // deploy-time topology on a node Sentinel has since promoted or demoted.
     let resolution = boot_master_for_this_boot(&config).await;
 
-    // Fail-stop guard, checked before anything is written to the volume: an
-    // env-primary booting with no loadable dataset into a live cluster whose
-    // Sentinels still name it master must not fall back to the env topology.
-    // No failover ever repointed the replicas, so they reconnect and ack —
-    // min-replicas-to-write is satisfied — and then full-resync the empty
-    // dataset: the documented replication wipe Sentinel does not protect
-    // against. Exiting leaves the master down instead; the peers fail over
-    // to a replica that still holds the data, and this node's next boot
-    // joins the new master as a replica through the peer query.
+    // Fail-stop guard, checked before anything is written to the volume: a
+    // boot that would claim mastership with no loadable dataset — the peer
+    // Sentinels naming this node master on a wiped volume, or a surviving
+    // sentinel.conf naming it after the dataset alone was lost — must not
+    // fall back to booting an empty master. No failover ever repointed the
+    // replicas, so they reconnect and ack — min-replicas-to-write is
+    // satisfied — and then full-resync the empty dataset: the documented
+    // replication wipe Sentinel does not protect against. Exiting leaves
+    // the master down instead; the peers fail over to a replica that still
+    // holds the data, and this node's next boot joins the new master as a
+    // replica through the peer query.
     if empty_primary_boot_guard(&config, &resolution) == EmptyPrimaryBoot::Refuse {
+        let who_claims = if resolution.conf_names_self {
+            "this node's own sentinel.conf".to_string()
+        } else {
+            "the peer sentinels".to_string()
+        };
         let error = format!(
-            "refusing to boot as an empty master: the peer sentinels name this node ({}) as \
+            "refusing to boot as an empty master: {} name this node ({}) as \
              the current master, but {} holds no loadable dataset — the volume was wiped or \
              replaced. Booting would have every replica full-resync the empty dataset and \
              destroy the cluster's data. This container exits so Sentinel fails over to a \
              data-bearing replica; this node then rejoins as a replica on a later boot. Set \
              {}=false to override.",
-            config.private_domain, config.data_dir, EMPTY_PRIMARY_GUARD_ENV
+            who_claims, config.private_domain, config.data_dir, EMPTY_PRIMARY_GUARD_ENV
         );
         tracing::error!("{error}");
         telemetry.send(TelemetryEvent::ComponentError {
