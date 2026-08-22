@@ -163,28 +163,62 @@ async fn main() -> Result<()> {
     // the master down instead; the peers fail over to a replica that still
     // holds the data, and this node's next boot joins the new master as a
     // replica through the peer query.
-    if empty_primary_boot_guard(&config, &resolution) == EmptyPrimaryBoot::Refuse {
-        let who_claims = if resolution.conf_names_self {
-            "this node's own sentinel.conf".to_string()
-        } else {
-            "the peer sentinels".to_string()
-        };
-        let error = format!(
-            "refusing to boot as an empty master: {} name this node ({}) as \
-             the current master, but {} holds no loadable dataset — the volume was wiped or \
-             replaced. Booting would have every replica full-resync the empty dataset and \
-             destroy the cluster's data. This container exits so Sentinel fails over to a \
-             data-bearing replica; this node then rejoins as a replica on a later boot. Set \
-             {}=false to override.",
-            who_claims, config.private_domain, config.data_dir, EMPTY_PRIMARY_GUARD_ENV
-        );
-        tracing::error!("{error}");
-        telemetry.send(TelemetryEvent::ComponentError {
-            component: "redis-wrapper".to_string(),
-            error,
-            context: "startup".to_string(),
-        });
-        std::process::exit(1);
+    match empty_primary_boot_guard(&config, &resolution) {
+        EmptyPrimaryBoot::Proceed => {}
+        EmptyPrimaryBoot::ProceedAlone => {
+            // The refusal's trigger without its recovery: sentinel.conf
+            // names this node master over an empty dataset, but no peer
+            // sentinel is configured — nothing exists to wipe or to fail
+            // over to, and refusing would crash-loop a single-node service
+            // until an operator flips the kill switch.
+            tracing::warn!(
+                "this node's own sentinel.conf names this node ({}) as the current master \
+                 and {} holds no loadable dataset, but no peer sentinels are configured — \
+                 there is no replica to protect and nothing to fail over to, so this boot \
+                 proceeds as an empty master",
+                config.private_domain,
+                config.data_dir
+            );
+        }
+        EmptyPrimaryBoot::Refuse => {
+            // Both branches carry the "refusing to boot as an empty master"
+            // anchor verbatim — the e2e suite and fleet log searches grep
+            // for it.
+            let error = if resolution.conf_names_self {
+                format!(
+                    "refusing to boot as an empty master: this node's own sentinel.conf names \
+                     this node ({}) as the current master, but {} holds no loadable dataset — \
+                     the dataset was wiped while the conf survived. Booting would have every \
+                     replica full-resync the empty dataset and destroy the cluster's data. \
+                     This container exits instead; the peer sentinels may fail over to a \
+                     data-bearing replica, or an operator can restore the volume's dataset or \
+                     set {}=false to accept the empty boot.",
+                    config.private_domain, config.data_dir, EMPTY_PRIMARY_GUARD_ENV
+                )
+            } else {
+                format!(
+                    "refusing to boot as an empty master: the peer sentinels name this node \
+                     ({}) as the current master, but {} holds no loadable dataset — the volume \
+                     was wiped or replaced. Booting would have every replica full-resync the \
+                     empty dataset and destroy the cluster's data. This container exits so \
+                     Sentinel fails over to a data-bearing replica; this node then rejoins as \
+                     a replica on a later boot. Set {}=false to override.",
+                    config.private_domain, config.data_dir, EMPTY_PRIMARY_GUARD_ENV
+                )
+            };
+            tracing::error!("{error}");
+            // One send, before exit: `Telemetry::send` is synchronous with a
+            // single bounded transport retry — exactly the emit-then-exit(1)
+            // shape it documents for the boot guards. The distinct component
+            // lets fleet monitors spot refusal loops without parsing the
+            // message.
+            telemetry.send(TelemetryEvent::ComponentError {
+                component: "empty-master-boot-guard".to_string(),
+                error,
+                context: "startup".to_string(),
+            });
+            std::process::exit(1);
+        }
     }
     let boot_master = resolution.master;
 

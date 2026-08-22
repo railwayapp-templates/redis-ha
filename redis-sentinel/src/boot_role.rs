@@ -76,7 +76,10 @@
 //! booting on an empty ephemeral dir — lose the whole volume,
 //! sentinel.conf included; `rm` of dump.rdb/AOF alone loses only the
 //! dataset, which is why the conf path refuses on the dataset check rather
-//! than on the conf's absence.
+//! than on the conf's absence. A node with no peer sentinels configured is
+//! carved out of the conf-path refusal: there is no replica to wipe and no
+//! peer to fail over to, so refusing would only crash-loop a single-node
+//! service — that boot proceeds with a loud warning instead.
 
 use crate::config::Config;
 use std::io::ErrorKind;
@@ -734,6 +737,14 @@ pub const EMPTY_PRIMARY_GUARD_ENV: &str = "EMPTY_PRIMARY_BOOT_GUARD";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmptyPrimaryBoot {
     Proceed,
+    /// Proceed, but only because this node has no peer sentinels configured:
+    /// the surviving sentinel.conf names it master over an empty dataset —
+    /// the refusal's trigger — yet the refusal's advertised recovery (the
+    /// peers failing over to a data-bearing replica) needs peers to exist.
+    /// A single-node sentinel-enabled service has nothing to fail over to
+    /// and no replica to wipe, so refusing would only crash-loop it until an
+    /// operator flips the kill switch. The wrapper warns loudly instead.
+    ProceedAlone,
     /// Exit instead of booting: the cluster still names this node master and
     /// the data dir holds nothing to serve. Its replicas were never
     /// repointed, so they reconnect the moment it listens — acking enough to
@@ -758,30 +769,42 @@ pub enum EmptyPrimaryBoot {
 /// the peer query produces it), so neither is a separate input;
 /// `holds_dataset` scopes the guard to a node with nothing to serve — the
 /// incumbent master restarting normally still boots.
+///
+/// The conf path additionally requires `has_peer_sentinels`: with zero peers
+/// configured there is nothing the refusal protects (no replica to wipe) and
+/// nothing it recovers through (no peer to fail over), so exiting would
+/// crash-loop a single-node service forever. That boot proceeds with a loud
+/// warn instead ([`EmptyPrimaryBoot::ProceedAlone`]). The peer path needs no
+/// such carve-out — `peers_named_self` cannot be observed without a peer.
 pub fn decide_empty_primary_boot(
     peers_named_self: bool,
     conf_names_self: bool,
     is_primary: bool,
     holds_dataset: bool,
+    has_peer_sentinels: bool,
     guard_enabled: bool,
 ) -> EmptyPrimaryBoot {
     let peer_path_dangerous = peers_named_self && is_primary;
-    let conf_path_dangerous = conf_names_self;
+    let conf_path_dangerous = conf_names_self && has_peer_sentinels;
     if guard_enabled && (peer_path_dangerous || conf_path_dangerous) && !holds_dataset {
         EmptyPrimaryBoot::Refuse
+    } else if guard_enabled && conf_names_self && !has_peer_sentinels && !holds_dataset {
+        EmptyPrimaryBoot::ProceedAlone
     } else {
         EmptyPrimaryBoot::Proceed
     }
 }
 
 /// [`decide_empty_primary_boot`] with its inputs gathered from the resolved
-/// boot role, the env topology, the data dir, and the kill switch.
+/// boot role, the env topology, the data dir, the configured peer list, and
+/// the kill switch.
 pub fn empty_primary_boot_guard(config: &Config, resolution: &BootResolution) -> EmptyPrimaryBoot {
     decide_empty_primary_boot(
         resolution.peers_named_self,
         resolution.conf_names_self,
         config.is_primary(),
         Config::holds_redis_dataset(&config.data_dir),
+        !peer_sentinel_addrs(config).is_empty(),
         enabled(std::env::var(EMPTY_PRIMARY_GUARD_ENV).ok().as_deref()),
     )
 }
@@ -953,7 +976,7 @@ mod tests {
         // The wipe scenario: env-primary, fresh/wiped volume, cluster never
         // failed over. Every replica would full-resync the empty dataset.
         assert_eq!(
-            decide_empty_primary_boot(true, false, true, false, true),
+            decide_empty_primary_boot(true, false, true, false, true, true),
             EmptyPrimaryBoot::Refuse
         );
     }
@@ -962,7 +985,7 @@ mod tests {
     fn a_peer_answer_naming_another_node_never_refuses() {
         // ReplicaOf path, or no peer answered at all — the guard has no say.
         assert_eq!(
-            decide_empty_primary_boot(false, false, true, false, true),
+            decide_empty_primary_boot(false, false, true, false, true, true),
             EmptyPrimaryBoot::Proceed
         );
     }
@@ -972,7 +995,7 @@ mod tests {
         // REPLICA_OF set: the env fallback boots a stale replica, which
         // Sentinel's master-in-slave-role handling resolves — never a wipe.
         assert_eq!(
-            decide_empty_primary_boot(true, false, false, false, true),
+            decide_empty_primary_boot(true, false, false, false, true, true),
             EmptyPrimaryBoot::Proceed
         );
     }
@@ -982,7 +1005,7 @@ mod tests {
         // The peers naming us master with data on disk is the incumbent
         // master restarting normally — the env fallback stays.
         assert_eq!(
-            decide_empty_primary_boot(true, false, true, true, true),
+            decide_empty_primary_boot(true, false, true, true, true, true),
             EmptyPrimaryBoot::Proceed
         );
     }
@@ -990,7 +1013,7 @@ mod tests {
     #[test]
     fn the_kill_switch_restores_the_env_fallback() {
         assert_eq!(
-            decide_empty_primary_boot(true, false, true, false, false),
+            decide_empty_primary_boot(true, false, true, false, true, false),
             EmptyPrimaryBoot::Proceed
         );
     }
@@ -1007,11 +1030,11 @@ mod tests {
         // conf_names_self overrides REPLICA_OF when booting, so the refusal
         // must not depend on the env topology at all.
         assert_eq!(
-            decide_empty_primary_boot(false, true, false, false, true),
+            decide_empty_primary_boot(false, true, false, false, true, true),
             EmptyPrimaryBoot::Refuse
         );
         assert_eq!(
-            decide_empty_primary_boot(false, true, true, false, true),
+            decide_empty_primary_boot(false, true, true, false, true, true),
             EmptyPrimaryBoot::Refuse
         );
     }
@@ -1021,7 +1044,7 @@ mod tests {
         // The incumbent master restarting normally: the conf names it, and
         // the dataset is on disk.
         assert_eq!(
-            decide_empty_primary_boot(false, true, true, true, true),
+            decide_empty_primary_boot(false, true, true, true, true, true),
             EmptyPrimaryBoot::Proceed
         );
     }
@@ -1029,7 +1052,38 @@ mod tests {
     #[test]
     fn the_conf_path_kill_switch_restores_the_boot() {
         assert_eq!(
-            decide_empty_primary_boot(false, true, true, false, false),
+            decide_empty_primary_boot(false, true, true, false, true, false),
+            EmptyPrimaryBoot::Proceed
+        );
+    }
+
+    #[test]
+    fn the_conf_path_with_no_peers_proceeds_with_a_warning() {
+        // A single-node sentinel-enabled service that lost its dataset but
+        // kept sentinel.conf: nothing exists to fail over to and no replica
+        // follows this node, so refusing would only crash-loop it. The boot
+        // proceeds on the warn path — env topology notwithstanding.
+        assert_eq!(
+            decide_empty_primary_boot(false, true, true, false, false, true),
+            EmptyPrimaryBoot::ProceedAlone
+        );
+        assert_eq!(
+            decide_empty_primary_boot(false, true, false, false, false, true),
+            EmptyPrimaryBoot::ProceedAlone
+        );
+    }
+
+    #[test]
+    fn the_no_peers_carve_out_is_silent_when_nothing_would_have_refused() {
+        // The warn path exists only where the refusal was carved out: with a
+        // dataset on disk, or with the kill switch off, the boot is a plain
+        // Proceed — no warning to justify.
+        assert_eq!(
+            decide_empty_primary_boot(false, true, true, true, false, true),
+            EmptyPrimaryBoot::Proceed
+        );
+        assert_eq!(
+            decide_empty_primary_boot(false, true, true, false, false, false),
             EmptyPrimaryBoot::Proceed
         );
     }
@@ -1065,6 +1119,9 @@ mod tests {
     fn the_guard_refuses_a_wiped_dataset_the_conf_still_names() {
         let dir = tempdir().unwrap();
         let config = config_at(dir.path());
+        // Config::for_tests' SENTINEL_HOSTS entry is not this node, so the
+        // refusal has a peer to fail over to — the precondition it needs.
+        assert!(!peer_sentinel_addrs(&config).is_empty());
         let conf_named_self = BootResolution {
             master: BootMaster::SelfIsMaster,
             peers_named_self: false,
@@ -1075,6 +1132,34 @@ mod tests {
             EmptyPrimaryBoot::Refuse
         );
         fs::write(dir.path().join("appendonly.aof"), b"*2").unwrap();
+        assert_eq!(
+            empty_primary_boot_guard(&config, &conf_named_self),
+            EmptyPrimaryBoot::Proceed
+        );
+    }
+
+    #[test]
+    fn the_guard_lets_a_peerless_node_boot_off_its_own_conf() {
+        // A 1-node sentinel-enabled service: SENTINEL_HOSTS names only this
+        // node, so the peer list is empty and the refusal's recovery —
+        // "Sentinel fails over to a data-bearing replica" — is impossible.
+        // The wiped-dataset boot must proceed (on the warn path) instead of
+        // crash-looping until an operator flips the kill switch.
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path());
+        config.sentinel_hosts = format!("{}:26379", config.private_domain);
+        assert!(peer_sentinel_addrs(&config).is_empty());
+        let conf_named_self = BootResolution {
+            master: BootMaster::SelfIsMaster,
+            peers_named_self: false,
+            conf_names_self: true,
+        };
+        assert_eq!(
+            empty_primary_boot_guard(&config, &conf_named_self),
+            EmptyPrimaryBoot::ProceedAlone
+        );
+        // With the dataset on disk it is a normal boot, not the warn path.
+        fs::write(dir.path().join("dump.rdb"), b"REDIS0011fake").unwrap();
         assert_eq!(
             empty_primary_boot_guard(&config, &conf_named_self),
             EmptyPrimaryBoot::Proceed
