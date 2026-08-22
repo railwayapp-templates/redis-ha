@@ -29,6 +29,19 @@ use tracing::{info, warn};
 const RUNTIME_LOCK_FILE: &str = ".railway-redis-runtime.lock";
 const DEFAULT_WAIT_SECS: u64 = 300;
 
+/// How the lock attempt ended, so the wrapper can keep the documented
+/// fail-open boot while still surfacing the lost invariant in telemetry —
+/// without this, a boot without the volume lock differs from a normal boot
+/// by one warn line nobody alerts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeLockOutcome {
+    /// The exclusive flock is held for this process's lifetime.
+    Held,
+    /// The lock file could not be opened; the boot continued without the
+    /// lock. The overlap protection is gone for this container.
+    FailedOpen,
+}
+
 /// Acquire the exclusive volume runtime lock, waiting up to
 /// `RUNTIME_LOCK_WAIT_SECONDS` (default 300) for a previous holder.
 ///
@@ -36,9 +49,10 @@ const DEFAULT_WAIT_SECS: u64 = 300;
 /// stays open until this process exits, which is exactly the intended lock
 /// lifetime. An unopenable lock file fails OPEN (warn + continue) — the lock
 /// is defense in depth, and refusing to boot over a bad lock file would be a
-/// worse failure than the overlap it guards against. A timeout waiting on a
-/// live holder fails CLOSED.
-pub fn acquire_volume_runtime_lock(data_dir: &str) -> Result<()> {
+/// worse failure than the overlap it guards against; the outcome is returned
+/// so the caller can report it. A timeout waiting on a live holder fails
+/// CLOSED.
+pub fn acquire_volume_runtime_lock(data_dir: &str) -> Result<VolumeLockOutcome> {
     let wait_secs = std::env::var("RUNTIME_LOCK_WAIT_SECONDS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -46,7 +60,7 @@ pub fn acquire_volume_runtime_lock(data_dir: &str) -> Result<()> {
     acquire_with_wait(data_dir, wait_secs)
 }
 
-fn acquire_with_wait(data_dir: &str, wait_secs: u64) -> Result<()> {
+fn acquire_with_wait(data_dir: &str, wait_secs: u64) -> Result<VolumeLockOutcome> {
     let path = Path::new(data_dir).join(RUNTIME_LOCK_FILE);
     let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(f) => f,
@@ -56,7 +70,7 @@ fn acquire_with_wait(data_dir: &str, wait_secs: u64) -> Result<()> {
                 error = %err,
                 "could not open the runtime lock file; continuing without the volume lock"
             );
-            return Ok(());
+            return Ok(VolumeLockOutcome::FailedOpen);
         }
     };
 
@@ -69,7 +83,7 @@ fn acquire_with_wait(data_dir: &str, wait_secs: u64) -> Result<()> {
                     info!("previous container released the volume; continuing boot");
                 }
                 std::mem::forget(lock);
-                return Ok(());
+                return Ok(VolumeLockOutcome::Held);
             }
             Err((returned, _errno)) => {
                 if !waited {
