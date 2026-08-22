@@ -14,6 +14,7 @@
 use anyhow::{Context, Result};
 use common::{init_logging, RailwayEnv, Telemetry, TelemetryEvent};
 use redis_sentinel::{
+    atomic_write::write_atomic,
     boot_role::{
         boot_master_for_this_boot, empty_primary_boot_guard, BootMaster, EmptyPrimaryBoot,
         EMPTY_PRIMARY_GUARD_ENV,
@@ -33,7 +34,6 @@ use redis_sentinel::{
     sentinel_conf::{conf_requires_auth, generate_sentinel_conf},
 };
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tracing::info;
 
@@ -223,9 +223,12 @@ async fn main() -> Result<()> {
     let boot_master = resolution.master;
 
     // Always regenerate redis.conf so env-var changes take effect on restart.
+    // Atomically (tmp + fsync + rename — see `atomic_write`): a torn
+    // redis.conf would poison `persisted_requirepass` on the next boot,
+    // pinning the node to whatever prefix of the password survived.
     let redis_conf_path = format!("{}/redis.conf", config.data_dir);
     let redis_conf = generate_redis_conf(&config, &boot_master);
-    fs::write(&redis_conf_path, &redis_conf)
+    write_atomic(Path::new(&redis_conf_path), &redis_conf, None)
         .context("failed to write redis.conf")?;
     info!(path = %redis_conf_path, "wrote redis.conf");
 
@@ -242,10 +245,15 @@ async fn main() -> Result<()> {
     {
         let sentinel_password = sentinel_auth::first_boot_sentinel_password(&config).await;
         let sentinel_conf = generate_sentinel_conf(&config, &boot_master, &sentinel_password);
-        fs::write(&sentinel_conf_path, &sentinel_conf)
+        // Atomic AND durable, unlike redis.conf's every-boot rewrite: this
+        // file is written exactly once and preserved forever after, so a
+        // torn write here would be permanent — no usable monitor line for
+        // the boot-role resolver, the empty-master guard's conf-path arm
+        // silently gone, auth resolution reading garbage. The 0600 lands on
+        // the temp file BEFORE the rename, so the credential-bearing conf
+        // is never more readable than that at its final path.
+        write_atomic(Path::new(&sentinel_conf_path), &sentinel_conf, Some(0o600))
             .context("failed to write sentinel.conf")?;
-        fs::set_permissions(&sentinel_conf_path, fs::Permissions::from_mode(0o600))
-            .context("failed to set sentinel.conf permissions")?;
         info!(path = %sentinel_conf_path, "wrote sentinel.conf (first boot)");
         conf_requires_auth(&sentinel_conf)
     } else if config.sentinel_enabled {

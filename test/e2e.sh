@@ -1102,17 +1102,34 @@ t_sigterm_master_demotes_before_exit() {
   # A survivor must have taken over, and the switch must be visible in a
   # survivor's own Sentinel log too (`+switch-master`) — the event the local
   # `SENTINEL FAILOVER` request drove.
-  local promoted="" n
-  for n in demote-2 demote-3; do
-    docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
-      | grep -q '"role":"master"' && { promoted="$n"; break; }
+  # Polled, not one-shot: the demote confirmation above already proved the
+  # failover LANDED on the leader — what settles here is the SURVIVOR's own
+  # /role view, which has two legitimate one-beat 503s right after a
+  # promotion. The promoted node's own Sentinel adopts the leader's
+  # +switch-master via hello (measured ~1s after MASTER MODE enabled), and
+  # the promotion's closing `CLIENT KILL TYPE normal` severs the health
+  # server's cached redis connection, whose next request used to answer one
+  # silent 503 (hardened wrapper-side with a fresh-connection retry, but
+  # the probe must not depend on the image under test for its own
+  # stability). Same 15s bar as the prompt-write assertion below.
+  local promoted="" n i
+  for i in $(seq 1 15); do
+    for n in demote-2 demote-3; do
+      docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
+        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+    done
+    sleep 1
   done
   [ -n "$promoted" ] || { ko "$t" "no survivor was promoted after the stop" demote-2 demote-3; return; }
   note "promoted: ${promoted} (docker stop took ${stop_elapsed}s)"
 
   local switch_seen=""
   for n in demote-2 demote-3; do
-    docker logs "$n" 2>&1 | grep -q '+switch-master' && { switch_seen=1; break; }
+    # Not `grep -q` — the same SIGPIPE false negative as the demote-1 greps
+    # above: -q exits at the first match while docker logs is still
+    # writing, and pipefail turns that into a failed pipeline with the line
+    # demonstrably present in the log (reproduced locally on 4 of 7 runs).
+    docker logs "$n" 2>&1 | grep -F '+switch-master' >/dev/null && { switch_seen=1; break; }
   done
   [ -n "$switch_seen" ] \
     || { ko "$t" "no survivor logged +switch-master" demote-2 demote-3; return; }

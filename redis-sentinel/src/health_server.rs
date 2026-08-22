@@ -153,6 +153,60 @@ async fn get_or_connect(
     guard.clone()
 }
 
+/// Run one command over the cached connection, retrying ONCE on a fresh
+/// connection when the cached one errors.
+///
+/// A cached connection dying mid-life is a NORMAL event here, not an
+/// anomaly: Sentinel's promotion sequence ends with `CLIENT KILL TYPE
+/// normal` on the node it just promoted (redis's own `sentinelSendSlaveOf`
+/// MULTI), severing every pooled client connection — including the one the
+/// image's Docker HEALTHCHECK keeps primed through /health every 5s.
+/// Without the retry, the FIRST /role or /health request after every
+/// failover answers a spurious 503 off the dead connection, with no log
+/// line (reproduced: `CLIENT KILL TYPE normal` on a healthy master turns
+/// exactly one subsequent /role into an empty-handed 503, the next one is
+/// 200 again — the one-shot probe flake that failed CI on PR #59).
+///
+/// One retry on a fresh connection is what distinguishes "the cached
+/// connection died" from "the endpoint is actually unreachable". The
+/// second failure — and a failure to CONNECT at any point — stays
+/// fail-closed exactly as before; this never turns a dead redis or
+/// sentinel into a healthy answer.
+async fn query_cached<T: redis::FromRedisValue>(
+    slot: &Arc<Mutex<Option<MultiplexedConnection>>>,
+    url: &str,
+    label: &str,
+    cmd: redis::Cmd,
+) -> Option<T> {
+    for attempt in 0..2 {
+        let Some(mut conn) = get_or_connect(slot, url, label).await else {
+            // Connecting itself failed (get_or_connect warned): a retry
+            // would only redial the same dead endpoint within this probe.
+            return None;
+        };
+        match cmd.query_async::<T>(&mut conn).await {
+            Ok(value) => return Some(value),
+            Err(err) => {
+                *slot.lock().await = None;
+                if attempt == 0 {
+                    info!(
+                        error = %err,
+                        label,
+                        "cached connection failed — retrying once on a fresh connection"
+                    );
+                } else {
+                    warn!(
+                        error = %err,
+                        label,
+                        "query failed on a fresh connection — treating as no answer"
+                    );
+                }
+            }
+        }
+    }
+    None
+}
+
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     match timeout(Duration::from_secs(2), ping_redis(&state)).await {
         Ok(true) => (StatusCode::OK, Json(json!({"status": "ok"}))),
@@ -196,27 +250,23 @@ async fn role(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn ping_redis(state: &AppState) -> bool {
-    match state.get_redis_conn().await {
-        Some(mut conn) => {
-            let result: redis::RedisResult<String> =
-                redis::cmd("PING").query_async(&mut conn).await;
-            matches!(result, Ok(s) if s == "PONG")
-        }
-        None => false,
-    }
+    let reply: Option<String> = query_cached(
+        &state.redis_conn,
+        &state.redis_url,
+        "Redis",
+        redis::cmd("PING"),
+    )
+    .await;
+    matches!(reply, Some(s) if s == "PONG")
 }
 
 /// Check (1): local Redis says role:master.
 async fn local_role_is_master(state: &AppState) -> bool {
-    let Some(mut conn) = state.get_redis_conn().await else {
-        return false;
-    };
-    let Ok(info): redis::RedisResult<String> = redis::cmd("INFO")
-        .arg("replication")
-        .query_async(&mut conn)
-        .await
+    let mut cmd = redis::cmd("INFO");
+    cmd.arg("replication");
+    let Some(info) =
+        query_cached::<String>(&state.redis_conn, &state.redis_url, "Redis", cmd).await
     else {
-        *state.redis_conn.lock().await = None;
         return false;
     };
     info.lines().any(|l| l.trim() == "role:master")
@@ -254,43 +304,33 @@ fn answer_confirms_self(
 ///
 /// Fails closed: if Sentinel is unreachable, returns false.
 async fn sentinel_confirms_master(state: &AppState, master_name: &str) -> bool {
-    let Some(mut conn) = state.get_sentinel_conn().await else {
+    // Returns a two-element bulk array: [host, port]
+    let mut cmd = redis::cmd("SENTINEL");
+    cmd.arg("get-master-addr-by-name").arg(master_name);
+    let Some(parts) =
+        query_cached::<Vec<String>>(&state.sentinel_conn, &state.sentinel_url, "Sentinel", cmd)
+            .await
+    else {
         warn!("sentinel unreachable — failing closed for /role");
         return false;
     };
 
-    // Returns a two-element bulk array: [host, port]
-    let result: redis::RedisResult<Vec<String>> = redis::cmd("SENTINEL")
-        .arg("get-master-addr-by-name")
-        .arg(master_name)
-        .query_async(&mut conn)
-        .await;
-
-    match result {
-        Ok(parts) if parts.len() == 2 => {
-            let master_host = &parts[0];
-            let confirmed =
-                answer_confirms_self(master_host, &parts[1], &state.private_domain, state.redis_port);
-            if !confirmed {
-                info!(
-                    sentinel_master = %master_host,
-                    this_node = %state.private_domain,
-                    "sentinel says master is elsewhere — returning 503"
-                );
-            }
-            confirmed
-        }
-        Ok(_) => {
-            warn!("unexpected sentinel response shape");
-            *state.sentinel_conn.lock().await = None;
-            false
-        }
-        Err(e) => {
-            warn!(error = %e, "sentinel get-master-addr-by-name failed");
-            *state.sentinel_conn.lock().await = None;
-            false
-        }
+    if parts.len() != 2 {
+        warn!("unexpected sentinel response shape");
+        *state.sentinel_conn.lock().await = None;
+        return false;
     }
+    let master_host = &parts[0];
+    let confirmed =
+        answer_confirms_self(master_host, &parts[1], &state.private_domain, state.redis_port);
+    if !confirmed {
+        info!(
+            sentinel_master = %master_host,
+            this_node = %state.private_domain,
+            "sentinel says master is elsewhere — returning 503"
+        );
+    }
+    confirmed
 }
 
 async fn is_sentinel_confirmed_master(state: &AppState) -> bool {
