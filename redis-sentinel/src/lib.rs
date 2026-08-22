@@ -1,3 +1,4 @@
+pub mod atomic_write;
 pub mod boot_role;
 pub mod config;
 pub mod demote_on_shutdown;

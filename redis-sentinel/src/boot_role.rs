@@ -186,6 +186,15 @@ pub(crate) fn master_is_declared(config: &Config, host: &str) -> bool {
 
 /// Read `<data_dir>/sentinel.conf` and turn its `sentinel monitor` line into
 /// the role this boot has to start in.
+///
+/// One deliberate side effect: a conf that EXISTS and READS but carries no
+/// usable `sentinel monitor` line for this master set — a torn first-boot
+/// write, since the file is written once and preserved forever — is
+/// quarantined (renamed aside) so the wrapper's write-if-absent regenerates
+/// it this boot instead of the damage persisting. A missing file and an
+/// unreadable file are left alone: there is nothing to quarantine, or the
+/// contents are unknown and a transient read error must not condemn a
+/// possibly-valid conf.
 pub fn resolve_boot_master(config: &Config) -> BootMaster {
     let path = format!("{}/sentinel.conf", config.data_dir);
     let contents = match std::fs::read_to_string(&path) {
@@ -203,11 +212,37 @@ pub fn resolve_boot_master(config: &Config) -> BootMaster {
     };
 
     let Some((host, port)) = parse_sentinel_monitor(&contents, &config.redis_master_name) else {
+        // An existing conf with no usable monitor line for this master set
+        // cannot inform the boot role — and cannot inform anything else
+        // either: Sentinel would boot off it without monitoring this
+        // cluster's master, and the wrapper's auth resolution
+        // (`conf_requires_auth`) would read a file that no longer describes
+        // this node's decisions. The likely cause is a torn first-boot
+        // write (the file is written once and preserved forever after), so
+        // leaving it in place would make the damage permanent — including
+        // silently disarming the empty-master boot guard's conf-path arm.
+        // Quarantine it (renamed aside, never deleted — the same machinery
+        // as the dead-world path) so the wrapper's write-if-absent
+        // regenerates a fresh conf on this very boot. A conf with a valid
+        // monitor line for this master set never reaches this arm, however
+        // minimal the rest of it is.
         warn!(
             path = %path,
             master_name = %config.redis_master_name,
-            "sentinel.conf has no usable `sentinel monitor` line — falling back to the env topology"
+            "sentinel.conf exists but has no usable `sentinel monitor` line for this \
+             master set (likely a torn write) — quarantining it so a fresh conf is \
+             regenerated; falling back to the env topology"
         );
+        match crate::sentinel_conf::quarantine_ghost_sentinel_conf(&config.data_dir) {
+            Ok(Some(ghost)) => {
+                info!(to = %ghost.display(), "moved unparseable sentinel.conf aside")
+            }
+            Ok(None) => {}
+            Err(err) => warn!(
+                error = %err,
+                "failed to move unparseable sentinel.conf aside — sentinel will resume from it"
+            ),
+        }
         return BootMaster::NoLocalState;
     };
 
@@ -1282,6 +1317,86 @@ mod tests {
             resolve_boot_master(&config_at(dir.path())),
             BootMaster::NoLocalState
         );
+    }
+
+    fn ghost_confs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("sentinel.conf.ghost-"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_unparseable_conf_is_quarantined_so_the_wrapper_regenerates_it() {
+        // The torn-write case: sentinel.conf is written on first boot only,
+        // so a truncated file would otherwise persist forever — no usable
+        // monitor line for this resolver, the empty-master guard's
+        // conf-path arm silently disarmed, auth resolution reading garbage.
+        // The condemned file is moved aside (preserved, never deleted) so
+        // the wrapper's write-if-absent regenerates a fresh conf this boot.
+        let dir = tempdir().unwrap();
+        let torn = "port 26379\nrequirepass hunter2\nsentinel monitor mymaster redis-2";
+        write_sentinel_conf(dir.path(), torn);
+        assert_eq!(
+            resolve_boot_master(&config_at(dir.path())),
+            BootMaster::NoLocalState
+        );
+        assert!(!dir.path().join("sentinel.conf").exists());
+        let ghosts = ghost_confs(dir.path());
+        assert_eq!(ghosts.len(), 1);
+        assert_eq!(fs::read_to_string(&ghosts[0]).unwrap(), torn);
+    }
+
+    #[test]
+    fn a_monitor_line_for_a_foreign_master_set_is_quarantined_too() {
+        // Aligned with what this resolver treats as "no usable monitor
+        // line": a conf monitoring only some other master set says nothing
+        // about this cluster's, and preserving it would leave Sentinel
+        // running without monitoring the master this node belongs to.
+        let dir = tempdir().unwrap();
+        write_sentinel_conf(dir.path(), "sentinel monitor othermaster redis-9 6379 2\n");
+        assert_eq!(
+            resolve_boot_master(&config_at(dir.path())),
+            BootMaster::NoLocalState
+        );
+        assert!(!dir.path().join("sentinel.conf").exists());
+        assert_eq!(ghost_confs(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn a_minimal_but_valid_conf_is_preserved_byte_identical() {
+        // The guard rail on the quarantine: a conf whose ONLY directive is a
+        // valid monitor line for this master set is legitimate (Sentinel
+        // rewrites the file wholesale and owns its shape) and must never be
+        // touched — the empty-master boot guard's conf-path arm depends on
+        // exactly this file surviving.
+        let dir = tempdir().unwrap();
+        let minimal = "sentinel monitor mymaster redis-1.railway.internal 6379 2\n";
+        write_sentinel_conf(dir.path(), minimal);
+        assert_eq!(
+            resolve_boot_master(&config_at(dir.path())),
+            BootMaster::SelfIsMaster
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("sentinel.conf")).unwrap(),
+            minimal
+        );
+        assert!(ghost_confs(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_missing_conf_quarantines_nothing() {
+        let dir = tempdir().unwrap();
+        assert_eq!(
+            resolve_boot_master(&config_at(dir.path())),
+            BootMaster::NoLocalState
+        );
+        assert!(ghost_confs(dir.path()).is_empty());
     }
 
     #[test]

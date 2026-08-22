@@ -53,6 +53,11 @@ pub fn conf_requires_auth(contents: &str) -> bool {
 /// to fail over to, no writable master anywhere. Renamed aside, never
 /// deleted — the file is the only record of the old world's failover
 /// history. Returns the quarantine path when something moved.
+///
+/// `boot_role::resolve_boot_master` reuses this rename for a second kind of
+/// condemned conf: one with no parseable `sentinel monitor` line at all (a
+/// torn first-boot write), which would otherwise persist forever behind the
+/// wrapper's write-if-absent gate.
 pub fn quarantine_ghost_sentinel_conf(
     data_dir: &str,
 ) -> std::io::Result<Option<std::path::PathBuf>> {
