@@ -30,7 +30,19 @@
 //!    bounded) `INFO replication`. Not master → return immediately, so a
 //!    replica's shutdown does no further work than today's (this one
 //!    fast local round trip is the only difference).
-//! 2. `SENTINEL FAILOVER <master name>` against the LOCAL Sentinel only
+//! 2. Best-effort `CLIENT PAUSE <ms> WRITE` on the local Redis, sized to
+//!    the failover window this sequence can occupy (the confirmation
+//!    deadline, capped at [`MAX_WRITE_PAUSE`]). Every write a
+//!    direct-connected client lands on this master between the failover
+//!    request and the promotion dies with the node — the same lost-write
+//!    tail the docs' manual-failover recipe closes with exactly this
+//!    command. The window was already fence-bounded (/role goes 503,
+//!    HAProxy's shutdown-sessions cuts routed clients over in ~3.5s,
+//!    min-replicas-to-write fences a partitioned master); the pause closes
+//!    what those cannot see: clients holding their own direct connection
+//!    to this node. Failure is a warn, never a blocker — the pause is an
+//!    optimization on top of the fences, not a correctness gate.
+//! 3. `SENTINEL FAILOVER <master name>` against the LOCAL Sentinel only
 //!    (`127.0.0.1:<sentinel_port>`, AUTHed iff the local sentinel.conf
 //!    carries `requirepass` — the same file-resolved
 //!    `local_sentinel_password` every other local watcher uses).
@@ -45,7 +57,7 @@
 //!    logged at `warn` and shutdown proceeds unchanged: a failed demote
 //!    request must never block or slow down the shutdown it was trying to
 //!    speed up.
-//! 3. Poll (every [`POLL_INTERVAL`], each call independently timeout-
+//! 4. Poll (every [`POLL_INTERVAL`], each call independently timeout-
 //!    bounded) `SENTINEL MASTER <master name>` on the local Sentinel until
 //!    BOTH of these hold: its `flags` no longer carry
 //!    `failover_in_progress`, AND its `ip`/`port` (or this node's own `INFO
@@ -54,7 +66,7 @@
 //!    logged at `warn` and shutdown proceeds unchanged.
 //!
 //!    Both signals are required, not just the address change. This node's
-//!    own Sentinel forced itself leader (that is what step 2 asked for), so
+//!    own Sentinel forced itself leader (that is what step 3 asked for), so
 //!    it — not some other survivor — is the one running the ENTIRE failover
 //!    state machine, including `failover-state-reconf-slaves`: sequentially
 //!    telling every OTHER known replica to attach to the winner. That step
@@ -74,6 +86,21 @@
 //!    reason. Checking it ALONE is not enough either: an aborted failover
 //!    (e.g. `-NOGOODSLAVE`) also clears the flag while this node stays
 //!    master, so both must hold together.
+//! 5. Best-effort `REPLICAOF <new_host> <new_port>` on the local Redis, at
+//!    whoever Sentinel last named as master — after a confirmed demote, and
+//!    on the timeout arm too whenever that answer already names another
+//!    node. The confirmation deliberately trusts Sentinel's answer while
+//!    the local Redis may still report `role:master` (the two signals land
+//!    in either order — see `switched_away`), so between confirmation and
+//!    the SIGTERM that follows, a direct-connected client can still land
+//!    writes here that die with the node. `REPLICAOF` is cheap and
+//!    non-destructive (see `link_heal`'s backoff rationale) and flips this
+//!    node read-only immediately; when Sentinel's own reconfiguration
+//!    already landed it is a no-op re-statement of the same attachment.
+//!    Sentinel still naming this node, or never answering, means there is
+//!    nothing safe to point at — skipped. Warn-on-failure, never a blocker:
+//!    the confirmation semantics above are unchanged, this only narrows
+//!    their deliberate tail.
 //!
 //! ## Budget vs. the existing shutdown waits
 //! Railway's SIGTERM grace window is ~30s. `graceful_shutdown` already
@@ -121,7 +148,7 @@ use tracing::{info, warn};
 /// Operator kill switch. Only the literal `false` disables the behavior.
 pub const DEMOTE_ON_SHUTDOWN_ENV: &str = "DEMOTE_ON_SHUTDOWN";
 
-/// Overall deadline for step 3 (the confirmation poll), in milliseconds.
+/// Overall deadline for step 4 (the confirmation poll), in milliseconds.
 pub const DEMOTE_TIMEOUT_ENV: &str = "DEMOTE_ON_SHUTDOWN_TIMEOUT_MS";
 
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
@@ -132,6 +159,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Per-RPC bound (connect + command), independent of the overall poll
 /// deadline — a single hung call must never eat more than this.
 const CALL_DEADLINE: Duration = Duration::from_secs(1);
+
+/// Upper bound on the best-effort `CLIENT PAUSE ... WRITE` issued before
+/// the failover request (module doc, step 2). The pause tracks the
+/// confirmation deadline — the window this sequence can actually occupy —
+/// but an operator-raised [`DEMOTE_TIMEOUT_ENV`] must not translate into an
+/// arbitrarily long client-visible write stall, so it is capped at the same
+/// ~30s scale as Railway's SIGTERM grace window: past that the node is
+/// exiting anyway.
+const MAX_WRITE_PAUSE: Duration = Duration::from_secs(30);
 
 /// What the demote-before-shutdown sequence needs, plumbed in from `Config`
 /// at spawn time. A struct beats five loose parameters threaded through
@@ -257,6 +293,35 @@ pub(crate) fn demote_confirmed(
     failover_finished(failover_flags) && switched_away(own_host, own_port, master_addr, local_role)
 }
 
+/// How long the best-effort write pause holds, in the milliseconds `CLIENT
+/// PAUSE` takes: the confirmation deadline (the window this sequence can
+/// occupy), capped at [`MAX_WRITE_PAUSE`]. `0` — an operator zeroing the
+/// deadline out — means no pause is issued at all.
+pub(crate) fn write_pause_ms(deadline: Duration) -> u64 {
+    deadline.min(MAX_WRITE_PAUSE).as_millis() as u64
+}
+
+/// The address the closing best-effort `REPLICAOF` should point the local
+/// Redis at: Sentinel's last observed master, but only when it names a node
+/// other than this one. Sentinel still naming this node (an aborted
+/// failover) or never having answered means there is nothing safe to attach
+/// to — `None`, and the caller skips the command. Hosts are compared
+/// normalized and the port must match too, same as [`switched_away`].
+pub(crate) fn replicaof_target(
+    own_host: &str,
+    own_port: u16,
+    master_addr: Option<(&str, u16)>,
+) -> Option<(String, u16)> {
+    match master_addr {
+        Some((host, port))
+            if normalize_host(host) != normalize_host(own_host) || port != own_port =>
+        {
+            Some((host.to_string(), port))
+        }
+        _ => None,
+    }
+}
+
 /// Local Redis's role, via a timeout-bounded `INFO replication`.
 /// `Role::Unknown` on any failure (connect refused, handshake timeout, no
 /// role line in the reply) — the caller treats that exactly like "not
@@ -275,6 +340,54 @@ async fn local_role(redis_url: &str) -> Role {
     {
         Ok(Ok(info)) => parse_role(&info),
         _ => Role::Unknown,
+    }
+}
+
+/// Best-effort `CLIENT PAUSE <ms> WRITE` on the local Redis, timeout-
+/// bounded (module doc, step 2). `Err` on an unreachable local Redis, a
+/// timeout, or the server refusing — the caller warns and proceeds without
+/// the pause in every case.
+async fn pause_writes(redis_url: &str, pause_ms: u64) -> Result<(), String> {
+    let Some(mut conn) = connect(redis_url, CALL_DEADLINE).await else {
+        return Err("local redis unreachable".to_string());
+    };
+    match timeout(
+        CALL_DEADLINE,
+        redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(pause_ms)
+            .arg("WRITE")
+            .query_async::<String>(&mut conn),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!("timed out after {:?}", CALL_DEADLINE)),
+    }
+}
+
+/// Best-effort `REPLICAOF <host> <port>` on the local Redis, timeout-
+/// bounded (module doc, step 5). Same idiom as `link_heal::issue_replicaof`
+/// — the command is cheap and non-destructive, and pointing at the master
+/// this node is already attached to is a no-op. `Err` for the caller to
+/// warn on and proceed.
+async fn reattach_to_new_master(redis_url: &str, host: &str, port: u16) -> Result<(), String> {
+    let Some(mut conn) = connect(redis_url, CALL_DEADLINE).await else {
+        return Err("local redis unreachable".to_string());
+    };
+    match timeout(
+        CALL_DEADLINE,
+        redis::cmd("REPLICAOF")
+            .arg(host)
+            .arg(port)
+            .query_async::<()>(&mut conn),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!("timed out after {:?}", CALL_DEADLINE)),
     }
 }
 
@@ -302,6 +415,17 @@ async fn request_failover(sentinel_url: &str, master_name: &str) -> Result<(), S
     }
 }
 
+/// What the confirmation poll ended with: whether [`demote_confirmed`] held
+/// before the deadline, plus Sentinel's last observed master address either
+/// way — the closing best-effort `REPLICAOF` (module doc, step 5) wants
+/// that address even on the timeout arm, when Sentinel already names
+/// another node. A poll iteration where Sentinel gave no usable address
+/// leaves the previous observation standing rather than erasing it.
+struct DemotionWait {
+    confirmed: bool,
+    last_master_addr: Option<(String, u16)>,
+}
+
 /// Poll (see module docs for the two required signals) until the failover
 /// is confirmed or `deadline` elapses. Each RPC is independently bounded by
 /// [`CALL_DEADLINE`] via `sentinel_query::connect`/`get_master_fields`;
@@ -318,8 +442,9 @@ async fn wait_for_demotion(
     own_host: &str,
     own_port: u16,
     deadline: Duration,
-) -> bool {
+) -> DemotionWait {
     let start = Instant::now();
+    let mut last_master_addr: Option<(String, u16)> = None;
     loop {
         let role = local_role(redis_url).await;
         let fields = match connect(sentinel_url, CALL_DEADLINE).await {
@@ -331,6 +456,9 @@ async fn wait_for_demotion(
             let port = field_value(f, "port")?.parse::<u16>().ok()?;
             Some((host, port))
         });
+        if master_addr.is_some() {
+            last_master_addr = master_addr.clone();
+        }
         let flags = fields.as_ref().and_then(|f| field_value(f, "flags"));
         if demote_confirmed(
             own_host,
@@ -339,10 +467,16 @@ async fn wait_for_demotion(
             role,
             flags.as_deref(),
         ) {
-            return true;
+            return DemotionWait {
+                confirmed: true,
+                last_master_addr,
+            };
         }
         if start.elapsed() >= deadline {
-            return false;
+            return DemotionWait {
+                confirmed: false,
+                last_master_addr,
+            };
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -391,6 +525,28 @@ pub async fn demote_before_shutdown(target: &DemoteTarget, sentinel_colocated: b
         "demote-on-shutdown: master shutting down — requesting SENTINEL FAILOVER before stopping redis"
     );
 
+    let deadline = Duration::from_millis(u64::env_parse(DEMOTE_TIMEOUT_ENV, DEFAULT_TIMEOUT_MS));
+
+    // Step 2 (module doc): pause direct-connected clients' writes for the
+    // window the failover can occupy, so what they land here between the
+    // request and the promotion doesn't die with the node. Best-effort —
+    // a failed pause must never block or slow the shutdown, and the node
+    // exits (dropping every connection, pause included) either way.
+    let pause_ms = write_pause_ms(deadline);
+    if pause_ms > 0 {
+        match pause_writes(&redis_url, pause_ms).await {
+            Ok(()) => info!(
+                pause_ms,
+                "demote-on-shutdown: paused writes on the local redis for the failover window"
+            ),
+            Err(err) => warn!(
+                error = %err,
+                pause_ms,
+                "demote-on-shutdown: CLIENT PAUSE WRITE failed — proceeding without the write pause"
+            ),
+        }
+    }
+
     if let Err(err) = request_failover(&sentinel_url, &target.redis_master_name).await {
         warn!(
             error = %err,
@@ -400,9 +556,8 @@ pub async fn demote_before_shutdown(target: &DemoteTarget, sentinel_colocated: b
     }
 
     let own_host = RailwayEnv::private_domain();
-    let deadline = Duration::from_millis(u64::env_parse(DEMOTE_TIMEOUT_ENV, DEFAULT_TIMEOUT_MS));
     let start = Instant::now();
-    if wait_for_demotion(
+    let wait = wait_for_demotion(
         &redis_url,
         &sentinel_url,
         &target.redis_master_name,
@@ -410,8 +565,8 @@ pub async fn demote_before_shutdown(target: &DemoteTarget, sentinel_colocated: b
         target.redis_port,
         deadline,
     )
-    .await
-    {
+    .await;
+    if wait.confirmed {
         info!(
             elapsed_ms = start.elapsed().as_millis() as u64,
             "demote-on-shutdown: failover confirmed — proceeding with shutdown"
@@ -421,6 +576,32 @@ pub async fn demote_before_shutdown(target: &DemoteTarget, sentinel_colocated: b
             timeout_ms = deadline.as_millis() as u64,
             "demote-on-shutdown: timed out waiting for the failover to land — proceeding with normal shutdown"
         );
+    }
+
+    // Step 5 (module doc): whether confirmed or timed out, when Sentinel's
+    // last answer names another node, best-effort REPLICAOF the local redis
+    // at it — flipping this node read-only for the beat between here and
+    // the SIGTERM, where the confirmation deliberately tolerates a local
+    // `role:master`. No usable answer, or an answer still naming this node,
+    // leaves nothing safe to attach to and the command is skipped.
+    if let Some((host, port)) = replicaof_target(
+        &own_host,
+        target.redis_port,
+        wait.last_master_addr
+            .as_ref()
+            .map(|(h, p)| (h.as_str(), *p)),
+    ) {
+        match reattach_to_new_master(&redis_url, &host, port).await {
+            Ok(()) => info!(
+                new_master = %format!("{host}:{port}"),
+                "demote-on-shutdown: re-pointed the local redis at the new master before shutdown"
+            ),
+            Err(err) => warn!(
+                error = %err,
+                new_master = %format!("{host}:{port}"),
+                "demote-on-shutdown: best-effort REPLICAOF failed — proceeding with shutdown"
+            ),
+        }
     }
 }
 
@@ -663,5 +844,80 @@ mod demote_confirmed_tests {
     #[test]
     fn no_signals_at_all_is_not_confirmed() {
         assert!(!demote_confirmed(SELF_HOST, SELF_PORT, None, Role::Master, None));
+    }
+}
+
+#[cfg(test)]
+mod write_pause_tests {
+    use super::*;
+
+    #[test]
+    fn the_pause_tracks_the_confirmation_deadline_below_the_cap() {
+        // The default deadline: the pause covers exactly the window the
+        // demote sequence can occupy, no longer.
+        assert_eq!(write_pause_ms(Duration::from_millis(10_000)), 10_000);
+        assert_eq!(write_pause_ms(Duration::from_millis(2_500)), 2_500);
+    }
+
+    #[test]
+    fn an_operator_raised_deadline_is_capped_at_thirty_seconds() {
+        assert_eq!(write_pause_ms(Duration::from_secs(120)), 30_000);
+        assert_eq!(write_pause_ms(MAX_WRITE_PAUSE), 30_000);
+    }
+
+    #[test]
+    fn a_zeroed_deadline_means_no_pause_at_all() {
+        // DEMOTE_ON_SHUTDOWN_TIMEOUT_MS=0 — the caller skips the CLIENT
+        // PAUSE call entirely rather than sending a zero-length pause.
+        assert_eq!(write_pause_ms(Duration::ZERO), 0);
+    }
+}
+
+#[cfg(test)]
+mod replicaof_target_tests {
+    use super::*;
+
+    const SELF_HOST: &str = "self.railway.internal";
+    const SELF_PORT: u16 = 6379;
+
+    #[test]
+    fn another_node_is_the_target() {
+        assert_eq!(
+            replicaof_target(
+                SELF_HOST,
+                SELF_PORT,
+                Some(("redis-2.railway.internal", 6379))
+            ),
+            Some(("redis-2.railway.internal".to_string(), 6379))
+        );
+    }
+
+    #[test]
+    fn sentinel_still_naming_self_is_never_a_target() {
+        // The aborted-failover case: pointing a master at itself would be
+        // actively wrong, so an answer that is self — including modulo case
+        // and a trailing root dot — yields nothing to attach to.
+        assert_eq!(
+            replicaof_target(SELF_HOST, SELF_PORT, Some((SELF_HOST, SELF_PORT))),
+            None
+        );
+        let aliased_self = ("Self.railway.internal.", SELF_PORT);
+        assert_eq!(
+            replicaof_target(SELF_HOST, SELF_PORT, Some(aliased_self)),
+            None
+        );
+    }
+
+    #[test]
+    fn same_host_different_port_is_a_different_instance_and_a_target() {
+        assert_eq!(
+            replicaof_target(SELF_HOST, SELF_PORT, Some((SELF_HOST, 6380))),
+            Some((SELF_HOST.to_string(), 6380))
+        );
+    }
+
+    #[test]
+    fn no_answer_is_no_target() {
+        assert_eq!(replicaof_target(SELF_HOST, SELF_PORT, None), None);
     }
 }
