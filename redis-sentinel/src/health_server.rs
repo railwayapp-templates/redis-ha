@@ -89,6 +89,9 @@ struct AppState {
     /// default `mymaster`). A cluster with a custom name never matches a
     /// hardcoded "mymaster", so this must come from config, not a literal.
     redis_master_name: String,
+    /// This node's Redis data port. Sentinel's master-addr answer carries a
+    /// port too, and the same host on a different port is not this node.
+    redis_port: u16,
     redis_conn: Arc<Mutex<Option<MultiplexedConnection>>>,
     sentinel_conn: Arc<Mutex<Option<MultiplexedConnection>>>,
     /// Single-flight latch for /switchover: a second promote while the first
@@ -108,12 +111,14 @@ impl AppState {
         sentinel_url: String,
         private_domain: String,
         redis_master_name: String,
+        redis_port: u16,
     ) -> Self {
         Self {
             redis_url,
             sentinel_url,
             private_domain,
             redis_master_name,
+            redis_port,
             redis_conn: Arc::new(Mutex::new(None)),
             sentinel_conn: Arc::new(Mutex::new(None)),
             switchover_in_flight: Arc::new(AtomicBool::new(false)),
@@ -225,9 +230,24 @@ async fn local_role_is_master(state: &AppState) -> bool {
 /// node's /role forever the moment DNS or Sentinel's own announce-hostnames
 /// gossip varies the case or trailing-dot shape of the hostname it reports,
 /// which nothing about this cluster's health actually depends on.
-fn answer_confirms_self(answer_host: &str, private_domain: &str) -> bool {
-    crate::boot_role::normalize_host(answer_host)
-        == crate::boot_role::normalize_host(private_domain)
+///
+/// The port must match too: the same host on a different port is a
+/// different Redis instance (a data port vs a sentinel port on one box, a
+/// stale announce from a previous topology), and confirming it would make
+/// this node serve /role 200 as master of an instance that is not the
+/// cluster's data plane. An unparsable port fails closed.
+fn answer_confirms_self(
+    answer_host: &str,
+    answer_port: &str,
+    private_domain: &str,
+    redis_port: u16,
+) -> bool {
+    crate::boot_role::normalize_host(answer_host) == crate::boot_role::normalize_host(private_domain)
+        && answer_port
+            .trim()
+            .parse::<u16>()
+            .map(|p| p == redis_port)
+            .unwrap_or(false)
 }
 
 /// Check (2): Sentinel confirms this node is the current master.
@@ -249,7 +269,8 @@ async fn sentinel_confirms_master(state: &AppState, master_name: &str) -> bool {
     match result {
         Ok(parts) if parts.len() == 2 => {
             let master_host = &parts[0];
-            let confirmed = answer_confirms_self(master_host, &state.private_domain);
+            let confirmed =
+                answer_confirms_self(master_host, &parts[1], &state.private_domain, state.redis_port);
             if !confirmed {
                 info!(
                     sentinel_master = %master_host,
@@ -584,7 +605,13 @@ async fn run_health_server(
         sentinel_port,
         &local_sentinel_password,
     );
-    let state = AppState::new(redis_url, sentinel_url, private_domain, redis_master_name);
+    let state = AppState::new(
+        redis_url,
+        sentinel_url,
+        private_domain,
+        redis_master_name,
+        redis_port,
+    );
 
     let app = Router::new()
         .route("/health", get(health))
@@ -711,7 +738,9 @@ mod answer_confirms_self_tests {
     fn identical_hosts_confirm() {
         assert!(answer_confirms_self(
             "redis-1.railway.internal",
-            "redis-1.railway.internal"
+            "6379",
+            "redis-1.railway.internal",
+            6379
         ));
     }
 
@@ -719,7 +748,9 @@ mod answer_confirms_self_tests {
     fn case_difference_still_confirms() {
         assert!(answer_confirms_self(
             "Redis-1.Railway.Internal",
-            "redis-1.railway.internal"
+            "6379",
+            "redis-1.railway.internal",
+            6379
         ));
     }
 
@@ -727,7 +758,9 @@ mod answer_confirms_self_tests {
     fn trailing_root_dot_still_confirms() {
         assert!(answer_confirms_self(
             "redis-1.railway.internal.",
-            "redis-1.railway.internal"
+            "6379",
+            "redis-1.railway.internal",
+            6379
         ));
     }
 
@@ -735,7 +768,32 @@ mod answer_confirms_self_tests {
     fn different_host_does_not_confirm() {
         assert!(!answer_confirms_self(
             "redis-2.railway.internal",
-            "redis-1.railway.internal"
+            "6379",
+            "redis-1.railway.internal",
+            6379
+        ));
+    }
+
+    #[test]
+    fn same_host_different_port_does_not_confirm() {
+        // The announced port is part of the instance identity: a sentinel
+        // port on this host answering the master query must not make this
+        // node claim mastership of the data plane.
+        assert!(!answer_confirms_self(
+            "redis-1.railway.internal",
+            "26379",
+            "redis-1.railway.internal",
+            6379
+        ));
+    }
+
+    #[test]
+    fn an_unparsable_port_fails_closed() {
+        assert!(!answer_confirms_self(
+            "redis-1.railway.internal",
+            "not-a-port",
+            "redis-1.railway.internal",
+            6379
         ));
     }
 }

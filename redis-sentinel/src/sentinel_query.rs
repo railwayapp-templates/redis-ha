@@ -37,11 +37,35 @@ use tokio::time::timeout;
 /// the same crate, so what this builds is guaranteed to parse back to the
 /// original password, not merely "usually work."
 pub fn build_redis_url(host: &str, port: u16, password: &str) -> String {
+    // A bare IPv6 literal in a URL authority is a parse error waiting to
+    // happen — the colons read as the port separator. Sentinel's
+    // `get-master-addr-by-name` and peer gossip hand back whatever address
+    // was announced, brackets included or not, so bracket it here once for
+    // every caller. Hostnames and IPv4 never contain ':' and pass through.
+    let authority = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
     if password.is_empty() {
-        return format!("redis://{host}:{port}");
+        return format!("redis://{authority}:{port}");
     }
-    let mut url = url::Url::parse(&format!("redis://{host}:{port}"))
-        .expect("a bare host:port authority always parses");
+    let mut url = match url::Url::parse(&format!("redis://{authority}:{port}")) {
+        Ok(url) => url,
+        Err(err) => {
+            // The host came from the network (a Sentinel answer, a peer's
+            // gossip) and is not URL-authority material — empty, whitespace,
+            // illegal characters. Hand the raw URL back so the redis client
+            // surfaces the same parse failure as a connection error at the
+            // call site; panicking here would take the whole wrapper down.
+            tracing::warn!(
+                host = %host,
+                error = %err,
+                "host is not a parseable URL authority; passing it through for the client to reject"
+            );
+            return format!("redis://{authority}:{port}");
+        }
+    };
     url.set_password(Some(password))
         .expect("a URL with a host always accepts a password");
     url.to_string()
@@ -268,6 +292,55 @@ mod build_redis_url_tests {
         // password into the host/port portion of the URL.
         let url = build_redis_url("redis-2.railway.internal", 26379, "hunter2");
         assert_eq!(url.matches("hunter2").count(), 1);
+    }
+
+    // --- hosts that used to panic (audit R-1) ---
+    //
+    // `Url::parse(...).expect()` turned a bare IPv6 literal — exactly what
+    // `SENTINEL get-master-addr-by-name` returns when a peer announces one —
+    // into a wrapper-killing panic (`InvalidPort`), and any other
+    // non-authority host (empty, whitespace) into one too. These pin the
+    // two replacement behaviors: bracket-and-work for IPv6, pass-through
+    // for garbage.
+
+    #[test]
+    fn a_bare_ipv6_literal_is_bracketed_and_round_trips() {
+        assert_eq!(
+            build_redis_url("fd12::10", 26379, ""),
+            "redis://[fd12::10]:26379"
+        );
+        let url = build_redis_url("fd12::10", 26379, "pw");
+        assert_eq!(url, "redis://:pw@[fd12::10]:26379");
+        let info = url
+            .as_str()
+            .into_connection_info()
+            .unwrap_or_else(|e| panic!("built URL {url:?} failed to parse: {e}"));
+        match info.addr {
+            redis::ConnectionAddr::Tcp(host, _) => assert_eq!(host, "fd12::10"),
+            other => panic!("unexpected addr for a redis:// URL: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_already_bracketed_ipv6_literal_is_not_double_bracketed() {
+        assert_eq!(
+            build_redis_url("[fd12::10]", 26379, ""),
+            "redis://[fd12::10]:26379"
+        );
+    }
+
+    #[test]
+    fn a_non_authority_host_never_panics_and_stays_parseable_by_the_client() {
+        // Garbage from the network must come back as a URL string, not a
+        // panic; the redis crate then rejects it at connection-info parse.
+        for host in ["", "host with space"] {
+            let url = build_redis_url(host, 26379, "pw");
+            assert!(
+                url.starts_with("redis://"),
+                "unexpected URL {url:?} for host {host:?}"
+            );
+            assert!(url.as_str().into_connection_info().is_err());
+        }
     }
 
     // --- passwords with characters that break a hand-interpolated URL ---

@@ -66,12 +66,17 @@
 //! it did before the cross-check, and Sentinel's higher config epoch demotes
 //! it within a failover-timeout once the partition heals.
 //!
-//! The empty-primary guard only covers a boot that reached the peer query:
-//! a volume that kept its sentinel.conf but lost its dataset resolves
-//! locally and never asks the peers. The triggers this guards against —
-//! volume replaced or recreated (template revert, re-conversion, fork) and
-//! the volume-attach race booting on an empty ephemeral dir — lose the
-//! whole volume, sentinel.conf included.
+//! The empty-primary guard covers both ways a boot can claim mastership
+//! over nothing: the peer query naming this node (a wiped volume joining a
+//! live cluster) and a local `sentinel.conf` that survived a partial volume
+//! loss — the conf still names this node as master and its replicas still
+//! follow it, so booting an empty dataset here is the same cluster wipe.
+//! The triggers this guards against — volume replaced or recreated
+//! (template revert, re-conversion, fork) and the volume-attach race
+//! booting on an empty ephemeral dir — lose the whole volume,
+//! sentinel.conf included; `rm` of dump.rdb/AOF alone loses only the
+//! dataset, which is why the conf path refuses on the dataset check rather
+//! than on the conf's absence.
 
 use crate::config::Config;
 use std::io::ErrorKind;
@@ -476,6 +481,12 @@ pub struct BootResolution {
     /// True only when the peer majority named this node and
     /// [`boot_master_from_peer_answer`] refused the answer.
     pub peers_named_self: bool,
+    /// True only when the final role came from a local `sentinel.conf` that
+    /// names this node as master. The conf surviving on the volume means
+    /// Sentinel — and every replica following it — still considers this node
+    /// the master, so the empty-primary boot guard must refuse an empty
+    /// dataset on this path too, not just on the peer-query path.
+    pub conf_names_self: bool,
 }
 
 impl BootResolution {
@@ -483,6 +494,7 @@ impl BootResolution {
         Self {
             master,
             peers_named_self: false,
+            conf_names_self: false,
         }
     }
 }
@@ -545,7 +557,9 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
     }
     if !matches!(resolved, BootMaster::NoLocalState) {
         info!("{}", boot_role_log_line(config, &resolved));
-        return BootResolution::of(resolved);
+        let mut resolution = BootResolution::of(resolved);
+        resolution.conf_names_self = matches!(resolution.master, BootMaster::SelfIsMaster);
+        return resolution;
     }
 
     let mut peers_named_self = false;
@@ -594,6 +608,7 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
     BootResolution {
         master: resolved,
         peers_named_self,
+        conf_names_self: false,
     }
 }
 
@@ -733,19 +748,26 @@ pub enum EmptyPrimaryBoot {
 /// Pure (zero-I/O) decision, mirroring `decide_link_heal`: the wrapper
 /// gathers the observations and performs the log + telemetry + exit.
 ///
-/// All four must hold. `peers_named_self` already implies Sentinel is
-/// enabled and the resolution had no usable local state (only the peer
-/// query produces it), so neither is a separate input. `is_primary` scopes
-/// the guard to the one node the env fallback would self-promote; a
-/// loadable dataset means the incumbent master is restarting normally and
-/// the env fallback stays.
+/// Either self-mastership claim with an empty dataset refuses. The peer
+/// query naming this node requires `is_primary` too — that path lands in
+/// the env fallback, where only an env-primary would self-promote. The
+/// local-conf path does not: `sentinel.conf` naming this node overrides
+/// `REPLICA_OF` and boots a master regardless of the env topology, so the
+/// conf alone is the dangerous signal. `peers_named_self` already implies
+/// Sentinel is enabled and the resolution had no usable local state (only
+/// the peer query produces it), so neither is a separate input;
+/// `holds_dataset` scopes the guard to a node with nothing to serve — the
+/// incumbent master restarting normally still boots.
 pub fn decide_empty_primary_boot(
     peers_named_self: bool,
+    conf_names_self: bool,
     is_primary: bool,
     holds_dataset: bool,
     guard_enabled: bool,
 ) -> EmptyPrimaryBoot {
-    if guard_enabled && peers_named_self && is_primary && !holds_dataset {
+    let peer_path_dangerous = peers_named_self && is_primary;
+    let conf_path_dangerous = conf_names_self;
+    if guard_enabled && (peer_path_dangerous || conf_path_dangerous) && !holds_dataset {
         EmptyPrimaryBoot::Refuse
     } else {
         EmptyPrimaryBoot::Proceed
@@ -757,6 +779,7 @@ pub fn decide_empty_primary_boot(
 pub fn empty_primary_boot_guard(config: &Config, resolution: &BootResolution) -> EmptyPrimaryBoot {
     decide_empty_primary_boot(
         resolution.peers_named_self,
+        resolution.conf_names_self,
         config.is_primary(),
         Config::holds_redis_dataset(&config.data_dir),
         enabled(std::env::var(EMPTY_PRIMARY_GUARD_ENV).ok().as_deref()),
@@ -930,7 +953,7 @@ mod tests {
         // The wipe scenario: env-primary, fresh/wiped volume, cluster never
         // failed over. Every replica would full-resync the empty dataset.
         assert_eq!(
-            decide_empty_primary_boot(true, true, false, true),
+            decide_empty_primary_boot(true, false, true, false, true),
             EmptyPrimaryBoot::Refuse
         );
     }
@@ -939,7 +962,7 @@ mod tests {
     fn a_peer_answer_naming_another_node_never_refuses() {
         // ReplicaOf path, or no peer answered at all — the guard has no say.
         assert_eq!(
-            decide_empty_primary_boot(false, true, false, true),
+            decide_empty_primary_boot(false, false, true, false, true),
             EmptyPrimaryBoot::Proceed
         );
     }
@@ -949,7 +972,7 @@ mod tests {
         // REPLICA_OF set: the env fallback boots a stale replica, which
         // Sentinel's master-in-slave-role handling resolves — never a wipe.
         assert_eq!(
-            decide_empty_primary_boot(true, false, false, true),
+            decide_empty_primary_boot(true, false, false, false, true),
             EmptyPrimaryBoot::Proceed
         );
     }
@@ -959,7 +982,7 @@ mod tests {
         // The peers naming us master with data on disk is the incumbent
         // master restarting normally — the env fallback stays.
         assert_eq!(
-            decide_empty_primary_boot(true, true, true, true),
+            decide_empty_primary_boot(true, false, true, true, true),
             EmptyPrimaryBoot::Proceed
         );
     }
@@ -967,7 +990,46 @@ mod tests {
     #[test]
     fn the_kill_switch_restores_the_env_fallback() {
         assert_eq!(
-            decide_empty_primary_boot(true, true, false, false),
+            decide_empty_primary_boot(true, false, true, false, false),
+            EmptyPrimaryBoot::Proceed
+        );
+    }
+
+    // --- the sentinel.conf path (audit R-2) ---
+    //
+    // A volume that lost dump.rdb/AOF but kept its sentinel.conf resolves
+    // locally as SelfIsMaster and never reaches the peer query, so the
+    // peers-only guard let it boot an empty master the replicas would
+    // full-resync from — the same wipe, reached without any peer involved.
+
+    #[test]
+    fn an_empty_master_the_local_conf_still_names_is_refused() {
+        // conf_names_self overrides REPLICA_OF when booting, so the refusal
+        // must not depend on the env topology at all.
+        assert_eq!(
+            decide_empty_primary_boot(false, true, false, false, true),
+            EmptyPrimaryBoot::Refuse
+        );
+        assert_eq!(
+            decide_empty_primary_boot(false, true, true, false, true),
+            EmptyPrimaryBoot::Refuse
+        );
+    }
+
+    #[test]
+    fn a_conf_named_master_with_a_dataset_boots_as_today() {
+        // The incumbent master restarting normally: the conf names it, and
+        // the dataset is on disk.
+        assert_eq!(
+            decide_empty_primary_boot(false, true, true, true, true),
+            EmptyPrimaryBoot::Proceed
+        );
+    }
+
+    #[test]
+    fn the_conf_path_kill_switch_restores_the_boot() {
+        assert_eq!(
+            decide_empty_primary_boot(false, true, true, false, false),
             EmptyPrimaryBoot::Proceed
         );
     }
@@ -982,6 +1044,7 @@ mod tests {
         let refused = BootResolution {
             master: BootMaster::NoLocalState,
             peers_named_self: true,
+            conf_names_self: false,
         };
         assert_eq!(
             empty_primary_boot_guard(&config, &refused),
@@ -994,6 +1057,26 @@ mod tests {
         );
         assert_eq!(
             empty_primary_boot_guard(&config, &BootResolution::of(BootMaster::NoLocalState)),
+            EmptyPrimaryBoot::Proceed
+        );
+    }
+
+    #[test]
+    fn the_guard_refuses_a_wiped_dataset_the_conf_still_names() {
+        let dir = tempdir().unwrap();
+        let config = config_at(dir.path());
+        let conf_named_self = BootResolution {
+            master: BootMaster::SelfIsMaster,
+            peers_named_self: false,
+            conf_names_self: true,
+        };
+        assert_eq!(
+            empty_primary_boot_guard(&config, &conf_named_self),
+            EmptyPrimaryBoot::Refuse
+        );
+        fs::write(dir.path().join("appendonly.aof"), b"*2").unwrap();
+        assert_eq!(
+            empty_primary_boot_guard(&config, &conf_named_self),
             EmptyPrimaryBoot::Proceed
         );
     }
