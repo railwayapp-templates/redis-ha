@@ -323,7 +323,10 @@ pub fn boot_role_log_line(config: &Config, resolved: &BootMaster) -> String {
             host, port, config.replica_of
         ),
         BootMaster::ReplicaOf(host, port) => {
-            format!("boot role: replica of {}:{} (from sentinel.conf)", host, port)
+            format!(
+                "boot role: replica of {}:{} (from sentinel.conf)",
+                host, port
+            )
         }
         BootMaster::SelfIsMaster if overridden => format!(
             "boot role: master (sentinel.conf names this node — overriding REPLICA_OF={:?})",
@@ -570,7 +573,18 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
     }
     if !enabled(std::env::var(BOOT_ROLE_ENV).ok().as_deref()) {
         info!("boot role: from env topology ({}=false)", BOOT_ROLE_ENV);
-        return BootResolution::of(BootMaster::NoLocalState);
+        // Role comes from the env, but the empty-primary guard still needs
+        // to see a surviving sentinel.conf that names this node — otherwise
+        // BOOT_ROLE=false blinds the conf-path arm of R-2.
+        let conf_names_self = matches!(
+            classify_local_state(config),
+            LocalSentinelState::Usable(BootMaster::SelfIsMaster)
+        );
+        return BootResolution {
+            master: BootMaster::NoLocalState,
+            peers_named_self: false,
+            conf_names_self,
+        };
     }
     let resolved = match classify_local_state(config) {
         LocalSentinelState::Usable(resolved) => resolved,
@@ -982,11 +996,7 @@ mod tests {
     fn a_peer_answer_naming_another_node_contradicts_the_self_master_boot() {
         let config = Config::for_tests();
         assert_eq!(
-            classify_self_master_peer_answer(
-                &config,
-                "redis-2.railway.internal".to_string(),
-                6379
-            ),
+            classify_self_master_peer_answer(&config, "redis-2.railway.internal".to_string(), 6379),
             SelfMasterPeerAnswer::NamesOther("redis-2.railway.internal".to_string(), 6379)
         );
     }
@@ -995,11 +1005,7 @@ mod tests {
     fn a_peer_answer_naming_this_host_on_another_port_contradicts_it_too() {
         let config = Config::for_tests();
         assert_eq!(
-            classify_self_master_peer_answer(
-                &config,
-                "redis-1.railway.internal".to_string(),
-                6380
-            ),
+            classify_self_master_peer_answer(&config, "redis-1.railway.internal".to_string(), 6380),
             SelfMasterPeerAnswer::NamesOther("redis-1.railway.internal".to_string(), 6380)
         );
     }
@@ -1257,7 +1263,10 @@ mod tests {
 
     #[test]
     fn garbage_file_has_no_monitor_line() {
-        assert_eq!(parse_sentinel_monitor("\u{0}\u{1}not a config at all", "mymaster"), None);
+        assert_eq!(
+            parse_sentinel_monitor("\u{0}\u{1}not a config at all", "mymaster"),
+            None
+        );
         assert_eq!(parse_sentinel_monitor("", "mymaster"), None);
     }
 
@@ -1269,7 +1278,10 @@ mod tests {
 
     #[test]
     fn a_truncated_monitor_line_is_not_a_match() {
-        assert_eq!(parse_sentinel_monitor("sentinel monitor mymaster\n", "mymaster"), None);
+        assert_eq!(
+            parse_sentinel_monitor("sentinel monitor mymaster\n", "mymaster"),
+            None
+        );
         assert_eq!(
             parse_sentinel_monitor("sentinel monitor mymaster redis-2\n", "mymaster"),
             None
@@ -1737,5 +1749,21 @@ mod tests {
             BootResolution::of(BootMaster::NoLocalState)
         );
         assert!(dir.path().join("sentinel.conf").exists());
+    }
+
+    #[test]
+    fn classify_self_is_master_is_the_conf_names_self_signal() {
+        // The BOOT_ROLE=false arm of boot_master_for_this_boot must still
+        // surface this so the empty-primary guard's conf-path sees it.
+        let dir = tempdir().unwrap();
+        let config = config_at(dir.path());
+        write_sentinel_conf(
+            dir.path(),
+            "sentinel monitor mymaster redis-1.railway.internal 6379 2\n",
+        );
+        assert_eq!(
+            classify_local_state(&config),
+            LocalSentinelState::Usable(BootMaster::SelfIsMaster)
+        );
     }
 }
