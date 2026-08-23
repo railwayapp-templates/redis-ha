@@ -278,6 +278,23 @@ pub(crate) fn classify_local_state(config: &Config) -> LocalSentinelState {
     LocalSentinelState::Usable(resolved)
 }
 
+/// Side-effect-free read of "does sentinel.conf name this node as master",
+/// for the empty-primary guard when `BOOT_ROLE_FROM_SENTINEL_STATE=false`.
+/// Unlike [`resolve_boot_master`] this never quarantines a torn conf — the
+/// kill switch's contract is that no file on the volume is touched. A torn
+/// or unreadable conf reads as `false` (the guard then relies on its peer
+/// arm, exactly as on main before this evidence existed).
+pub(crate) fn conf_names_self_for_guard(config: &Config) -> bool {
+    let path = format!("{}/sentinel.conf", config.data_dir);
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    match parse_sentinel_monitor(&contents, &config.redis_master_name) {
+        Some((host, port)) => addr_is_self(config, &host, port),
+        None => false,
+    }
+}
+
 /// Condemn local state whose master failed the membership probe: it is
 /// quarantined (renamed aside, never deleted) and this boot proceeds as if
 /// it had none — the peer query / env fallback re-anchor the node to the
@@ -323,7 +340,10 @@ pub fn boot_role_log_line(config: &Config, resolved: &BootMaster) -> String {
             host, port, config.replica_of
         ),
         BootMaster::ReplicaOf(host, port) => {
-            format!("boot role: replica of {}:{} (from sentinel.conf)", host, port)
+            format!(
+                "boot role: replica of {}:{} (from sentinel.conf)",
+                host, port
+            )
         }
         BootMaster::SelfIsMaster if overridden => format!(
             "boot role: master (sentinel.conf names this node — overriding REPLICA_OF={:?})",
@@ -570,7 +590,18 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
     }
     if !enabled(std::env::var(BOOT_ROLE_ENV).ok().as_deref()) {
         info!("boot role: from env topology ({}=false)", BOOT_ROLE_ENV);
-        return BootResolution::of(BootMaster::NoLocalState);
+        // Role comes from the env, but the empty-primary guard still needs
+        // to see a surviving sentinel.conf that names this node — otherwise
+        // BOOT_ROLE=false blinds the conf-path arm of R-2. Read PURELY:
+        // classify_local_state quarantines (renames) a torn conf as a side
+        // effect, and the kill switch's contract is that it never mutates
+        // files — the guard gets the evidence bit, the volume stays as-is.
+        let conf_names_self = conf_names_self_for_guard(config);
+        return BootResolution {
+            master: BootMaster::NoLocalState,
+            peers_named_self: false,
+            conf_names_self,
+        };
     }
     let resolved = match classify_local_state(config) {
         LocalSentinelState::Usable(resolved) => resolved,
@@ -982,11 +1013,7 @@ mod tests {
     fn a_peer_answer_naming_another_node_contradicts_the_self_master_boot() {
         let config = Config::for_tests();
         assert_eq!(
-            classify_self_master_peer_answer(
-                &config,
-                "redis-2.railway.internal".to_string(),
-                6379
-            ),
+            classify_self_master_peer_answer(&config, "redis-2.railway.internal".to_string(), 6379),
             SelfMasterPeerAnswer::NamesOther("redis-2.railway.internal".to_string(), 6379)
         );
     }
@@ -995,11 +1022,7 @@ mod tests {
     fn a_peer_answer_naming_this_host_on_another_port_contradicts_it_too() {
         let config = Config::for_tests();
         assert_eq!(
-            classify_self_master_peer_answer(
-                &config,
-                "redis-1.railway.internal".to_string(),
-                6380
-            ),
+            classify_self_master_peer_answer(&config, "redis-1.railway.internal".to_string(), 6380),
             SelfMasterPeerAnswer::NamesOther("redis-1.railway.internal".to_string(), 6380)
         );
     }
@@ -1257,7 +1280,10 @@ mod tests {
 
     #[test]
     fn garbage_file_has_no_monitor_line() {
-        assert_eq!(parse_sentinel_monitor("\u{0}\u{1}not a config at all", "mymaster"), None);
+        assert_eq!(
+            parse_sentinel_monitor("\u{0}\u{1}not a config at all", "mymaster"),
+            None
+        );
         assert_eq!(parse_sentinel_monitor("", "mymaster"), None);
     }
 
@@ -1269,7 +1295,10 @@ mod tests {
 
     #[test]
     fn a_truncated_monitor_line_is_not_a_match() {
-        assert_eq!(parse_sentinel_monitor("sentinel monitor mymaster\n", "mymaster"), None);
+        assert_eq!(
+            parse_sentinel_monitor("sentinel monitor mymaster\n", "mymaster"),
+            None
+        );
         assert_eq!(
             parse_sentinel_monitor("sentinel monitor mymaster redis-2\n", "mymaster"),
             None
@@ -1737,5 +1766,53 @@ mod tests {
             BootResolution::of(BootMaster::NoLocalState)
         );
         assert!(dir.path().join("sentinel.conf").exists());
+    }
+
+    #[test]
+    fn the_kill_switch_guard_read_never_quarantines_a_torn_conf() {
+        // BOOT_ROLE_FROM_SENTINEL_STATE=false must never mutate files on the
+        // volume — the guard evidence is a pure read. A torn conf reads as
+        // "does not name self" and STAYS ON DISK (resolve_boot_master would
+        // have renamed it aside).
+        let dir = tempdir().unwrap();
+        let config = config_at(dir.path());
+        write_sentinel_conf(dir.path(), "sentinel monitor mymaster\n");
+        assert!(!conf_names_self_for_guard(&config));
+        assert!(dir.path().join("sentinel.conf").exists());
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .all(|e| !e.file_name().to_string_lossy().contains("ghost")),
+            "no quarantine rename may happen on the pure guard read"
+        );
+    }
+
+    #[test]
+    fn the_kill_switch_guard_read_sees_a_self_naming_conf() {
+        let dir = tempdir().unwrap();
+        let config = config_at(dir.path());
+        write_sentinel_conf(
+            dir.path(),
+            "sentinel monitor mymaster redis-1.railway.internal 6379 2\n",
+        );
+        assert!(conf_names_self_for_guard(&config));
+        assert!(dir.path().join("sentinel.conf").exists());
+    }
+
+    #[test]
+    fn classify_self_is_master_is_the_conf_names_self_signal() {
+        // The BOOT_ROLE=false arm of boot_master_for_this_boot must still
+        // surface this so the empty-primary guard's conf-path sees it.
+        let dir = tempdir().unwrap();
+        let config = config_at(dir.path());
+        write_sentinel_conf(
+            dir.path(),
+            "sentinel monitor mymaster redis-1.railway.internal 6379 2\n",
+        );
+        assert_eq!(
+            classify_local_state(&config),
+            LocalSentinelState::Usable(BootMaster::SelfIsMaster)
+        );
     }
 }

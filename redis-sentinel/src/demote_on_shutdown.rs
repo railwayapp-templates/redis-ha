@@ -52,11 +52,13 @@
 //!    published so that the other Sentinels will update their
 //!    configurations)."* (<https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/#sentinel-api>,
 //!    `SENTINEL FAILOVER` entry). So this neither needs nor waits on any
-//!    other Sentinel's agreement — only the local one has to be up. Any
-//!    error (`-NOGOODSLAVE`, `-INPROG`, the local Sentinel unreachable) is
-//!    logged at `warn` and shutdown proceeds unchanged: a failed demote
-//!    request must never block or slow down the shutdown it was trying to
-//!    speed up.
+//!    other Sentinel's agreement — only the local one has to be up.
+//!    `-INPROG` means a failover is already running — wait for it and
+//!    still run REPLICAOF, otherwise this node stays writable beside the
+//!    winner. Other errors (`-NOGOODSLAVE`, the local Sentinel unreachable)
+//!    are logged at `warn` and shutdown proceeds unchanged: a failed
+//!    demote request must never block or slow down the shutdown it was
+//!    trying to speed up.
 //! 4. Poll (every [`POLL_INTERVAL`], each call independently timeout-
 //!    bounded) `SENTINEL MASTER <master name>` on the local Sentinel until
 //!    BOTH of these hold: its `flags` no longer carry
@@ -394,8 +396,8 @@ async fn reattach_to_new_master(redis_url: &str, host: &str, port: u16) -> Resul
 /// `SENTINEL FAILOVER <master_name>` against the local Sentinel, timeout-
 /// bounded. `Err` covers every way this can fail to help: the local
 /// Sentinel unreachable, the call timing out, or Sentinel itself refusing
-/// (`-NOGOODSLAVE`, `-INPROG`, ...) — the caller logs and proceeds with the
-/// normal shutdown in every case.
+/// (`-NOGOODSLAVE`, `-INPROG`, ...). The caller waits out `-INPROG` and
+/// still runs REPLICAOF; other errors log and proceed with shutdown.
 async fn request_failover(sentinel_url: &str, master_name: &str) -> Result<(), String> {
     let Some(mut conn) = connect(sentinel_url, CALL_DEADLINE).await else {
         return Err("local sentinel unreachable".to_string());
@@ -547,12 +549,25 @@ pub async fn demote_before_shutdown(target: &DemoteTarget, sentinel_colocated: b
         }
     }
 
-    if let Err(err) = request_failover(&sentinel_url, &target.redis_master_name).await {
-        warn!(
-            error = %err,
-            "demote-on-shutdown: SENTINEL FAILOVER request failed — proceeding with normal shutdown"
-        );
-        return;
+    match request_failover(&sentinel_url, &target.redis_master_name).await {
+        Ok(()) => {}
+        // `-INPROG`: a failover is already running (another Sentinel started
+        // it, or a previous SIGTERM did). Skipping wait + REPLICAOF here
+        // leaves this node writable while the winner is already serving —
+        // the dual-writer tail step 5 exists to close. Wait it out.
+        Err(err) if err.to_ascii_uppercase().contains("INPROG") => {
+            warn!(
+                error = %err,
+                "demote-on-shutdown: SENTINEL FAILOVER already in progress — waiting for it"
+            );
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "demote-on-shutdown: SENTINEL FAILOVER request failed — proceeding with normal shutdown"
+            );
+            return;
+        }
     }
 
     let own_host = RailwayEnv::private_domain();
@@ -727,7 +742,12 @@ mod switched_away_tests {
 
     #[test]
     fn replica_role_alone_confirms_it() {
-        assert!(switched_away("self.railway.internal", 6379, None, Role::Replica));
+        assert!(switched_away(
+            "self.railway.internal",
+            6379,
+            None,
+            Role::Replica
+        ));
     }
 
     #[test]
@@ -775,12 +795,22 @@ mod switched_away_tests {
 
     #[test]
     fn no_master_addr_and_still_master_is_not_confirmed() {
-        assert!(!switched_away("self.railway.internal", 6379, None, Role::Master));
+        assert!(!switched_away(
+            "self.railway.internal",
+            6379,
+            None,
+            Role::Master
+        ));
     }
 
     #[test]
     fn unknown_role_with_no_master_addr_is_not_confirmed() {
-        assert!(!switched_away("self.railway.internal", 6379, None, Role::Unknown));
+        assert!(!switched_away(
+            "self.railway.internal",
+            6379,
+            None,
+            Role::Unknown
+        ));
     }
 }
 
@@ -825,7 +855,13 @@ mod demote_confirmed_tests {
 
     #[test]
     fn replica_role_plus_finished_confirms_it() {
-        assert!(demote_confirmed(SELF_HOST, SELF_PORT, None, Role::Replica, DONE));
+        assert!(demote_confirmed(
+            SELF_HOST,
+            SELF_PORT,
+            None,
+            Role::Replica,
+            DONE
+        ));
     }
 
     #[test]
@@ -843,7 +879,13 @@ mod demote_confirmed_tests {
 
     #[test]
     fn no_signals_at_all_is_not_confirmed() {
-        assert!(!demote_confirmed(SELF_HOST, SELF_PORT, None, Role::Master, None));
+        assert!(!demote_confirmed(
+            SELF_HOST,
+            SELF_PORT,
+            None,
+            Role::Master,
+            None
+        ));
     }
 }
 
