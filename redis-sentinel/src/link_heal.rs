@@ -93,9 +93,12 @@ use redis::aio::MultiplexedConnection;
 use redis::Client;
 use std::env;
 use std::fs;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 use tracing::{info, warn};
+
+use crate::atomic_write::write_atomic;
 
 const STATE_FILENAME: &str = ".link_heal_state";
 
@@ -454,6 +457,12 @@ fn read_state_field(state_path: &str, field: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+// A torn state write is not benign here: read_state_field treats a truncated
+// file as absence, which launders the dwell window and the attempt cap — the
+// limiter forgets it already acted and acts again sooner than the window
+// allows. Every write below therefore goes through write_atomic
+// (tmp-in-same-dir + fsync + rename), so a crash mid-write leaves the
+// previous complete state, never a half of the new one.
 fn write_state_field(state_path: &str, field: &str, value: &str) -> std::io::Result<()> {
     let prefix = format!("{field}=");
     let existing = fs::read_to_string(state_path).unwrap_or_default();
@@ -465,7 +474,7 @@ fn write_state_field(state_path: &str, field: &str, value: &str) -> std::io::Res
     new_lines.push(format!("{field}={value}"));
     let mut out = new_lines.join("\n");
     out.push('\n');
-    fs::write(state_path, out)
+    write_atomic(Path::new(state_path), &out, None)
 }
 
 fn clear_state_field(state_path: &str, field: &str) -> std::io::Result<()> {
@@ -482,7 +491,7 @@ fn clear_state_field(state_path: &str, field: &str) -> std::io::Result<()> {
     if !out.is_empty() {
         out.push('\n');
     }
-    fs::write(state_path, out)
+    write_atomic(Path::new(state_path), &out, None)
 }
 
 /// Append an `attempt=<epoch>` line. Purely additive; pruning happens at
@@ -493,7 +502,9 @@ fn append_attempt(state_path: &str, now: i64) {
     lines.push(format!("attempt={now}"));
     let mut out = lines.join("\n");
     out.push('\n');
-    let _ = fs::write(state_path, out);
+    if let Err(e) = write_atomic(Path::new(state_path), &out, None) {
+        warn!(error = %e, state_path, "link-heal: failed to record heal attempt");
+    }
 }
 
 fn recent_action_count(state_path: &str, now: i64, window_secs: u64) -> u32 {
