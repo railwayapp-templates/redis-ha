@@ -2685,6 +2685,81 @@ t_maxmemory_pressure_keeps_cluster_stable() {
   ok "$t"
 }
 
+# The noeviction stamp above is the default, not the only contract: a cache
+# dataset opts in to eviction with MAXMEMORY_POLICY (validated by the
+# wrapper, stamped with the ceiling). Same fill as the noeviction scenario,
+# opposite behavior at the ceiling: the write is admitted and paid for with
+# evictions instead of refused with -OOM. The policy is read per node, so
+# the stamp is asserted on all three — eviction runs on whichever node holds
+# the master role, and a policy missing from a replica silently reverts the
+# cluster to noeviction at the first failover.
+t_maxmemory_policy_opt_in_evicts_instead_of_refusing() {
+  local t=t_maxmemory_policy_opt_in_evicts_instead_of_refusing
+  # REPL_BACKLOG_SIZE shrunk to keep the scenario's proportions honest: the
+  # replication backlog exists once replicas attach, counts against
+  # maxmemory, and is not evictable — against this test's 24MiB ceiling the
+  # stamped 64mb default swallows the whole budget and eviction can never
+  # satisfy the ceiling (evict-everything, then -OOM forever, which reads
+  # as "eviction doesn't work"). At the real default ceiling (75% of a
+  # >=512MiB container) the same 64mb backlog is a rounding error.
+  start_ha_trio ev -e MAXMEMORY_MB=24 -e MAXMEMORY_POLICY=allkeys-lru \
+    -e REPL_BACKLOG_SIZE=1mb \
+    || { ko "$t" "trio never reached steady state" ev-1 ev-2 ev-3; return; }
+  local n
+  for n in ev-1 ev-2 ev-3; do
+    [ "$(rcli "$n" CONFIG GET maxmemory-policy | tail -1)" = "allkeys-lru" ] \
+      || { ko "$t" "maxmemory-policy was not stamped from MAXMEMORY_POLICY on ${n}" "$n"; return; }
+  done
+
+  # Fill past the ceiling: the same 40k x 1KiB against 24MiB as the
+  # noeviction scenario above.
+  docker exec -e PW="$PW" ev-1 sh -c '
+    pad=$(head -c 1024 /dev/zero | tr "\0" "x")
+    for i in $(seq 1 40000); do echo "SET pad:$i $pad"; done \
+      | redis-cli -a "$PW" --pipe' >/dev/null 2>&1 || true
+
+  # At the ceiling a plain write is admitted, not refused...
+  write_key ev-1 evprobe admitted 30 \
+    || { ko "$t" "write at the ceiling was refused despite allkeys-lru" ev-1; return; }
+
+  # ...and the admissions were paid for with evictions.
+  local evicted
+  evicted=$(rcli ev-1 INFO stats | tr -d '\r' | awk -F: '/^evicted_keys:/{print $2}')
+  [ "${evicted:-0}" -gt 0 ] 2>/dev/null \
+    || { ko "$t" "nothing was evicted under pressure (evicted_keys=${evicted:-unreadable})" ev-1; return; }
+
+  # Replication survives the eviction churn (evictions reach replicas as
+  # DELs), and the admitted write lands on a replica.
+  [ "$(link_status ev-2)" = "up" ] && [ "$(link_status ev-3)" = "up" ] \
+    || { ko "$t" "replication link broke under eviction churn" ev-1 ev-2 ev-3; return; }
+  wait_for_key ev-2 evprobe admitted \
+    || { ko "$t" "the admitted write never replicated" ev-1 ev-2; return; }
+
+  docker rm -f ev-1 ev-2 ev-3 >/dev/null 2>&1
+  ok "$t"
+}
+
+# The guard on that opt-in: redis-server refuses to boot over an unknown
+# maxmemory-policy value, so a typo'd variable edit passed through verbatim
+# would crash-loop the node on its next restart. The wrapper validates and
+# keeps noeviction instead — the node must come up, warn, and run the safe
+# default.
+t_invalid_maxmemory_policy_boots_on_noeviction() {
+  local t=t_invalid_maxmemory_policy_boots_on_noeviction
+  mkvol evbad-vol
+  start_node evbad evbad-vol /data -e MAXMEMORY_MB=24 -e MAXMEMORY_POLICY=allkeys-lruu
+  wait_for_ping evbad \
+    || { ko "$t" "node with a typo'd policy never came up" evbad; return; }
+  [ "$(rcli evbad CONFIG GET maxmemory-policy | tail -1)" = "noeviction" ] \
+    || { ko "$t" "typo'd policy was not replaced by noeviction" evbad; return; }
+  # Not `grep -q` — see t_restart_old_master_rejoins_as_replica on the
+  # SIGPIPE false negative; read the logs to completion.
+  docker logs evbad 2>&1 | grep -F "not a redis eviction policy" >/dev/null \
+    || { ko "$t" "fallback happened without the warning that makes it visible" evbad; return; }
+  docker rm -f evbad >/dev/null 2>&1
+  ok "$t"
+}
+
 # ----- runner ------------------------------------------------------------------
 ALL_TESTS=(
   t_fresh_boot
@@ -2724,6 +2799,8 @@ ALL_TESTS=(
   t_scale_up_of_unauthed_cluster_stays_unauthed
   t_password_variable_edit_does_not_rotate
   t_maxmemory_pressure_keeps_cluster_stable
+  t_maxmemory_policy_opt_in_evicts_instead_of_refusing
+  t_invalid_maxmemory_policy_boots_on_noeviction
 )
 
 setup
