@@ -222,14 +222,18 @@ pub fn generate_redis_conf(config: &Config, boot_master: &BootMaster) -> String 
 
     // Absent when no cgroup memory limit could be detected and no
     // MAXMEMORY_MB override was set — Redis then has no ceiling, same as
-    // every boot before this existed. `noeviction`, not an eviction policy:
+    // every boot before this existed. The policy defaults to `noeviction`:
     // this dataset backs correctness-sensitive uses (queues, idempotency
     // keys, rate limits), so silently discarding a live key under memory
     // pressure is worse than failing the write that would have crossed the
-    // ceiling. See Config::maxmemory_bytes for why 75%, not 100%.
+    // ceiling. A cache dataset opts in to eviction with MAXMEMORY_POLICY
+    // (validated in Config) — set on every data node, because eviction runs
+    // on whichever node currently holds the master role: a policy set only
+    // on today's master stops evicting at the first failover. See
+    // Config::maxmemory_bytes for why 75%, not 100%.
     if let Some(bytes) = config.maxmemory_bytes {
         lines.push(format!("maxmemory {bytes}"));
-        lines.push("maxmemory-policy noeviction".to_string());
+        lines.push(format!("maxmemory-policy {}", config.maxmemory_policy));
     }
 
     if config.sentinel_enabled {
@@ -650,7 +654,7 @@ mod tests {
         assert!(conf.contains("client-output-buffer-limit replica 1gb 256mb 180"));
     }
 
-    // --- maxmemory: absent by default, stamped (with noeviction) when set ---
+    // --- maxmemory: absent by default, stamped (with the policy) when set ---
 
     #[test]
     fn no_maxmemory_directive_when_none_was_detected() {
@@ -682,6 +686,17 @@ mod tests {
         let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
         assert!(conf.contains("maxmemory 536870912"));
         assert!(conf.contains("maxmemory-policy noeviction"));
+    }
+
+    #[test]
+    fn an_opted_in_eviction_policy_is_stamped_instead_of_noeviction() {
+        let dir = tempdir().unwrap();
+        let mut config = config_at(dir.path().to_str().unwrap());
+        config.maxmemory_bytes = Some(1_610_612_736);
+        config.maxmemory_policy = "allkeys-lru".to_string();
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(conf.contains("maxmemory-policy allkeys-lru"));
+        assert!(!conf.contains("noeviction"));
     }
 
     // --- quote_conf_value: every branch ---

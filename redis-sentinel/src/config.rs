@@ -46,6 +46,13 @@ pub struct Config {
     /// client/replication buffers, which don't count against `maxmemory`
     /// either.
     pub maxmemory_bytes: Option<u64>,
+    /// `maxmemory-policy` to stamp alongside the ceiling: `MAXMEMORY_POLICY`
+    /// when it names a policy redis-server actually has, `noeviction`
+    /// otherwise. Validated here rather than passed through because
+    /// redis-server refuses to boot over an unknown enum value — a typo'd
+    /// variable edit passed through verbatim would crash-loop the node on
+    /// its next restart, taking the database down over a config knob.
+    pub maxmemory_policy: String,
 }
 
 impl Config {
@@ -83,7 +90,46 @@ impl Config {
             data_dir: Self::resolve_data_dir(),
             private_domain: RailwayEnv::private_domain(),
             maxmemory_bytes: Self::resolve_maxmemory_bytes(),
+            maxmemory_policy: Self::resolve_maxmemory_policy(),
         })
+    }
+
+    /// The `maxmemory-policy` values redis-server accepts (same set in 7.x
+    /// and 8.x).
+    const MAXMEMORY_POLICIES: [&'static str; 8] = [
+        "noeviction",
+        "allkeys-lru",
+        "volatile-lru",
+        "allkeys-lfu",
+        "volatile-lfu",
+        "allkeys-random",
+        "volatile-random",
+        "volatile-ttl",
+    ];
+
+    /// See the field doc on `maxmemory_policy` for why this validates
+    /// instead of passing through. Lowercased on the way in — redis-server
+    /// matches enum values case-insensitively, so mixed-case input is valid
+    /// and the stamped conf stays canonical.
+    fn resolve_maxmemory_policy() -> String {
+        const DEFAULT: &str = "noeviction";
+        let Ok(raw) = env::var("MAXMEMORY_POLICY") else {
+            return DEFAULT.to_string();
+        };
+        let policy = raw.trim().to_ascii_lowercase();
+        if policy.is_empty() {
+            return DEFAULT.to_string();
+        }
+        if Self::MAXMEMORY_POLICIES.contains(&policy.as_str()) {
+            return policy;
+        }
+        tracing::warn!(
+            value = %raw,
+            "MAXMEMORY_POLICY is not a redis eviction policy — keeping noeviction; \
+             valid values: {}",
+            Self::MAXMEMORY_POLICIES.join(", ")
+        );
+        DEFAULT.to_string()
     }
 
     /// An explicit `MAXMEMORY_MB` wins outright; otherwise 75% of whatever
@@ -270,6 +316,7 @@ impl Config {
             data_dir: "/data".to_string(),
             private_domain: "redis-1.railway.internal".to_string(),
             maxmemory_bytes: None,
+            maxmemory_policy: "noeviction".to_string(),
         }
     }
 }
@@ -303,6 +350,7 @@ mod tests {
             "REPLICA_OF",
             "REDIS_PORT",
             "MAXMEMORY_MB",
+            "MAXMEMORY_POLICY",
         ] {
             env::remove_var(key);
         }
@@ -605,6 +653,50 @@ mod tests {
         // host with no /sys/fs/cgroup/memory.max at this literal path — so
         // this only asserts it doesn't panic or return the junk value as 0.
         assert_ne!(Config::resolve_maxmemory_bytes(), Some(0));
+    }
+
+    // --- resolve_maxmemory_policy: the validated eviction opt-in ---
+
+    #[test]
+    fn maxmemory_policy_defaults_to_noeviction_when_unset() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        assert_eq!(Config::resolve_maxmemory_policy(), "noeviction");
+    }
+
+    #[test]
+    fn a_real_eviction_policy_passes_through() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("MAXMEMORY_POLICY", "allkeys-lru");
+        assert_eq!(Config::resolve_maxmemory_policy(), "allkeys-lru");
+    }
+
+    #[test]
+    fn policy_input_is_trimmed_and_lowercased() {
+        // redis-server itself matches enum values case-insensitively, so
+        // mixed-case input is valid and must not be rejected as a typo.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("MAXMEMORY_POLICY", "  Volatile-TTL ");
+        assert_eq!(Config::resolve_maxmemory_policy(), "volatile-ttl");
+    }
+
+    #[test]
+    fn an_unknown_policy_falls_back_to_noeviction() {
+        // The value redis-server would refuse to boot on if passed through.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("MAXMEMORY_POLICY", "allkeys-lruu");
+        assert_eq!(Config::resolve_maxmemory_policy(), "noeviction");
+    }
+
+    #[test]
+    fn an_empty_policy_falls_back_to_noeviction() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("MAXMEMORY_POLICY", "");
+        assert_eq!(Config::resolve_maxmemory_policy(), "noeviction");
     }
 
     // --- detect_cgroup_memory_limit_bytes: every branch, via a fake cgroup root ---

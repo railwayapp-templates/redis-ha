@@ -101,6 +101,8 @@ Key variables on the Redis nodes (set on Redis-1, referenced by replicas):
 | `REDIS_MIN_REPLICAS_TO_WRITE` | `1` | Master disables writes when fewer healthy replicas |
 | `REDIS_MIN_REPLICAS_MAX_LAG` | `10` | Replica lag threshold (seconds) |
 | `REDIS_APPENDONLY` | `yes` | AOF persistence (required — see notes) |
+| `MAXMEMORY_MB` | 75% of the container memory limit | `maxmemory` ceiling, in MiB. The default leaves the remaining 25% for the BGSAVE/AOF-rewrite fork spike and for client buffers. The replication backlog (`REPL_BACKLOG_SIZE`, default `64mb`) lives **inside** the ceiling once replicas attach and is not evictable, so an explicit ceiling has to leave clear room above it |
+| `MAXMEMORY_POLICY` | `noeviction` | Eviction policy stamped with the ceiling. Any policy redis-server accepts (`allkeys-lru`, `volatile-ttl`, …); an unrecognized value logs a warning and keeps `noeviction` rather than crash-looping the node. Set it on **every Redis node** — eviction follows the master role across failovers |
 | `SENTINEL_AUTH` | `true` | Sentinel auth for new clusters, reusing `REDIS_PASSWORD` as the Sentinel password (see Sentinel auth). Set to the literal `false` to always generate an open (no-auth) `sentinel.conf` |
 | `BOOT_ROLE_FROM_SENTINEL_STATE` | `true` | Take the boot role from Sentinel's own `sentinel.conf` instead of `REPLICA_OF`. Set to `false` to pin every boot to the deploy-time topology |
 | `BOOT_ROLE_FROM_PEER_SENTINELS` | `true` | On a first boot (no local Sentinel state), ask the peer Sentinels in `SENTINEL_HOSTS` who the master currently is before trusting `REPLICA_OF`. Set to `false` to disable the query |
