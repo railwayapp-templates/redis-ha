@@ -633,6 +633,9 @@ async fn switchover(State(state): State<AppState>) -> impl IntoResponse {
 /// has no `requirepass` regardless of what new clusters now get, and
 /// authenticating against a Sentinel that requires none is a hard
 /// connection failure, not a no-op.
+// Each argument is one connection fact of this node; a struct would only
+// rename the same list.
+#[allow(clippy::too_many_arguments)]
 async fn run_health_server(
     health_port: u16,
     redis_port: u16,
@@ -711,6 +714,7 @@ const RESPAWN_DELAY: Duration = Duration::from_secs(5);
 ///
 /// Failures are deduped via `HEALTHY_RUN_THRESHOLD` so a crash loop emits one
 /// `ComponentError` per incident instead of one every `RESPAWN_DELAY`.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     health_port: u16,
     redis_port: u16,

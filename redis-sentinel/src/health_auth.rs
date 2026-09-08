@@ -108,7 +108,10 @@ fn parse_basic(value: &HeaderValue) -> Option<(String, String)> {
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, HeaderValue::from_static(CHALLENGE))],
+        [(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static(CHALLENGE),
+        )],
         Json(json!({"status": "unauthorized"})),
     )
         .into_response()
