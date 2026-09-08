@@ -1076,15 +1076,15 @@ t_health_api_auth_gates_switchover() {
   [ "$(health_http_code hapi-1 GET /role)" = "200" ] \
     || { ko "$t" "the master's /role is not 200 with the variable set" hapi-1; return; }
 
-  # No credential → 401 with the challenge and the JSON body, on a replica.
+  # No credential → 401 with the challenge, on a replica. GNU wget gives up on
+  # a 401 before --content-on-error applies ("Authorization failed."), so the
+  # body never reaches this transcript; the unit tests pin the JSON verdict.
   local resp
   resp=$(health_http hapi-2 POST /switchover)
   echo "$resp" | grep -q 'HTTP/1.[01] 401' \
     || { ko "$t" "unauthenticated POST /switchover was not refused with 401: $(echo "$resp" | tr '\n' ' ' | cut -c1-300)" hapi-2; return; }
   echo "$resp" | grep -qi 'WWW-Authenticate: Basic realm="railway-ha"' \
     || { ko "$t" "401 carries no Basic challenge" hapi-2; return; }
-  echo "$resp" | grep -q '"status":"unauthorized"' \
-    || { ko "$t" "401 body is not the unauthorized verdict" hapi-2; return; }
 
   # Wrong password → 401, and on the MASTER too: a wrong credential must not
   # be answered with the "already-primary" verdict.
