@@ -24,7 +24,9 @@
 //!                      normally lands ~8-12s after the POST because of the
 //!                      visibility wait — the dashboard's client allows 35s),
 //!                      409 = a previous switchover is still settling,
-//!                      503 = refused.
+//!                      503 = refused, 401 = no/wrong credential once
+//!                      `HEALTH_API_PASSWORD` is set (see health_auth; the
+//!                      two GET probes never require one).
 //!
 //! The pre-bias priority is stashed in shared state before it is
 //! overwritten, so every path out of a switchover — refusal, the handler
@@ -60,10 +62,12 @@
 //! node from BOTH HAProxy backends permanently, with nothing else watching
 //! this task (`supervise` only watches the redis and sentinel processes).
 
+use crate::health_auth::{self, Credential as HealthApiCredential};
 use anyhow::Context;
 use axum::{
     extract::State,
     http::StatusCode,
+    middleware,
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
@@ -637,6 +641,7 @@ async fn run_health_server(
     private_domain: String,
     redis_master_name: String,
     local_sentinel_password: String,
+    health_api_credential: Option<HealthApiCredential>,
 ) -> anyhow::Result<()> {
     let redis_url =
         crate::sentinel_query::build_redis_url("127.0.0.1", redis_port, &redis_password);
@@ -653,10 +658,18 @@ async fn run_health_server(
         redis_port,
     );
 
+    // The credential gate is a route layer on the mutating route alone:
+    // HAProxy's /health and /role probes must never be asked for one.
+    let mutating = Router::new()
+        .route("/switchover", post(switchover))
+        .route_layer(middleware::from_fn_with_state(
+            health_api_credential,
+            health_auth::require_credential,
+        ));
     let app = Router::new()
         .route("/health", get(health))
         .route("/role", get(role))
-        .route("/switchover", post(switchover))
+        .merge(mutating)
         .with_state(state);
 
     // Bind the IPv6 unspecified address rather than 0.0.0.0: Railway's private
@@ -706,6 +719,7 @@ pub fn spawn(
     private_domain: String,
     redis_master_name: String,
     local_sentinel_password: String,
+    health_api_credential: Option<HealthApiCredential>,
     telemetry: Telemetry,
 ) {
     tokio::spawn(async move {
@@ -722,10 +736,11 @@ pub fn spawn(
             let domain = private_domain.clone();
             let mn = redis_master_name.clone();
             let spw = local_sentinel_password.clone();
+            let cred = health_api_credential.clone();
 
             let started_at = Instant::now();
             let handle = tokio::task::spawn(async move {
-                run_health_server(hp, rp, sp, pw, domain, mn, spw).await
+                run_health_server(hp, rp, sp, pw, domain, mn, spw, cred).await
             });
             let outcome = handle.await;
             let ran_for = started_at.elapsed();

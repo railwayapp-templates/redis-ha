@@ -16,8 +16,11 @@ serde_json.workspace = true
 tracing.workspace = true
 nix.workspace = true
 axum.workspace = true
+base64.workspace = true
+subtle.workspace = true
 redis.workspace = true
 url.workspace = true
 
 [dev-dependencies]
 tempfile = "3.26.0"
+tower = { version = "0.5", features = ["util"] }

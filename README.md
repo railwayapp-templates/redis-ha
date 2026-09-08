@@ -79,7 +79,7 @@ discovered from Docker Hub on every run; `REDIS_SUPPORTED_MAJORS` in
 
 - Renders `redis.conf` and `sentinel.conf` from env vars at startup
 - Manages `redis-server` + `redis-sentinel` as supervised child processes
-- Serves `/health` (liveness) and `/role` (master check) on `HEALTH_PORT` (default 8080)
+- Serves `/health` (liveness) and `/role` (master check) on `HEALTH_PORT` (default 8080), plus `POST /switchover` (promote this node) — credential-gated once `HEALTH_API_PASSWORD` is set (see Health API auth)
 
 ### `haproxy` (`haproxy-entrypoint`)
 
@@ -103,6 +103,8 @@ Key variables on the Redis nodes (set on Redis-1, referenced by replicas):
 | `REDIS_APPENDONLY` | `yes` | AOF persistence (required — see notes) |
 | `MAXMEMORY_MB` | 75% of the container memory limit | `maxmemory` ceiling, in MiB. The default leaves the remaining 25% for the BGSAVE/AOF-rewrite fork spike and for client buffers. The replication backlog (`REPL_BACKLOG_SIZE`, default `64mb`) lives **inside** the ceiling once replicas attach and is not evictable, so an explicit ceiling has to leave clear room above it |
 | `MAXMEMORY_POLICY` | `noeviction` | Eviction policy stamped with the ceiling. Any policy redis-server accepts (`allkeys-lru`, `volatile-ttl`, …); an unrecognized value logs a warning and keeps `noeviction` rather than crash-looping the node. Set it on **every Redis node** — eviction follows the master role across failovers |
+| `HEALTH_API_PASSWORD` | unset | Turns on HTTP Basic auth for the health server's mutating routes (`POST /switchover`); the GET probes stay open. Unset = open, the previous behavior. The Railway template sets it to the cluster's shared `REDIS_PASSWORD` on every Redis node (see Health API auth) |
+| `HEALTH_API_USERNAME` | `railway` | Username the Basic credential is checked against |
 | `SENTINEL_AUTH` | `true` | Sentinel auth for new clusters, reusing `REDIS_PASSWORD` as the Sentinel password (see Sentinel auth). Set to the literal `false` to always generate an open (no-auth) `sentinel.conf` |
 | `BOOT_ROLE_FROM_SENTINEL_STATE` | `true` | Take the boot role from Sentinel's own `sentinel.conf` instead of `REPLICA_OF`. Set to `false` to pin every boot to the deploy-time topology |
 | `BOOT_ROLE_FROM_PEER_SENTINELS` | `true` | On a first boot (no local Sentinel state), ask the peer Sentinels in `SENTINEL_HOSTS` who the master currently is before trusting `REPLICA_OF`. Set to `false` to disable the query |
@@ -131,6 +133,14 @@ New clusters get Sentinel client auth automatically: the first boot that generat
 - Any peer answers openly → the cluster runs without auth → **auth off**, matching — a scale-up onto an existing unauthenticated cluster stays unauthenticated.
 
 Existing unauthenticated clusters therefore keep working unchanged, restarts and scale-ups included. Upgrading one to auth is a deliberate whole-cluster operation (regenerate every node's `sentinel.conf` in one window); a rolling restart can never converge to auth precisely because each regenerated node matches the still-open majority. `SENTINEL_AUTH=false` is the kill switch: it forces an open first boot regardless of what the peers say.
+
+## Health API auth
+
+Each Redis node's health server (`HEALTH_PORT`, default 8080) has two probe routes and one action: `GET /health`, `GET /role`, and `POST /switchover`, which promotes the node that receives it. The action is reachable by anything on the private network, so it is gated by the cluster's own secret.
+
+With `HEALTH_API_PASSWORD` set, `POST /switchover` requires `Authorization: Basic base64(HEALTH_API_USERNAME:HEALTH_API_PASSWORD)` (username default `railway`). A request without a credential, with a malformed one, or with the wrong username or password is answered `401` with `WWW-Authenticate: Basic realm="railway-ha"` and the body `{"status":"unauthorized"}`; the wrapper logs one line naming the route and never the header. Both halves of the credential are compared in constant time. `GET /health` and `GET /role` never require a credential — HAProxy's routing checks depend on them.
+
+With the variable unset the health server is open, exactly as before. The Railway template sets `HEALTH_API_PASSWORD` to the cluster's shared `REDIS_PASSWORD` on every Redis node, so new clusters enforce from their first boot; an existing cluster starts enforcing once the variable is set on its Redis nodes and they redeploy. Callers can send the credential unconditionally — a node that does not enforce ignores it — which is what makes that rollout safe in either order.
 
 ## Self-healing
 
