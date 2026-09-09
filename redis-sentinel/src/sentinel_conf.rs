@@ -133,6 +133,21 @@ pub fn generate_sentinel_conf(
     }
 
     lines.extend([
+        // Refuse `SENTINEL SET <master> notification-script` and
+        // `client-reconfig-script` over the wire. Both name a program Sentinel
+        // executes as its own user on the next failover, so a client that
+        // reaches 26379 — any client at all on a conf that predates Sentinel
+        // auth — could otherwise turn a failover into code execution inside
+        // this container. Redis 7.4 and 8.x compile the default as `yes`
+        // (`SENTINEL_DEFAULT_DENY_SCRIPTS_RECONFIG 1`, sentinel.c); it is
+        // written out anyway so the posture is on disk rather than in a
+        // compiled default this image never inspects. Sentinel's own conf
+        // rewrite replaces an existing line in place (config.c,
+        // `rewriteConfigRewriteLine`), so the directive survives every
+        // failover. Not live-settable: `SENTINEL CONFIG SET` accepts only
+        // announce-*, sentinel-user/pass, resolve-hostnames and loglevel, so a
+        // preserved conf keeps whatever it was first written with.
+        "sentinel deny-scripts-reconfig yes".to_string(),
         // Resolve peers by DNS hostname so Railway's internal DNS works
         "sentinel resolve-hostnames yes".to_string(),
         "sentinel announce-hostnames yes".to_string(),
@@ -292,6 +307,42 @@ mod tests {
         assert!(conf
             .lines()
             .any(|l| l.starts_with("sentinel down-after-milliseconds")));
+    }
+
+    // --- generate_sentinel_conf: deny-scripts-reconfig ---
+
+    #[test]
+    fn deny_scripts_reconfig_is_written_explicitly_on_every_posture() {
+        // Open and authed boots alike: the script-path lock never depends on
+        // the compiled default, and it is a global directive (no master name).
+        let config = Config::for_tests();
+        for password in ["", "s3cr3t"] {
+            let conf = generate_sentinel_conf(&config, &BootMaster::SelfIsMaster, password);
+            assert_eq!(
+                conf.lines()
+                    .filter(|l| *l == "sentinel deny-scripts-reconfig yes")
+                    .count(),
+                1,
+                "exactly one deny-scripts-reconfig line expected:\n{conf}"
+            );
+            assert!(!conf.contains("deny-scripts-reconfig no"));
+        }
+    }
+
+    #[test]
+    fn deny_scripts_reconfig_precedes_the_monitor_line() {
+        // Sentinel loads it as a pre-monitor global either way
+        // (`preMonitorCfgName`, sentinel.c); keeping it ahead of the monitor
+        // line in the file we write mirrors Sentinel's own rewrite order.
+        let config = Config::for_tests();
+        let conf = generate_sentinel_conf(&config, &BootMaster::NoLocalState, "");
+        let deny = conf
+            .find("sentinel deny-scripts-reconfig yes")
+            .expect("deny-scripts-reconfig present");
+        let monitor = conf
+            .find("sentinel monitor ")
+            .expect("monitor line present");
+        assert!(deny < monitor);
     }
 
     // --- conf_requires_auth ---

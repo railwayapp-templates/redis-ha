@@ -2390,6 +2390,88 @@ t_password_variable_edit_does_not_rotate() {
   ok "$t"
 }
 
+# `sentinel deny-scripts-reconfig yes` must be written into every generated
+# sentinel.conf, not left to the compiled default: notification-script and
+# client-reconfig-script name a program Sentinel executes on the next
+# failover, so a client that reaches 26379 (any client at all, on a conf
+# that predates Sentinel auth) could otherwise turn a failover into code
+# execution inside the container. The conf-file assertions are what fail
+# without the fix — the runtime refusal alone passes on Redis's default.
+t_sentinel_conf_denies_script_reconfig() {
+  local t=t_sentinel_conf_denies_script_reconfig
+  start_ha_trio denys \
+    || { dump_sentinel_view denys-2 denys-3
+         ko "$t" "trio never became failover-ready" denys-1 denys-2 denys-3
+         return; }
+  local v
+  for v in denys-vol-1 denys-vol-2 denys-vol-3; do
+    docker run --rm -v "$v:/v" alpine:latest \
+      grep -qx 'sentinel deny-scripts-reconfig yes' /v/sentinel.conf 2>/dev/null \
+      || { ko "$t" "${v} sentinel.conf carries no explicit 'sentinel deny-scripts-reconfig yes'" denys-1; return; }
+  done
+
+  # Even the REDIS_PASSWORD-authenticated caller cannot point Sentinel at a
+  # script — the lock is about the script path, not about who asks.
+  local out opt
+  for opt in notification-script client-reconfig-script; do
+    out=$(docker exec denys-1 redis-cli -p 26379 -a "$PW" --no-auth-warning \
+      SENTINEL SET mymaster "$opt" /bin/true 2>&1)
+    case "$out" in
+      *deny-scripts-reconfig*) ;;
+      *) ko "$t" "SENTINEL SET ${opt} was not refused: ${out}" denys-1; return ;;
+    esac
+  done
+
+  # A Sentinel-initiated conf rewrite (SENTINEL SET quorum triggers one)
+  # must keep the directive: an existing line is replaced in place, so what
+  # the wrapper wrote at first boot is what every later boot reads.
+  docker exec denys-1 redis-cli -p 26379 -a "$PW" --no-auth-warning \
+    SENTINEL SET mymaster quorum 2 >/dev/null 2>&1
+  docker run --rm -v denys-vol-1:/v alpine:latest \
+    grep -qx 'sentinel deny-scripts-reconfig yes' /v/sentinel.conf 2>/dev/null \
+    || { ko "$t" "deny-scripts-reconfig vanished from sentinel.conf after Sentinel rewrote it" denys-1; return; }
+
+  docker rm -f denys-1 denys-2 denys-3 >/dev/null 2>&1
+  ok "$t"
+}
+
+# A blank REDIS_PASSWORD used to pass validation and boot a node with
+# `requirepass ""` — an open data port and, since no auth lines are written
+# for an empty password, an open Sentinel. The wrapper must refuse to boot
+# before it writes anything, and say which variable to fix.
+t_blank_password_refuses_to_boot() {
+  local t=t_blank_password_refuses_to_boot n=blankpw-1
+  mkvol blankpw-vol
+  # start_node stamps -e REDIS_PASSWORD="$PW" first; the appended -e wins
+  # (docker takes the last occurrence) — this IS a service whose variable
+  # was set to an empty value.
+  start_node "$n" blankpw-vol /data -e REDIS_PASSWORD=
+  wait_for_log_line "$n" "REDIS_PASSWORD is set but blank" 30 \
+    || { ko "$t" "blank REDIS_PASSWORD was not refused with a message naming the variable" "$n"; return; }
+  local i state=""
+  for i in $(seq 1 30); do
+    state=$(docker inspect -f '{{.State.Status}}:{{.State.ExitCode}}' "$n" 2>/dev/null)
+    [ "$state" = "exited:1" ] && break
+    sleep 1
+  done
+  [ "$state" = "exited:1" ] \
+    || { ko "$t" "container did not exit 1 on a blank password (state=${state})" "$n"; return; }
+  # Refused before any conf was generated: nothing on the volume can boot
+  # open on a later attempt.
+  docker run --rm -v blankpw-vol:/v alpine:latest sh -c 'ls /v/redis.conf /v/sentinel.conf 2>/dev/null' \
+    | grep -q conf \
+    && { ko "$t" "a conf was written before the blank password was refused" "$n"; return; }
+
+  # Whitespace-only is blank too.
+  docker rm -f "$n" >/dev/null 2>&1
+  start_node "$n" blankpw-vol /data -e REDIS_PASSWORD="   "
+  wait_for_log_line "$n" "REDIS_PASSWORD is set but blank" 30 \
+    || { ko "$t" "whitespace-only REDIS_PASSWORD was not refused" "$n"; return; }
+
+  docker rm -f "$n" >/dev/null 2>&1
+  ok "$t"
+}
+
 # The membership probe's discriminator is the shared password, not DNS: a
 # foreign service that happens to reuse the hostname of a dead member
 # resolves and answers, but refuses the cluster's AUTH — that state is a
@@ -2798,6 +2880,8 @@ ALL_TESTS=(
   t_sentinel_auth_on_by_default_for_fresh_cluster
   t_scale_up_of_unauthed_cluster_stays_unauthed
   t_password_variable_edit_does_not_rotate
+  t_sentinel_conf_denies_script_reconfig
+  t_blank_password_refuses_to_boot
   t_maxmemory_pressure_keeps_cluster_stable
   t_maxmemory_policy_opt_in_evicts_instead_of_refusing
   t_invalid_maxmemory_policy_boots_on_noeviction

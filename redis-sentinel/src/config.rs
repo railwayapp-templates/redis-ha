@@ -58,6 +58,19 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Result<Self> {
         let redis_password = String::env_required("REDIS_PASSWORD")?;
+        // Present but blank passes `env_required` and would render
+        // `requirepass ""` — Redis's spelling of "no password" — on the data
+        // port, and an open Sentinel (no auth lines are written for an empty
+        // password). Whitespace-only is blank too. The value itself is never
+        // trimmed: a password with edge whitespace is the customer's password.
+        if redis_password.trim().is_empty() {
+            bail!(
+                "REDIS_PASSWORD is set but blank. A blank password would boot Redis with \
+                 `requirepass \"\"` (no authentication on the data port) and Sentinel \
+                 without authentication. Set REDIS_PASSWORD on this service to a non-empty \
+                 value and redeploy."
+            );
+        }
         let sentinel_enabled = bool::env_bool("SENTINEL_ENABLED", false);
         let sentinel_hosts = String::env_or("SENTINEL_HOSTS", "");
 
@@ -437,6 +450,41 @@ mod tests {
             .err()
             .expect("should fail without a password");
         assert!(err.to_string().contains("REDIS_PASSWORD"));
+    }
+
+    #[test]
+    fn from_env_rejects_a_blank_password() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("REDIS_PASSWORD", "");
+        let err = Config::from_env()
+            .err()
+            .expect("should fail on a blank password");
+        let msg = err.to_string();
+        assert!(msg.contains("REDIS_PASSWORD is set but blank"), "{msg}");
+        assert!(msg.contains("non-empty value"), "{msg}");
+    }
+
+    #[test]
+    fn from_env_rejects_a_whitespace_only_password() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("REDIS_PASSWORD", " \t ");
+        let err = Config::from_env()
+            .err()
+            .expect("should fail on a whitespace-only password");
+        assert!(err.to_string().contains("REDIS_PASSWORD is set but blank"));
+    }
+
+    #[test]
+    fn from_env_keeps_a_password_with_edge_whitespace_verbatim() {
+        // Rejecting blank must not turn into trimming: the customer's
+        // password is whatever the variable holds.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        env::set_var("REDIS_PASSWORD", " p w ");
+        let config = Config::from_env().expect("edge whitespace is a valid password");
+        assert_eq!(config.redis_password, " p w ");
     }
 
     #[test]
