@@ -295,6 +295,7 @@ async fn main() -> Result<()> {
         config.private_domain.clone(),
         config.redis_master_name.clone(),
         local_sentinel_password.clone(),
+        config.health_api_credential.clone(),
         telemetry.clone(),
     );
 

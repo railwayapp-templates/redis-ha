@@ -21,6 +21,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 nix = { version = "0.29", features = ["signal", "process", "fs"] }
 axum = "0.8"
+base64 = "0.22"
+subtle = "2.6"
 redis = { version = "0.27", features = ["tokio-comp", "aio"] }
 url = "2.5"
 

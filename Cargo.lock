@@ -925,13 +925,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "common",
  "nix",
  "redis",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "tokio",
+ "tower",
  "tracing",
  "url",
 ]

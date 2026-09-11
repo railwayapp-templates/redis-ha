@@ -266,6 +266,25 @@ wait_for_role_master() { # wait_for_role_master NODE [timeout]
   return 1
 }
 
+health_http() { # health_http NODE GET|POST PATH [extra wget args...]  ->  headers + body
+  # GNU wget: -S echoes the status line and headers, --content-on-error keeps
+  # the body of a 4xx, and the exit code is ignored on purpose (wget exits
+  # non-zero on every non-2xx, which is exactly what these assertions read).
+  local node="$1" method="$2" path="$3"; shift 3
+  local post=()
+  [ "$method" = POST ] && post=(--post-data=)
+  docker exec "$node" wget -S -O - --content-on-error "${post[@]}" "$@" \
+    "http://127.0.0.1:8080${path}" 2>&1
+}
+
+health_http_code() { # health_http_code NODE GET|POST PATH [extra wget args...]  ->  final status code
+  health_http "$@" | sed -n 's/^ *HTTP\/1\.[01] \([0-9][0-9][0-9]\).*/\1/p' | tail -1
+}
+
+basic_auth_header() { # basic_auth_header USER PASSWORD  ->  "Authorization: Basic ..."
+  printf 'Authorization: Basic %s' "$(printf '%s' "$1:$2" | base64 | tr -d '\n')"
+}
+
 link_status() { # link_status NODE  ->  "up" | "down" | ""
   rcli "$1" INFO replication | tr -d '\r' | grep '^master_link_status:' | cut -d: -f2
 }
@@ -1020,6 +1039,92 @@ t_switchover_promotes_requested_node() {
   wait_for_key "$target" swokey swovalue 30 \
     || { ko "$t" "seed key lost across the switchover" "$target"; return; }
   docker rm -f swo-1 swo-2 swo-3 >/dev/null 2>&1
+  ok "$t"
+}
+
+# With HEALTH_API_PASSWORD set, the health server's one mutating route —
+# POST /switchover, which hands the primary role to the node that receives
+# it — refuses every request that does not carry the credential as HTTP
+# Basic auth, while the two GET probes HAProxy routes on stay open on every
+# node. The variable UNSET keeps the pre-auth open behavior:
+# t_switchover_promotes_requested_node above drives the same POST with no
+# credential and no variable.
+t_health_api_auth_gates_switchover() {
+  local t=t_health_api_auth_gates_switchover
+  if ! docker image inspect "$EDGE_IMAGE" >/dev/null 2>&1; then
+    log "building ${EDGE_IMAGE}"
+    docker build -q -f "${REPO_ROOT}/haproxy/Dockerfile" -t "$EDGE_IMAGE" "$REPO_ROOT" >/dev/null || {
+      ko "$t" "edge image build failed"; return;
+    }
+  fi
+  start_ha_trio hapi -e HEALTH_API_PASSWORD="$PW" \
+    || { ko "$t" "cluster never became ready" hapi-1 hapi-2 hapi-3; return; }
+
+  # The probes never ask for a credential: 200 for /health everywhere, and
+  # /role answers its verdict (200 master / 503 replica), never 401.
+  local n code
+  for n in hapi-1 hapi-2 hapi-3; do
+    code=$(health_http_code "$n" GET /health)
+    [ "$code" = "200" ] \
+      || { ko "$t" "GET /health on ${n} answered ${code:-nothing} without a credential" "$n"; return; }
+    code=$(health_http_code "$n" GET /role)
+    case "$code" in
+      200|503) ;;
+      *) ko "$t" "GET /role on ${n} answered ${code:-nothing} without a credential" "$n"; return ;;
+    esac
+  done
+  [ "$(health_http_code hapi-1 GET /role)" = "200" ] \
+    || { ko "$t" "the master's /role is not 200 with the variable set" hapi-1; return; }
+
+  # No credential → 401 with the challenge, on a replica. GNU wget gives up on
+  # a 401 before --content-on-error applies ("Authorization failed."), so the
+  # body never reaches this transcript; the unit tests pin the JSON verdict.
+  local resp
+  resp=$(health_http hapi-2 POST /switchover)
+  echo "$resp" | grep -q 'HTTP/1.[01] 401' \
+    || { ko "$t" "unauthenticated POST /switchover was not refused with 401: $(echo "$resp" | tr '\n' ' ' | cut -c1-300)" hapi-2; return; }
+  echo "$resp" | grep -qi 'WWW-Authenticate: Basic realm="railway-ha"' \
+    || { ko "$t" "401 carries no Basic challenge" hapi-2; return; }
+
+  # Wrong password → 401, and on the MASTER too: a wrong credential must not
+  # be answered with the "already-primary" verdict.
+  code=$(health_http_code hapi-2 POST /switchover --header="$(basic_auth_header railway wrong-password)")
+  [ "$code" = "401" ] \
+    || { ko "$t" "wrong password on a replica answered ${code:-nothing}, not 401" hapi-2; return; }
+  code=$(health_http_code hapi-1 POST /switchover --header="$(basic_auth_header railway wrong-password)")
+  [ "$code" = "401" ] \
+    || { ko "$t" "wrong password on the master answered ${code:-nothing}, not 401" hapi-1; return; }
+  code=$(health_http_code hapi-2 POST /switchover --header="$(basic_auth_header someone-else "$PW")")
+  [ "$code" = "401" ] \
+    || { ko "$t" "wrong username answered ${code:-nothing}, not 401" hapi-2; return; }
+
+  # Nothing above may have moved the role.
+  [ "$(redis_role hapi-1)" = "master" ] \
+    || { ko "$t" "a refused switchover still changed the master" hapi-1 hapi-2 hapi-3; return; }
+
+  # The right credential runs the real handler: the replica is promoted.
+  resp=$(health_http hapi-2 POST /switchover --header="$(basic_auth_header railway "$PW")")
+  echo "$resp" | grep -q '"status":"failover-initiated"' \
+    || { ko "$t" "authenticated switchover not accepted: $(echo "$resp" | tr '\n' ' ' | cut -c1-300)" hapi-2; return; }
+  wait_for_role_master hapi-2 90 \
+    || { dump_sentinel_view hapi-2 hapi-3; ko "$t" "authenticated switchover did not promote the requested node" hapi-1 hapi-2 hapi-3; return; }
+
+  # The edge routes writes exactly as before: its /role probes hit nodes that
+  # enforce the credential on the mutating route only.
+  docker run -d --name hapi-edge --label "$LABEL" --network "$NET" \
+    --network-alias hapi-edge --hostname hapi-edge \
+    -e REDIS_NODES="hapi-1:6379,hapi-2:6379,hapi-3:6379" \
+    "$EDGE_IMAGE" >/dev/null
+  local i
+  for i in $(seq 1 60); do
+    docker exec -e PW="$PW" hapi-edge sh -c \
+      'redis-cli -a "$PW" -h 127.0.0.1 SET hapiprobe ok 2>/dev/null' | grep -q OK && break
+    sleep 1
+  done
+  wait_for_key hapi-2 hapiprobe ok 30 \
+    || { ko "$t" "edge never routed a write to the promoted master" hapi-edge hapi-2; return; }
+
+  docker rm -f hapi-1 hapi-2 hapi-3 hapi-edge >/dev/null 2>&1
   ok "$t"
 }
 
@@ -2845,6 +2950,7 @@ ALL_TESTS=(
   t_sentinel_failover
   t_edge_client_writes_survive_failover
   t_switchover_promotes_requested_node
+  t_health_api_auth_gates_switchover
   t_sigterm_master_demotes_before_exit
   t_restart_old_master_rejoins_as_replica
   t_down_for_failover_master_boots_as_replica

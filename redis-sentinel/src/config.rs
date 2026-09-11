@@ -1,3 +1,4 @@
+use crate::health_auth::{self, Credential as HealthApiCredential};
 use anyhow::{bail, Result};
 use common::{ConfigExt, RailwayEnv};
 use std::env;
@@ -29,6 +30,12 @@ pub struct Config {
     /// this path entirely — see sentinel_conf's comment on the directive.
     pub sentinel_master_reboot_down_after_ms: u64,
     pub health_port: u16,
+    /// Credential the health server's mutating routes (`POST /switchover`)
+    /// require — `HEALTH_API_USERNAME` (default `railway`) /
+    /// `HEALTH_API_PASSWORD`. `None` when no password is set: the routes stay
+    /// open, exactly the pre-auth behavior, so existing clusters adopt
+    /// enforcement by setting the variable (see health_auth).
+    pub health_api_credential: Option<HealthApiCredential>,
     pub data_dir: String,
     /// The hostname of this service's private domain (used to derive master host for sentinels).
     pub private_domain: String,
@@ -87,6 +94,10 @@ impl Config {
                 10000,
             ),
             health_port: u16::env_parse("HEALTH_PORT", 8080),
+            health_api_credential: HealthApiCredential::resolve(
+                &String::env_or(health_auth::USERNAME_ENV, health_auth::DEFAULT_USERNAME),
+                &String::env_or(health_auth::PASSWORD_ENV, ""),
+            ),
             data_dir: Self::resolve_data_dir(),
             private_domain: RailwayEnv::private_domain(),
             maxmemory_bytes: Self::resolve_maxmemory_bytes(),
@@ -313,6 +324,7 @@ impl Config {
             sentinel_failover_timeout_ms: 30000,
             sentinel_master_reboot_down_after_ms: 10000,
             health_port: 8080,
+            health_api_credential: None,
             data_dir: "/data".to_string(),
             private_domain: "redis-1.railway.internal".to_string(),
             maxmemory_bytes: None,
