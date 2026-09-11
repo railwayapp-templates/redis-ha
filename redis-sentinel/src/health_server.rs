@@ -509,6 +509,18 @@ async fn initiate_switchover(state: &AppState) -> anyhow::Result<SwitchoverOutco
         .await
         .context("CONFIG GET replica-priority failed")?;
     let previous_priority = priority_from_config_get(&reply);
+    // A node at the gated priority holds no dataset yet — its first full
+    // sync has not completed (see `sync_gate`). Biasing it to win would put
+    // an empty node in front of the cluster, which is the wipe the gate
+    // exists to prevent; refuse instead, and say what to wait for.
+    if crate::sync_gate::blocks_switchover(&previous_priority) {
+        anyhow::bail!(
+            "this node has not completed its first full sync from the master \
+             (replica-priority {}) and holds no dataset to promote — retry once its \
+             INFO replication reads master_link_status:up",
+            crate::sync_gate::GATED_PRIORITY
+        );
+    }
     // Stash BEFORE the overwrite: if the handler's timeout drops this future
     // anywhere past the next command, the timeout arm still knows what to
     // restore.
