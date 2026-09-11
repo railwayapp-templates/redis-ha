@@ -62,7 +62,7 @@ pub fn quarantine_manifestless_aof_dir(
 /// `REPLICA_OF` whenever it has one — see `crate::boot_role`. `NoLocalState`
 /// is the first-boot/fallback path and reproduces the env-only behavior
 /// exactly.
-fn replicate_from(config: &Config, boot_master: &BootMaster) -> Option<(String, u16)> {
+pub(crate) fn replicate_from(config: &Config, boot_master: &BootMaster) -> Option<(String, u16)> {
     match boot_master {
         BootMaster::NoLocalState => {
             if config.is_primary() {
@@ -282,6 +282,22 @@ pub fn generate_redis_conf(config: &Config, boot_master: &BootMaster) -> String 
 
     if let Some((host, port)) = replicate_from(config, boot_master) {
         lines.push(format!("replicaof {} {}", host, port));
+    }
+
+    // Sync gate: a replica boot that holds no loadable dataset is not a
+    // failover candidate until its first full sync completes. Sentinel's
+    // selection never checks whether a replica finished syncing, so without
+    // this a master that dies mid-transfer is replaced by an EMPTY node and
+    // the whole cluster — the returning master included — syncs the empty
+    // dataset from it. Priority 0 is Sentinel's own "never promote"; the
+    // sync-gate watcher lifts it to the default once the link first reads
+    // `up`. Boots over an existing dataset, and master boots, are never
+    // gated. See `sync_gate` for the full rationale.
+    if crate::sync_gate::boot_is_gated(config, boot_master) {
+        lines.push(format!(
+            "replica-priority {}",
+            crate::sync_gate::GATED_PRIORITY
+        ));
     }
 
     lines.join("\n") + "\n"
@@ -815,5 +831,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(persisted_requirepass(data_dir), Some("hunter2".to_string()));
+    }
+
+    // --- sync gate stamp ---
+
+    fn ha_replica_config(data_dir: &str) -> Config {
+        let mut config = config_at(data_dir);
+        config.sentinel_enabled = true;
+        config.private_domain = "redis-2.railway.internal".to_string();
+        config.replica_of = "redis-1.railway.internal:6379".to_string();
+        config
+    }
+
+    #[test]
+    fn replica_boot_over_an_empty_volume_is_stamped_unpromotable() {
+        let dir = tempdir().unwrap();
+        let config = ha_replica_config(dir.path().to_str().unwrap());
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(conf.contains("replicaof redis-1.railway.internal 6379\n"));
+        assert!(
+            conf.contains("\nreplica-priority 0\n"),
+            "a first sync in flight must not be promotable: {conf}"
+        );
+    }
+
+    #[test]
+    fn replica_boot_over_a_dataset_keeps_the_default_priority() {
+        let dir = tempdir().unwrap();
+        write_rdb(dir.path());
+        let config = ha_replica_config(dir.path().to_str().unwrap());
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(conf.contains("replicaof redis-1.railway.internal 6379\n"));
+        assert!(!conf.contains("replica-priority"), "{conf}");
+    }
+
+    #[test]
+    fn master_boot_is_never_stamped_unpromotable() {
+        let dir = tempdir().unwrap();
+        let mut config = ha_replica_config(dir.path().to_str().unwrap());
+        config.replica_of = String::new();
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(!conf.contains("replicaof"), "{conf}");
+        assert!(!conf.contains("replica-priority"), "{conf}");
+        // Sentinel's persisted answer naming this node: same thing.
+        let mut replica_env = ha_replica_config(dir.path().to_str().unwrap());
+        replica_env.private_domain = "redis-1.railway.internal".to_string();
+        let conf = generate_redis_conf(&replica_env, &BootMaster::SelfIsMaster);
+        assert!(!conf.contains("replica-priority"), "{conf}");
+    }
+
+    #[test]
+    fn sentinel_answer_naming_another_master_is_gated_like_the_env_replica() {
+        // A node deployed as the env-primary, redeployed onto a fresh volume
+        // after a failover: Sentinel's answer makes it a replica, and it
+        // holds nothing — exactly a first sync in flight.
+        let dir = tempdir().unwrap();
+        let mut config = ha_replica_config(dir.path().to_str().unwrap());
+        config.replica_of = String::new();
+        let conf = generate_redis_conf(
+            &config,
+            &BootMaster::ReplicaOf("redis-3.railway.internal".to_string(), 6379),
+        );
+        assert!(conf.contains("replicaof redis-3.railway.internal 6379\n"));
+        assert!(conf.contains("\nreplica-priority 0\n"), "{conf}");
     }
 }
