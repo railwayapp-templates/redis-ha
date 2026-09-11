@@ -2350,6 +2350,75 @@ t_scale_up_of_unauthed_cluster_stays_unauthed() {
   ok "$t"
 }
 
+# The mirror image of the scenario above: a node scaled up onto a cluster
+# whose Sentinels REQUIRE auth (the default since #35) must posture-match
+# the authed side, write requirepass, refuse credential-less sentinel
+# clients, sync the dataset, and cast a vote that a failover needs. A node
+# that came up open would be the mixed-auth cluster the posture probe
+# exists to prevent — invisible on the data port, fatal at election time.
+t_scale_up_of_authed_cluster_joins_and_votes() {
+  local t=t_scale_up_of_authed_cluster_joins_and_votes
+  local hosts="scaleauth-1:26379,scaleauth-2:26379,scaleauth-3:26379"
+  start_ha_trio scaleauth \
+    || { dump_sentinel_view scaleauth-2 scaleauth-3
+         ko "$t" "authed trio never became failover-ready" scaleauth-1 scaleauth-2 scaleauth-3
+         return; }
+  sentinel_conf_requires_auth scaleauth-vol-1 \
+    || { ko "$t" "the founding cluster is not authed — scenario premise broken" scaleauth-1; return; }
+  write_key scaleauth-1 upkey upvalue \
+    || { ko "$t" "master never accepted the pre-scale-up write" scaleauth-1; return; }
+
+  # The scale-up: fresh volume, stock env, deploy-time topology naming the
+  # founding master — exactly what a template scale-up renders.
+  mkvol scaleauth-vol-4
+  start_node scaleauth-4 scaleauth-vol-4 /data \
+    -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=scaleauth-1:6379
+  wait_for_log_line scaleauth-4 "peers require auth" 30 \
+    || { ko "$t" "scale-up node never posture-matched the authed cluster" scaleauth-4; return; }
+  wait_for_file_in_volume scaleauth-vol-4 sentinel.conf 30 \
+    || { ko "$t" "scale-up node never wrote sentinel.conf" scaleauth-4; return; }
+  sentinel_conf_requires_auth scaleauth-vol-4 \
+    || { ko "$t" "scale-up node wrote an open sentinel.conf into an authed cluster — mixed auth" scaleauth-4; return; }
+
+  # Its sentinel refuses a credential-less client and answers the cluster
+  # password. Retried: the conf lands before the sentinel starts listening.
+  local i answered=""
+  for i in $(seq 1 30); do
+    if scli scaleauth-4 PING 2>/dev/null | grep -q PONG; then answered=1; break; fi
+    sleep 1
+  done
+  [ -n "$answered" ] \
+    || { ko "$t" "scale-up node's sentinel never answered the cluster password" scaleauth-4; return; }
+  docker exec scaleauth-4 redis-cli -p 26379 PING 2>/dev/null | grep -q NOAUTH \
+    || { ko "$t" "scale-up node's sentinel answered a credential-less PING — not enforcing" scaleauth-4; return; }
+
+  wait_for_key scaleauth-4 upkey upvalue \
+    || { ko "$t" "scale-up node never synced the dataset" scaleauth-1 scaleauth-4; return; }
+
+  # Failover with the scale-up node's vote REQUIRED: 4 known sentinels need
+  # 3 votes, pausing the master leaves exactly 3 — scaleauth-4 must be one.
+  local n
+  for n in scaleauth-2 scaleauth-3 scaleauth-4; do
+    wait_for_sentinel_peers "$n" 3 || { ko "$t" "${n} never saw all 3 peers" "$n"; return; }
+  done
+  wait_for_sentinel_slave_view scaleauth-2 3 \
+    || { dump_sentinel_view scaleauth-2; ko "$t" "scaleauth-2 never got a live view of all replicas" scaleauth-2; return; }
+  wait_for_sentinel_slave_view scaleauth-3 3 \
+    || { dump_sentinel_view scaleauth-3; ko "$t" "scaleauth-3 never got a live view of all replicas" scaleauth-3; return; }
+  local promoted
+  promoted=$(promote_by_pausing scaleauth-1 scaleauth-2 scaleauth-3 scaleauth-4) || {
+    dump_sentinel_view scaleauth-2 scaleauth-3 scaleauth-4
+    ko "$t" "no replica was promoted — the scale-up node's vote was needed and missing" scaleauth-2 scaleauth-3 scaleauth-4
+    return
+  }
+  [ "$(rcli "$promoted" GET upkey)" = "upvalue" ] \
+    || { ko "$t" "key lost across the post-scale-up failover (promoted=${promoted})" "$promoted"; return; }
+  note "promoted: ${promoted}"
+  docker unpause scaleauth-1 >/dev/null 2>&1
+  docker rm -f scaleauth-1 scaleauth-2 scaleauth-3 scaleauth-4 >/dev/null 2>&1
+  ok "$t"
+}
+
 # Editing REDIS_PASSWORD and redeploying must NOT rotate the password the
 # dataset already runs with. The platform's variable editor warns exactly
 # that ("changes the variable without updating the actual database
@@ -2797,6 +2866,7 @@ ALL_TESTS=(
   t_wiped_dataset_with_surviving_conf_does_not_wipe_cluster
   t_sentinel_auth_on_by_default_for_fresh_cluster
   t_scale_up_of_unauthed_cluster_stays_unauthed
+  t_scale_up_of_authed_cluster_joins_and_votes
   t_password_variable_edit_does_not_rotate
   t_maxmemory_pressure_keeps_cluster_stable
   t_maxmemory_policy_opt_in_evicts_instead_of_refusing
