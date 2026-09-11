@@ -109,6 +109,7 @@ Key variables on the Redis nodes (set on Redis-1, referenced by replicas):
 | `QUORUM_SYNC_DISABLED` | unset | Set to `1` to stop the watcher that keeps the local Sentinel's quorum at a majority of the known Sentinels |
 | `SENTINEL_PRUNE_DISABLED` | unset | Set to `1` to stop the same watcher from forgetting (via `SENTINEL RESET`) peers that have been down past `SENTINEL_PRUNE_DWELL_SECONDS` (default 1800) |
 | `LINK_HEAL_DISABLED` | unset | Set to `1` to stop the replication-link self-heal watcher |
+| `REPLICA_SYNC_GATE` | `true` | A replica booting with no loadable dataset is stamped `replica-priority 0` — Sentinel never promotes it — until its first full sync completes, when the wrapper lifts the priority back to `100`. Without it a master that dies mid-transfer is replaced by an EMPTY replica and the whole cluster, the returning master included, syncs the empty dataset from it. Set to the literal `false` to boot every replica at the default priority |
 
 ### Boot role
 

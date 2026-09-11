@@ -383,6 +383,33 @@ promote_by_pausing() { # promote_by_pausing MASTER CANDIDATE...
   return 1
 }
 
+replica_priority() { # replica_priority NODE  ->  the node's own replica-priority
+  rcli "$1" CONFIG GET replica-priority | tr -d '\r' | sed -n 2p
+}
+
+wait_for_replica_priority() { # wait_for_replica_priority NODE PRIORITY [timeout]
+  local i
+  for i in $(seq 1 "${3:-30}"); do
+    [ "$(replica_priority "$1")" = "$2" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# Sentinel learns replicas from the master's INFO only; a candidate it never
+# learned about cannot be selected, so a promotion test has to prove the
+# sentinel KNOWS the replicas before the master goes away — independent of
+# whether their links read ok (a first sync in flight reads err).
+wait_for_sentinel_num_slaves() { # wait_for_sentinel_num_slaves NODE MIN_SLAVES [timeout]
+  local i n
+  for i in $(seq 1 "${3:-60}"); do
+    n=$(scli "$1" SENTINEL master mymaster | grep -A1 "^num-slaves$" | tail -1)
+    [ -n "$n" ] && [ "$n" -ge "$2" ] 2>/dev/null && return 0
+    sleep 1
+  done
+  return 1
+}
+
 wait_for_replica_repointed() { # wait_for_replica_repointed NODE EXPECTED_MASTER_HOST [timeout]
   # Polls the node's OWN INFO replication — the link-heal watcher's target
   # signal — rather than the health server, so this proves the watcher acted,
@@ -2760,6 +2787,139 @@ t_invalid_maxmemory_policy_boots_on_noeviction() {
   ok "$t"
 }
 
+# A replica that has not completed its first full sync holds no data, and
+# vanilla Sentinel does not know that: its candidate selection never asks
+# whether a replica finished syncing — a replica mid-transfer reports
+# master_link_down_since_seconds:-1 and offset 1 and passes every filter. A
+# master that dies while its replicas are still receiving their first RDB is
+# replaced by an EMPTY node; the other replica syncs the empty dataset; and
+# the returning master is demoted and full-syncs the empty dataset over its
+# own — the cluster's data gone, with the volume intact until that last step.
+# The conversion is exactly this window: a standalone root becomes the HA
+# master while two fresh replicas start their first sync from it.
+#
+# The gate stamps a no-dataset replica boot at replica-priority 0 (Sentinel
+# skips priority 0 outright) and lifts it to 100 the moment the first sync
+# completes. Asserted here end to end: Sentinel tries, finds nobody, and
+# keeps finding nobody; the master comes back untouched; and once the
+# replicas hold the data they are promotable again — the gate never fences a
+# node that has something to serve.
+t_never_synced_replica_is_not_promotable() {
+  local t=t_never_synced_replica_is_not_promotable
+  local hosts="sg-1:26379,sg-2:26379,sg-3:26379"
+  mkvol sg-vol-1; mkvol sg-vol-2; mkvol sg-vol-3
+  start_node sg-1 sg-vol-1 /data -e SENTINEL_HOSTS="$hosts"
+  wait_for_role_master sg-1 || { ko "$t" "sg-1 never became master" sg-1; return; }
+
+  # A dataset whose first sync is still in flight when the master dies:
+  # 2000 keys saved at 50ms each is ~100s of transfer (rdb-key-save-delay is
+  # Redis's own knob for exactly this). The write fence is lifted while the
+  # master is alone so the populate is not refused with NOREPLICAS —
+  # quorum-sync restores it on its own dwell.
+  rcli sg-1 CONFIG SET min-replicas-to-write 0 | grep -q OK \
+    || { ko "$t" "could not lift the write fence for the populate" sg-1; return; }
+  docker exec sg-1 sh -c \
+    'for i in $(seq 1 2000); do echo "SET sg:k$i v$i"; done | redis-cli -a '"$PW"' --no-auth-warning --pipe' \
+    >/dev/null 2>&1
+  [ "$(rcli sg-1 GET sg:k2000)" = "v2000" ] \
+    || { ko "$t" "populate never landed on the master" sg-1; return; }
+  rcli sg-1 CONFIG SET rdb-key-save-delay 50000 | grep -q OK \
+    || { ko "$t" "could not slow the master's RDB transfer" sg-1; return; }
+
+  # The conversion's two fresh replicas.
+  start_node sg-2 sg-vol-2 /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=sg-1:6379
+  start_node sg-3 sg-vol-3 /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=sg-1:6379
+  wait_for_ping sg-2 || { ko "$t" "sg-2 never answered PING" sg-2; return; }
+  wait_for_ping sg-3 || { ko "$t" "sg-3 never answered PING" sg-3; return; }
+
+  # The stamp: both boot at priority 0, empty, sync in flight.
+  local n
+  for n in sg-2 sg-3; do
+    [ "$(replica_priority "$n")" = "0" ] \
+      || { ko "$t" "$n did not boot at replica-priority 0 (got '$(replica_priority "$n")')" sg-1 "$n"; return; }
+    wait_for_log_line "$n" "replica-priority 0 until the first full sync completes" 20 \
+      || { ko "$t" "$n never logged the gate" "$n"; return; }
+  done
+
+  # Sentinel has to KNOW the replicas and have its mesh, or the election
+  # below never starts and the test would pass for the wrong reason.
+  wait_for_sentinel_peers sg-2 2 || { ko "$t" "sg-2 sentinel never saw 2 peers" sg-2; return; }
+  wait_for_sentinel_peers sg-3 2 || { ko "$t" "sg-3 sentinel never saw 2 peers" sg-3; return; }
+  wait_for_sentinel_num_slaves sg-2 2 || { dump_sentinel_view sg-2; ko "$t" "sg-2 sentinel never learned both replicas" sg-2; return; }
+  wait_for_sentinel_num_slaves sg-3 2 || { dump_sentinel_view sg-3; ko "$t" "sg-3 sentinel never learned both replicas" sg-3; return; }
+  # Precondition, not an assertion: the syncs are still in flight.
+  [ "$(link_status sg-2)" = "down" ] && [ "$(link_status sg-3)" = "down" ] \
+    || { ko "$t" "the replicas finished syncing before the master went away — scenario too fast" sg-1 sg-2 sg-3; return; }
+
+  # The master dies mid-transfer (pause, not kill: see t_sentinel_failover).
+  docker pause sg-1 >/dev/null 2>&1
+
+  # Sentinel goes all the way to slave selection and finds nobody — the
+  # leader logs the abort. Either survivor may have won the election.
+  local i found=""
+  for i in $(seq 1 120); do
+    for n in sg-2 sg-3; do
+      docker logs "$n" 2>&1 | grep -q "failover-abort-no-good-slave" && { found="$n"; break 2; }
+    done
+    sleep 1
+  done
+  [ -n "$found" ] || {
+    dump_sentinel_view sg-2 sg-3
+    ko "$t" "sentinel never reached slave selection (no failover-abort-no-good-slave)" sg-2 sg-3
+    return
+  }
+  note "election aborted with no candidate (leader: ${found})"
+  # And keeps finding nobody: a full failover-timeout retry cycle with no
+  # master anywhere. Without the gate this is where an empty node is master.
+  for i in $(seq 1 45); do
+    for n in sg-2 sg-3; do
+      [ "$(redis_role "$n")" = "master" ] \
+        && { ko "$t" "$n was promoted holding $(rcli "$n" DBSIZE) keys — the empty-master wipe" sg-2 sg-3; return; }
+    done
+    sleep 1
+  done
+  ok "no replica was promoted while both were still mid-sync"
+
+  # The master comes back: nothing was failed over, so it is still the
+  # master and the replicas finish their sync from it. The in-flight child
+  # keeps the old delay; a fresh sync (repl-timeout on the paused link) picks
+  # up the reset.
+  docker unpause sg-1 >/dev/null 2>&1
+  rcli sg-1 CONFIG SET rdb-key-save-delay 0 >/dev/null
+  [ "$(redis_role sg-1)" = "master" ] \
+    || { ko "$t" "sg-1 did not come back as master (role: $(redis_role sg-1))" sg-1 sg-2 sg-3; return; }
+  wait_for_link_status sg-2 up 240 || { ko "$t" "sg-2 never completed its sync" sg-1 sg-2; return; }
+  wait_for_link_status sg-3 up 240 || { ko "$t" "sg-3 never completed its sync" sg-1 sg-3; return; }
+  wait_for_key sg-2 sg:k2000 v2000 || { ko "$t" "sg-2 synced without the data" sg-1 sg-2; return; }
+  wait_for_key sg-3 sg:k2000 v2000 || { ko "$t" "sg-3 synced without the data" sg-1 sg-3; return; }
+
+  # The lift: back to the default priority within a few polls, logged.
+  for n in sg-2 sg-3; do
+    wait_for_replica_priority "$n" 100 30 \
+      || { ko "$t" "$n stayed at replica-priority $(replica_priority "$n") after its sync completed" "$n"; return; }
+    wait_for_log_line "$n" "first full sync complete" 10 \
+      || { ko "$t" "$n never logged the lift" "$n"; return; }
+  done
+  ok "both replicas lifted to replica-priority 100 once synced"
+
+  # Positive control: synced replicas ARE promotable, and the promoted one
+  # holds the data. Same failover-readiness bar as every other failover test.
+  wait_for_sentinel_slave_view sg-2 2 || { dump_sentinel_view sg-2; ko "$t" "sg-2 sentinel has no live view of both replicas" sg-2; return; }
+  wait_for_sentinel_slave_view sg-3 2 || { dump_sentinel_view sg-3; ko "$t" "sg-3 sentinel has no live view of both replicas" sg-3; return; }
+  local promoted
+  promoted=$(promote_by_pausing sg-1 sg-2 sg-3) || {
+    dump_sentinel_view sg-2 sg-3
+    ko "$t" "no synced replica was promoted — the gate fenced a data-bearing node" sg-2 sg-3
+    return
+  }
+  [ "$(rcli "$promoted" GET sg:k2000)" = "v2000" ] \
+    || { ko "$t" "promoted node ${promoted} lost the data" "$promoted"; return; }
+  note "promoted: ${promoted}"
+  docker unpause sg-1 >/dev/null 2>&1
+  docker rm -f sg-1 sg-2 sg-3 >/dev/null 2>&1
+  ok "$t"
+}
+
 # ----- runner ------------------------------------------------------------------
 ALL_TESTS=(
   t_fresh_boot
@@ -2795,6 +2955,7 @@ ALL_TESTS=(
   t_foreign_host_reusing_member_name_is_quarantined
   t_wiped_master_volume_does_not_wipe_cluster
   t_wiped_dataset_with_surviving_conf_does_not_wipe_cluster
+  t_never_synced_replica_is_not_promotable
   t_sentinel_auth_on_by_default_for_fresh_cluster
   t_scale_up_of_unauthed_cluster_stays_unauthed
   t_password_variable_edit_does_not_rotate
