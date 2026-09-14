@@ -36,6 +36,14 @@ use tokio::time::timeout;
 /// the userinfo-illegal byte set, and the `redis` crate parses URLs through
 /// the same crate, so what this builds is guaranteed to parse back to the
 /// original password, not merely "usually work."
+/// The value half of a `CONFIG GET <param>` reply (`["<param>", "<value>"]`),
+/// `None` when the reply carries no value. Callers pick their own fallback:
+/// what a missing value means differs between "restore the previous
+/// priority" and "is this node still gated".
+pub fn config_get_value(reply: &[String]) -> Option<String> {
+    reply.get(1).cloned()
+}
+
 pub fn build_redis_url(host: &str, port: u16, password: &str) -> String {
     // A bare IPv6 literal in a URL authority is a parse error waiting to
     // happen — the colons read as the port separator. Sentinel's
@@ -250,6 +258,19 @@ pub async fn get_master_fields(
     match reply {
         Ok(Ok(fields)) => Some(fields),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod config_get_value_tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_value_half_only() {
+        let reply = vec!["replica-priority".to_string(), "42".to_string()];
+        assert_eq!(config_get_value(&reply), Some("42".to_string()));
+        assert_eq!(config_get_value(&["replica-priority".to_string()]), None);
+        assert_eq!(config_get_value(&[]), None);
     }
 }
 

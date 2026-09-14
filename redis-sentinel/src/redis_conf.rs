@@ -881,6 +881,31 @@ mod tests {
     }
 
     #[test]
+    fn replica_boot_over_the_startup_manifest_is_stamped_only_while_the_gate_is_pending() {
+        // What redis-server leaves behind after one boot with `appendonly yes`
+        // and nothing to load: a manifest over an empty base. It counts as a
+        // dataset, so only the pending marker can carry the gate across it.
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("appendonlydir")).unwrap();
+        std::fs::write(
+            dir.path().join("appendonlydir").join("appendonly.aof.manifest"),
+            b"file appendonly.aof.1.base.rdb seq 1 type b\n",
+        )
+        .unwrap();
+        let config = ha_replica_config(dir.path().to_str().unwrap());
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(!conf.contains("replica-priority"), "{conf}");
+
+        std::fs::write(
+            crate::sync_gate::pending_marker_path(&config.data_dir),
+            b"pending\n",
+        )
+        .unwrap();
+        let conf = generate_redis_conf(&config, &BootMaster::NoLocalState);
+        assert!(conf.contains("\nreplica-priority 0\n"), "{conf}");
+    }
+
+    #[test]
     fn sentinel_answer_naming_another_master_is_gated_like_the_env_replica() {
         // A node deployed as the env-primary, redeployed onto a fresh volume
         // after a failover: Sentinel's answer makes it a replica, and it

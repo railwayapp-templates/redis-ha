@@ -402,6 +402,17 @@ promote_by_pausing() { # promote_by_pausing MASTER CANDIDATE...
   return 1
 }
 
+role_payload() { # role_payload NODE  ->  the /role JSON body, whatever the status
+  # The body is the last line health_http prints (headers first, via -S).
+  health_http "$1" GET /role | tail -1
+}
+
+switchover_payload() { # switchover_payload NODE  ->  the /switchover JSON body, whatever the status
+  # The credential is sent unconditionally: a node that does not enforce
+  # ignores it, so this reads the route's own verdict either way.
+  health_http "$1" POST /switchover --header="$(basic_auth_header railway "$PW")" | tail -1
+}
+
 replica_priority() { # replica_priority NODE  ->  the node's own replica-priority
   rcli "$1" CONFIG GET replica-priority | tr -d '\r' | sed -n 2p
 }
@@ -2974,8 +2985,11 @@ t_invalid_maxmemory_policy_boots_on_noeviction() {
 #
 # The gate stamps a no-dataset replica boot at replica-priority 0 (Sentinel
 # skips priority 0 outright) and lifts it to 100 the moment the first sync
-# completes. Asserted here end to end: Sentinel tries, finds nobody, and
-# keeps finding nobody; the master comes back untouched; and once the
+# completes. Asserted here end to end: a gated replica reports itself as not
+# promotable and refuses a switchover; a restart mid-transfer boots gated
+# again (redis writes an AOF manifest at startup, so "a dataset exists" is
+# not the signal — the persisted marker is); Sentinel tries, finds nobody,
+# and keeps finding nobody; the master comes back untouched; and once the
 # replicas hold the data they are promotable again — the gate never fences a
 # node that has something to serve.
 t_never_synced_replica_is_not_promotable() {
@@ -2986,16 +3000,17 @@ t_never_synced_replica_is_not_promotable() {
   wait_for_role_master sg-1 || { ko "$t" "sg-1 never became master" sg-1; return; }
 
   # A dataset whose first sync is still in flight when the master dies:
-  # 2000 keys saved at 50ms each is ~100s of transfer (rdb-key-save-delay is
-  # Redis's own knob for exactly this). The write fence is lifted while the
-  # master is alone so the populate is not refused with NOREPLICAS —
-  # quorum-sync restores it on its own dwell.
+  # 4000 keys saved at 50ms each is ~200s of transfer (rdb-key-save-delay is
+  # Redis's own knob for exactly this) — room for the sentinel-view waits
+  # below on a slow runner. The write fence is lifted while the master is
+  # alone so the populate is not refused with NOREPLICAS — quorum-sync
+  # restores it on its own dwell.
   rcli sg-1 CONFIG SET min-replicas-to-write 0 | grep -q OK \
     || { ko "$t" "could not lift the write fence for the populate" sg-1; return; }
   docker exec sg-1 sh -c \
-    'for i in $(seq 1 2000); do echo "SET sg:k$i v$i"; done | redis-cli -a '"$PW"' --no-auth-warning --pipe' \
+    'for i in $(seq 1 4000); do echo "SET sg:k$i v$i"; done | redis-cli -a '"$PW"' --no-auth-warning --pipe' \
     >/dev/null 2>&1
-  [ "$(rcli sg-1 GET sg:k2000)" = "v2000" ] \
+  [ "$(rcli sg-1 GET sg:k4000)" = "v4000" ] \
     || { ko "$t" "populate never landed on the master" sg-1; return; }
   rcli sg-1 CONFIG SET rdb-key-save-delay 50000 | grep -q OK \
     || { ko "$t" "could not slow the master's RDB transfer" sg-1; return; }
@@ -3015,6 +3030,33 @@ t_never_synced_replica_is_not_promotable() {
       || { ko "$t" "$n never logged the gate" "$n"; return; }
   done
 
+  # The gate is visible to a caller before it is refused: /role says the
+  # node is not promotable, and /switchover refuses instead of biasing an
+  # empty node to win.
+  local payload
+  payload=$(role_payload sg-3)
+  printf '%s' "$payload" | grep -F '"promotable":false' >/dev/null \
+    || { ko "$t" "gated sg-3 /role did not report promotable:false (got '${payload}')" sg-3; return; }
+  payload=$(switchover_payload sg-3)
+  printf '%s' "$payload" | grep -F '"refused"' >/dev/null \
+    || { ko "$t" "gated sg-3 accepted a switchover (got '${payload}')" sg-3; return; }
+  [ "$(replica_priority sg-3)" = "0" ] \
+    || { ko "$t" "the refused switchover left sg-3 at replica-priority $(replica_priority sg-3)" sg-3; return; }
+  ok "gated replica reports promotable:false and refuses a switchover"
+
+  # A restart mid-transfer: redis wrote its AOF manifest at the first boot,
+  # so the volume now "holds a dataset" — the second boot must still be
+  # gated, off the persisted marker, and log that it resumed the gate.
+  [ "$(link_status sg-3)" = "down" ] \
+    || { ko "$t" "sg-3 finished syncing before the restart — scenario too fast" sg-1 sg-3; return; }
+  docker restart sg-3 >/dev/null 2>&1
+  wait_for_ping sg-3 || { ko "$t" "sg-3 never answered PING after its restart" sg-3; return; }
+  [ "$(replica_priority sg-3)" = "0" ] \
+    || { ko "$t" "sg-3 rebooted mid-sync at replica-priority $(replica_priority sg-3) — the gate did not survive the restart" sg-3; return; }
+  wait_for_log_line sg-3 "an earlier boot's first full sync never completed" 20 \
+    || { ko "$t" "sg-3 never logged the resumed gate" sg-3; return; }
+  ok "gated replica restarted mid-sync boots gated again"
+
   # Sentinel has to KNOW the replicas and have its mesh, or the election
   # below never starts and the test would pass for the wrong reason.
   wait_for_sentinel_peers sg-2 2 || { ko "$t" "sg-2 sentinel never saw 2 peers" sg-2; return; }
@@ -3033,7 +3075,9 @@ t_never_synced_replica_is_not_promotable() {
   local i found=""
   for i in $(seq 1 120); do
     for n in sg-2 sg-3; do
-      docker logs "$n" 2>&1 | grep -q "failover-abort-no-good-slave" && { found="$n"; break 2; }
+      # Not `grep -q`: under `pipefail` it exits on the first match and the
+      # pipeline reports docker logs' SIGPIPE — a false negative.
+      docker logs "$n" 2>&1 | grep -F "failover-abort-no-good-slave" >/dev/null && { found="$n"; break 2; }
     done
     sleep 1
   done
@@ -3062,10 +3106,10 @@ t_never_synced_replica_is_not_promotable() {
   rcli sg-1 CONFIG SET rdb-key-save-delay 0 >/dev/null
   [ "$(redis_role sg-1)" = "master" ] \
     || { ko "$t" "sg-1 did not come back as master (role: $(redis_role sg-1))" sg-1 sg-2 sg-3; return; }
-  wait_for_link_status sg-2 up 240 || { ko "$t" "sg-2 never completed its sync" sg-1 sg-2; return; }
-  wait_for_link_status sg-3 up 240 || { ko "$t" "sg-3 never completed its sync" sg-1 sg-3; return; }
-  wait_for_key sg-2 sg:k2000 v2000 || { ko "$t" "sg-2 synced without the data" sg-1 sg-2; return; }
-  wait_for_key sg-3 sg:k2000 v2000 || { ko "$t" "sg-3 synced without the data" sg-1 sg-3; return; }
+  wait_for_link_status sg-2 up 300 || { ko "$t" "sg-2 never completed its sync" sg-1 sg-2; return; }
+  wait_for_link_status sg-3 up 300 || { ko "$t" "sg-3 never completed its sync" sg-1 sg-3; return; }
+  wait_for_key sg-2 sg:k4000 v4000 || { ko "$t" "sg-2 synced without the data" sg-1 sg-2; return; }
+  wait_for_key sg-3 sg:k4000 v4000 || { ko "$t" "sg-3 synced without the data" sg-1 sg-3; return; }
 
   # The lift: back to the default priority within a few polls, logged.
   for n in sg-2 sg-3; do
@@ -3073,6 +3117,13 @@ t_never_synced_replica_is_not_promotable() {
       || { ko "$t" "$n stayed at replica-priority $(replica_priority "$n") after its sync completed" "$n"; return; }
     wait_for_log_line "$n" "first full sync complete" 10 \
       || { ko "$t" "$n never logged the lift" "$n"; return; }
+  done
+  for n in sg-2 sg-3; do
+    payload=$(role_payload "$n")
+    printf '%s' "$payload" | grep -F '"promotable":true' >/dev/null \
+      || { ko "$t" "synced $n /role did not report promotable:true (got '${payload}')" "$n"; return; }
+    docker exec "$n" test ! -e /data/.sync_gate_pending \
+      || { ko "$t" "$n still carries the pending marker after its lift" "$n"; return; }
   done
   ok "both replicas lifted to replica-priority 100 once synced"
 
@@ -3086,7 +3137,7 @@ t_never_synced_replica_is_not_promotable() {
     ko "$t" "no synced replica was promoted — the gate fenced a data-bearing node" sg-2 sg-3
     return
   }
-  [ "$(rcli "$promoted" GET sg:k2000)" = "v2000" ] \
+  [ "$(rcli "$promoted" GET sg:k4000)" = "v4000" ] \
     || { ko "$t" "promoted node ${promoted} lost the data" "$promoted"; return; }
   note "promoted: ${promoted}"
   docker unpause sg-1 >/dev/null 2>&1
