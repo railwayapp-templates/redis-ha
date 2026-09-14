@@ -8,6 +8,13 @@
 //!                        1. local Redis reports role:master
 //!                        2. local Sentinel confirms this node is the current master
 //!                      503 in all other cases, including when Sentinel is unreachable.
+//!                      A replica's 503 body also says whether /switchover
+//!                      would accept it: {"role":"replica","promotable":false,
+//!                      "reason":...} while its first full sync is outstanding
+//!                      (see `sync_gate`), "promotable":true once it holds the
+//!                      dataset, and no field at all when that could not be
+//!                      read — so a caller can hold the action instead of
+//!                      having it refused.
 //!   POST /switchover → ask THIS node to become the primary (the generic
 //!                      clusterWiring.dataNodeSwitchover contract). Sentinel
 //!                      has no "promote node X" command, only "start an
@@ -243,13 +250,53 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 async fn role(State(state): State<AppState>) -> impl IntoResponse {
     match timeout(Duration::from_secs(2), is_sentinel_confirmed_master(&state)).await {
         Ok(true) => (StatusCode::OK, Json(json!({"role": "master"}))),
-        Ok(false) => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"role": "replica"}))),
+        Ok(false) => {
+            let promotable = timeout(Duration::from_secs(1), replica_is_promotable(&state))
+                .await
+                .ok()
+                .flatten();
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(replica_role_payload(promotable)),
+            )
+        }
         Err(_) => {
             // Timeout — treat as unhealthy
             *state.redis_conn.lock().await = None;
             *state.sentinel_conn.lock().await = None;
             (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"role": "unknown", "reason": "timeout"})))
         }
+    }
+}
+
+/// Why a replica's /role says `promotable:false`.
+const NOT_PROMOTABLE_REASON: &str =
+    "replica-priority 0: the first full sync from the master has not completed";
+
+/// Whether /switchover would accept this replica, read off the same signal
+/// it refuses on — the gated priority (`sync_gate::blocks_switchover`).
+/// `None` when the priority could not be read.
+async fn replica_is_promotable(state: &AppState) -> Option<bool> {
+    let mut cmd = redis::cmd("CONFIG");
+    cmd.arg("GET").arg("replica-priority");
+    let reply: Vec<String> =
+        query_cached(&state.redis_conn, &state.redis_url, "Redis", cmd).await?;
+    let priority = crate::sentinel_query::config_get_value(&reply)?;
+    Some(!crate::sync_gate::blocks_switchover(&priority))
+}
+
+/// The 503 body for a node that is not the confirmed master. The
+/// `promotable` field is only present when it could be read: a caller must
+/// treat its absence as unknown, never as a refusal.
+fn replica_role_payload(promotable: Option<bool>) -> serde_json::Value {
+    match promotable {
+        Some(false) => json!({
+            "role": "replica",
+            "promotable": false,
+            "reason": NOT_PROMOTABLE_REASON,
+        }),
+        Some(true) => json!({"role": "replica", "promotable": true}),
+        None => json!({"role": "replica"}),
     }
 }
 
@@ -375,9 +422,7 @@ const SWITCHOVER_TIMEOUT: Duration = Duration::from_secs(25);
 /// the reply has an unexpected shape — restoring SOMETHING sane beats leaving
 /// the election bias behind forever.
 fn priority_from_config_get(reply: &[String]) -> String {
-    reply
-        .get(1)
-        .cloned()
+    crate::sentinel_query::config_get_value(reply)
         .unwrap_or_else(|| DEFAULT_REPLICA_PRIORITY.to_string())
 }
 
@@ -509,6 +554,18 @@ async fn initiate_switchover(state: &AppState) -> anyhow::Result<SwitchoverOutco
         .await
         .context("CONFIG GET replica-priority failed")?;
     let previous_priority = priority_from_config_get(&reply);
+    // A node at the gated priority holds no dataset yet — its first full
+    // sync has not completed (see `sync_gate`). Biasing it to win would put
+    // an empty node in front of the cluster, which is the wipe the gate
+    // exists to prevent; refuse instead, and say what to wait for.
+    if crate::sync_gate::blocks_switchover(&previous_priority) {
+        anyhow::bail!(
+            "this node has not completed its first full sync from the master \
+             (replica-priority {}) and holds no dataset to promote — retry once its \
+             INFO replication reads master_link_status:up",
+            crate::sync_gate::GATED_PRIORITY
+        );
+    }
     // Stash BEFORE the overwrite: if the handler's timeout drops this future
     // anywhere past the next command, the timeout arm still knows what to
     // restore.
@@ -927,6 +984,33 @@ mod observed_priority_for_host_tests {
     #[test]
     fn empty_reply_is_none() {
         assert_eq!(observed_priority_for_host(&[], "redis-2"), None);
+    }
+}
+
+#[cfg(test)]
+mod replica_role_payload_tests {
+    use super::*;
+
+    #[test]
+    fn a_gated_replica_says_so_and_why() {
+        let payload = replica_role_payload(Some(false));
+        assert_eq!(payload["role"], "replica");
+        assert_eq!(payload["promotable"], false);
+        assert_eq!(payload["reason"], NOT_PROMOTABLE_REASON);
+    }
+
+    #[test]
+    fn a_synced_replica_is_promotable_with_no_reason_to_give() {
+        let payload = replica_role_payload(Some(true));
+        assert_eq!(payload["role"], "replica");
+        assert_eq!(payload["promotable"], true);
+        assert!(payload.get("reason").is_none());
+    }
+
+    #[test]
+    fn an_unreadable_priority_leaves_the_field_out_rather_than_guessing() {
+        let payload = replica_role_payload(None);
+        assert_eq!(payload, json!({"role": "replica"}));
     }
 }
 

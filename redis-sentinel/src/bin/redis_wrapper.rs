@@ -32,6 +32,7 @@ use redis_sentinel::{
     },
     sentinel_auth,
     sentinel_conf::{conf_requires_auth, generate_sentinel_conf},
+    sync_gate,
 };
 use std::fs;
 use std::path::Path;
@@ -315,6 +316,13 @@ async fn main() -> Result<()> {
     // Captured before spawning: once Redis is up it writes its own
     // appendonlydir, so the check would no longer be true.
     let adopting_rdb = needs_rdb_to_aof_migration(&config.data_dir);
+    // Same reason, same moment: whether this boot replicates from another
+    // node with nothing loadable of its own (or resumes an earlier boot's
+    // unfinished first sync) — the redis.conf just written stamped
+    // `replica-priority 0` for exactly that boot, `arm` persists the gate for
+    // the boots that may follow, and the watcher below is what lifts it once
+    // the first full sync completes.
+    let gated_boot = sync_gate::arm(&config, &boot_master);
 
     if adopting_rdb {
         match quarantine_manifestless_aof_dir(&config.data_dir) {
@@ -347,6 +355,16 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             enable_aof_after_rdb_load(redis_port, &redis_password, &data_dir, &telemetry).await;
         });
+    }
+
+    // A first sync in flight is not a failover candidate: lift the gated
+    // priority the moment the link first reads `up` — see `sync_gate`.
+    if gated_boot {
+        sync_gate::spawn(
+            config.redis_port,
+            config.redis_password.clone(),
+            config.data_dir.clone(),
+        );
     }
 
     // Spawn Sentinel (colocated)
