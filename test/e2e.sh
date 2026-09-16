@@ -29,7 +29,7 @@ IMAGE="${IMAGE:-redis-sentinel-e2e:local}"
 # it builds it on first use — inside the scenario, not setup, so subset runs
 # of unrelated scenarios never pay the cargo build.
 EDGE_IMAGE="${EDGE_IMAGE:-haproxy-e2e:local}"
-SEED_IMAGE="redis:8.2.1"
+SEED_IMAGE="${SEED_IMAGE:-redis:8.2.1}"
 NET="redis-ha-test-net"
 LABEL="redis-ha-e2e=1"
 PW="e2e-password"

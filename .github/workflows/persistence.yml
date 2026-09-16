@@ -1,0 +1,54 @@
+name: Persistence E2E
+on:
+  pull_request:
+  push:
+    branches: [main, 'pcs/redis-persistence-*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: persistence-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  persistence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: '7.2'
+            seed: 'redis:7.2.5'
+          - version: '7.4'
+            seed: 'redis:7.4.3'
+          - version: '8.2'
+            seed: 'redis:8.2.1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: redis-sentinel/Dockerfile
+          build-args: REDIS_VERSION=${{ matrix.version }}
+          tags: redis-sentinel-e2e:local
+          load: true
+          cache-from: type=gha,scope=e2e-node
+          cache-to: type=gha,scope=persistence-${{ matrix.version }},mode=max
+      - name: Exact dataset and restart battery
+        env:
+          SEED_IMAGE: ${{ matrix.seed }}
+        run: python3 test/persistence/run.py
+      - name: Migration fault and replication battery
+        env:
+          SEED_IMAGE: ${{ matrix.seed }}
+        run: |
+          set -o pipefail
+          ./test/e2e.sh t_crash_window_recovery t_stale_aof_quarantine_failure_stops_boot t_idle_restart_trusts_own_aof t_rdb_saved_by_another_image_is_adopted t_rewrite_failure_recovers t_replication_of_adopted_data t_conversion_under_active_writes t_sentinel_failover 2>&1 | tee migration-faults.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: persistence-${{ matrix.version }}
+          path: |
+            persistence-results/
+            migration-faults.log
