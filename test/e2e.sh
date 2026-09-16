@@ -403,14 +403,21 @@ promote_by_pausing() { # promote_by_pausing MASTER CANDIDATE...
 }
 
 role_payload() { # role_payload NODE  ->  the /role JSON body, whatever the status
-  # The body is the last line health_http prints (headers first, via -S).
-  health_http "$1" GET /role | tail -1
+  # Read the body directly. Do NOT scrape `health_http | tail -1`: wget writes
+  # its "ERROR <status>" line (and a trailing blank line) to stderr AFTER the
+  # body, health_http merges streams with 2>&1, and tail then returns empty —
+  # which is exactly how t_never_synced_replica_is_not_promotable failed on
+  # main with `got ''` despite /role serving {"promotable":false}.
+  docker exec "$1" wget -qO- --content-on-error "http://127.0.0.1:8080/role" 2>/dev/null || true
 }
 
 switchover_payload() { # switchover_payload NODE  ->  the /switchover JSON body, whatever the status
-  # The credential is sent unconditionally: a node that does not enforce
-  # ignores it, so this reads the route's own verdict either way.
-  health_http "$1" POST /switchover --header="$(basic_auth_header railway "$PW")" | tail -1
+  # Same body-only read as role_payload (see above). The credential is sent
+  # unconditionally: a node that does not enforce ignores it, so this reads
+  # the route's own verdict either way.
+  docker exec "$1" wget -qO- --content-on-error --post-data= \
+    --header="$(basic_auth_header railway "$PW")" \
+    "http://127.0.0.1:8080/switchover" 2>/dev/null || true
 }
 
 replica_priority() { # replica_priority NODE  ->  the node's own replica-priority
