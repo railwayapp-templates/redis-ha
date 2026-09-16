@@ -90,6 +90,15 @@ def stop(c, graceful=True):
     docker('stop' if graceful else 'kill', c)
 
 
+
+def shutdown_nosave(c):
+    # Docker can terminate the exec client as soon as Redis (PID 1) exits.
+    # Check the SERVER exit instead of treating that client-side race as failure.
+    docker('exec', c, 'redis-cli', '-a', PW, '--no-auth-warning', 'SHUTDOWN', 'NOSAVE', check=False)
+    wait(lambda: docker('inspect', '-f', '{{.State.Running}}', c) == 'false', 'clean source shutdown')
+    assert docker('inspect', '-f', '{{.State.ExitCode}}', c) == '0', 'source did not shut down cleanly'
+
+
 def age(v, nested=False):
     p = '/v/redis/data' if nested else '/v'
     fs(v, f"find {p}/appendonlydir -type f -exec touch -t {OLD_STAMP} {{}} +")
@@ -151,8 +160,7 @@ def stale_fixture(nested=False, nonempty=False):
         assert cli(old, 'SET', 'abandoned-only', 'obsolete') == 'OK'
     committed(old, nested)
     # NOSAVE leaves only the AOF. A different, AOF-off process writes the RDB.
-    docker('exec', old, 'redis-cli', '-a', PW, '--no-auth-warning', 'SHUTDOWN', 'NOSAVE')
-    wait(lambda: docker('inspect', '-f', '{{.State.Running}}', old) == 'false', 'old image shutdown')
+    shutdown_nosave(old)
     age(v, nested)
     old = start(v, nested=nested)
     ready(old)
@@ -195,8 +203,7 @@ def live_incremental(marker):
     # The RDB/base knows nothing about this later acknowledged write.
     cli(n, 'SET', 'aof-only', 'must-survive')
     time.sleep(2)
-    docker('exec', n, 'redis-cli', '-a', PW, '--no-auth-warning', 'SHUTDOWN', 'NOSAVE')
-    wait(lambda: docker('inspect', '-f', '{{.State.Running}}', n) == 'false', 'AOF source shutdown')
+    shutdown_nosave(n)
     fs(v, f"find /v/appendonlydir -type f ! -name '*.incr.aof' -exec touch -t {OLD_STAMP} {{}} +")
     if marker == 'corrupt':
         fs(v, "echo invalid > /v/.rdb_owner")
