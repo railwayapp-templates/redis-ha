@@ -25,10 +25,10 @@ use redis_sentinel::{
     health_server,
     link_heal,
     process_manager::{enable_aof_after_rdb_load, spawn_redis, spawn_sentinel, supervise},
-    quorum,
+    quorum, rdb_owner,
     redis_conf::{
         generate_redis_conf, needs_rdb_to_aof_migration, persisted_requirepass,
-        quarantine_manifestless_aof_dir,
+        quarantine_manifestless_aof_dir, quarantine_stale_aof_dir,
     },
     sentinel_auth,
     sentinel_conf::{conf_requires_auth, generate_sentinel_conf},
@@ -228,7 +228,11 @@ async fn main() -> Result<()> {
     // redis.conf would poison `persisted_requirepass` on the next boot,
     // pinning the node to whatever prefix of the password survived.
     let redis_conf_path = format!("{}/redis.conf", config.data_dir);
-    let redis_conf = generate_redis_conf(&config, &boot_master);
+    // Decide exactly once, before writing config or moving persistence files.
+    // A failed inspection must stop startup rather than guess a data source.
+    let adopting_rdb = needs_rdb_to_aof_migration(&config.data_dir)
+        .context("cannot safely choose Redis persistence source")?;
+    let redis_conf = generate_redis_conf(&config, &boot_master, adopting_rdb);
     write_atomic(Path::new(&redis_conf_path), &redis_conf, None)
         .context("failed to write redis.conf")?;
     info!(path = %redis_conf_path, "wrote redis.conf");
@@ -313,10 +317,7 @@ async fn main() -> Result<()> {
         role: role.to_string(),
     });
 
-    // Captured before spawning: once Redis is up it writes its own
-    // appendonlydir, so the check would no longer be true.
-    let adopting_rdb = needs_rdb_to_aof_migration(&config.data_dir);
-    // Same reason, same moment: whether this boot replicates from another
+    // Capture before spawning: whether this boot replicates from another
     // node with nothing loadable of its own (or resumes an earlier boot's
     // unfinished first sync) — the redis.conf just written stamped
     // `replica-priority 0` for exactly that boot, `arm` persists the gate for
@@ -331,15 +332,43 @@ async fn main() -> Result<()> {
                 "moved manifest-less appendonlydir aside before AOF migration"
             ),
             Ok(None) => {}
-            Err(err) => tracing::error!(
-                error = %err,
-                "failed to move manifest-less appendonlydir aside"
-            ),
+            Err(err) => {
+                return Err(err)
+                    .context("failed to preserve manifest-less AOF; refusing to start Redis")
+            }
         }
+        // Mutually exclusive with the branch above, on manifest presence: a
+        // loadable AOF the RDB has outlived. It cannot stay where Redis (or
+        // the closing rewrite) will find it.
+        match quarantine_stale_aof_dir(&config.data_dir) {
+            Ok(Some(superseded)) => tracing::warn!(
+                to = %superseded.display(),
+                "appendonlydir predates the RDB on this volume — moved aside before AOF migration"
+            ),
+            Ok(None) => {}
+            Err(err) => {
+                return Err(err)
+                    .context("failed to preserve superseded AOF; refusing to start Redis")
+            }
+        }
+    }
+
+    // The adoption decision is made: whatever dump.rdb this boot found is
+    // now accounted for — being loaded into the AOF, or already older than
+    // the AOF it sits beside. Record it as ours so a boot that finds it
+    // unchanged trusts the AOF instead of re-reading the timestamps; the
+    // watcher and the exit path keep the record current from here on.
+    if let Err(err) = rdb_owner::record(&config.data_dir) {
+        tracing::warn!(
+            error = %err,
+            "could not record the RDB this boot found — a restart falls back to comparing \
+             its timestamp against the AOF"
+        );
     }
 
     // Spawn Redis
     let redis_proc = spawn_redis(&config.data_dir, config.redis_port).await?;
+    rdb_owner::spawn(config.data_dir.clone());
 
     // redis.conf carries `appendonly no` for this boot so the adopted RDB is
     // what Redis loads; AOF is turned back on as soon as the load finishes.
@@ -429,5 +458,12 @@ async fn main() -> Result<()> {
 
     // Block until a process exits, we receive a signal, or a watcher asks
     // for a restart through the boot path.
-    supervise(redis_proc, sentinel_proc, demote_target, restart_rx).await
+    supervise(
+        redis_proc,
+        sentinel_proc,
+        demote_target,
+        restart_rx,
+        config.data_dir.clone(),
+    )
+    .await
 }

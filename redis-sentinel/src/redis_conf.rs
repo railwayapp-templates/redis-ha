@@ -1,26 +1,117 @@
 use crate::boot_role::BootMaster;
 use crate::config::Config;
 
-/// Whether this boot has to adopt an RDB-only dataset.
+/// How much newer `dump.rdb` must be before it outranks a committed AOF —
+/// the fallback for an RDB this image did not write itself (no
+/// [`crate::rdb_owner`] marker, or one naming a different file).
+///
+/// Redis fsyncs the AOF and only afterwards writes the shutdown RDB, so on a
+/// node that genuinely runs AOF the RDB is always a few milliseconds newer.
+/// The margin keeps that ordering from reading as an abandoned AOF. What it
+/// discriminates is a dataset the customer has been persisting via RDB while
+/// an AOF written by an earlier image sits untouched beside it — the bitnami
+/// lineage with `REDIS_AOF_ENABLED=no`, where the gap is days or years.
+///
+/// It cannot discriminate idleness: a node that took no writes for longer
+/// than this before a clean stop leaves the same shape (fsync touches no
+/// mtime, nothing buffered means nothing appended, then the shutdown RDB).
+/// That is why an RDB this image's own redis-server wrote never reaches
+/// this comparison — the marker settles it first.
+const STALE_AOF_MARGIN: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Whether this boot has to adopt the RDB rather than the AOF.
 ///
 /// Redis loads the AOF, not the RDB, whenever `appendonly yes` is set at
-/// startup. On a volume that holds a `dump.rdb` but no `appendonlydir` — a
-/// standalone Redis being adopted as a cluster primary, since Railway's
-/// standalone template runs `--save 60 1` with no AOF — that means booting
-/// from an empty AOF and silently abandoning the customer's data, with
-/// `dump.rdb` left untouched on disk beside it.
+/// startup. Two shapes on the volume make that the wrong source:
 ///
-/// So start with AOF off, let Redis load the RDB, and switch AOF on at
-/// runtime (`CONFIG SET appendonly yes`), which is the documented migration
-/// and rewrites the AOF from the in-memory dataset.
-pub fn needs_rdb_to_aof_migration(data_dir: &str) -> bool {
-    let has_rdb = std::path::Path::new(&format!("{}/dump.rdb", data_dir)).exists();
+///  1. A `dump.rdb` with no committed AOF at all — a standalone Redis being
+///     adopted as a cluster primary, since Railway's standalone template runs
+///     `--save 60 1` with no AOF. Booting `appendonly yes` there starts from
+///     an empty AOF and abandons the dataset sitting beside it.
+///  2. A `dump.rdb` decisively NEWER than a committed AOF — the bitnami
+///     lineage persisting via RDB (`REDIS_AOF_ENABLED=no`) over an AOF from
+///     an older image that stopped being written long ago. Trusting the
+///     manifest's mere existence there loaded a stale, empty AOF and then
+///     overwrote the live `dump.rdb` with it on shutdown (incident
+///     2026-09-15: an AOF base from 7.2.5 loaded 0 keys over 57,401).
+///
+/// One shape is excluded before any timestamp is read: a `dump.rdb` this
+/// image's own redis-server wrote — its shutdown save, a BGSAVE, a replica's
+/// full-sync transfer — recorded by [`crate::rdb_owner`]. That RDB is a
+/// snapshot of a dataset the AOF beside it already holds in full, however
+/// long the node idled before it stopped, and the AOF stays the source.
+///
+/// Either way: start with AOF off, let Redis load the RDB, and switch AOF on
+/// at runtime (`CONFIG SET appendonly yes`), which is the documented
+/// migration and rewrites the AOF from the in-memory dataset. The losing
+/// appendonlydir is renamed aside first, never deleted.
+pub fn needs_rdb_to_aof_migration(data_dir: &str) -> std::io::Result<bool> {
+    let Some(rdb) = file_metadata(&std::path::Path::new(data_dir).join("dump.rdb"))? else {
+        return Ok(false);
+    };
+    let manifest = std::path::Path::new(data_dir).join("appendonlydir/appendonly.aof.manifest");
+    if file_metadata(&manifest)?.is_none() {
+        return Ok(true);
+    }
     // The manifest, not the directory: `CONFIG SET appendonly yes` commits the
     // rewritten AOF by atomically renaming the manifest into place, so a crash
     // before that commit leaves an appendonlydir with orphan files Redis
     // cannot load. Keying on the directory would skip the migration on the
     // next boot and strand the (still intact) dump.rdb all over again.
-    has_rdb && !aof_manifest_exists(data_dir)
+    // Our own redis-server wrote this RDB: the AOF beside it is the source,
+    // whatever the mtimes say (see STALE_AOF_MARGIN on why they can lie).
+    if crate::rdb_owner::owns_rdb(data_dir) {
+        return Ok(false);
+    }
+    let aof = newest_aof_write(data_dir)?;
+    Ok(rdb
+        .modified()?
+        .duration_since(aof)
+        .is_ok_and(|gap| gap >= STALE_AOF_MARGIN))
+}
+
+/// Read a regular file, distinguishing absence from an unreadable path.
+/// Symlinks are not accepted: dangling links must not look like absent data.
+fn file_metadata(path: &std::path::Path) -> std::io::Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => Ok(Some(meta)),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("expected a regular persistence file: {}", path.display()),
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// The newest mtime anywhere in `appendonlydir`. Every entry must be read;
+/// a partial scan cannot establish which dataset is newer.
+///
+/// Every file, not just the manifest: the manifest is only rewritten when a
+/// rewrite commits, while the incr file is appended continuously. Reading the
+/// manifest alone would make a busy AOF node look years stale.
+fn newest_aof_write(data_dir: &str) -> std::io::Result<std::time::SystemTime> {
+    let aof_dir = std::path::Path::new(data_dir).join("appendonlydir");
+    let mut newest = None;
+    for entry in std::fs::read_dir(aof_dir)? {
+        let path = entry?.path();
+        let meta = file_metadata(&path)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "AOF file disappeared while inspecting persistence",
+            )
+        })?;
+        let modified = meta.modified()?;
+        newest = Some(newest.map_or(modified, |previous: std::time::SystemTime| {
+            previous.max(modified)
+        }));
+    }
+    newest.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "committed AOF directory is empty",
+        )
+    })
 }
 
 /// Whether a committed (loadable) multi-part AOF exists — the manifest is the
@@ -43,17 +134,58 @@ pub fn aof_manifest_exists(data_dir: &str) -> bool {
 pub fn quarantine_manifestless_aof_dir(
     data_dir: &str,
 ) -> std::io::Result<Option<std::path::PathBuf>> {
-    let aof_dir = std::path::Path::new(data_dir).join("appendonlydir");
-    if !aof_dir.exists() || aof_dir.join("appendonly.aof.manifest").exists() {
+    if file_metadata(&std::path::Path::new(data_dir).join("appendonlydir/appendonly.aof.manifest"))?
+        .is_some()
+    {
         return Ok(None);
+    }
+    rename_aof_dir_aside(data_dir, "orphaned")
+}
+
+/// Move a committed but superseded `appendonlydir` out of the way before an
+/// RDB adoption boot.
+///
+/// The adoption decision has already established that this AOF
+/// stopped being written long before the RDB was last saved. It is loadable,
+/// which is what makes it dangerous: leaving it in place lets the AOF rewrite
+/// that ends the migration merge into it, and lets any later boot that reads
+/// the manifest pick it over the dataset actually in memory. Renamed aside,
+/// never deleted — it stays on the volume as evidence.
+pub fn quarantine_stale_aof_dir(data_dir: &str) -> std::io::Result<Option<std::path::PathBuf>> {
+    if file_metadata(&std::path::Path::new(data_dir).join("appendonlydir/appendonly.aof.manifest"))?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    rename_aof_dir_aside(data_dir, "superseded")
+}
+
+/// Rename `appendonlydir` to `appendonlydir.<reason>-<unix ts>`, or answer
+/// `None` when there is no such directory. The timestamp keeps repeat boots
+/// from colliding with an earlier quarantine.
+fn rename_aof_dir_aside(
+    data_dir: &str,
+    reason: &str,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    let aof_dir = std::path::Path::new(data_dir).join("appendonlydir");
+    match std::fs::symlink_metadata(&aof_dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "expected appendonlydir to be a directory",
+            ))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
     }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let orphaned = std::path::Path::new(data_dir).join(format!("appendonlydir.orphaned-{}", ts));
-    std::fs::rename(&aof_dir, &orphaned)?;
-    Ok(Some(orphaned))
+    let moved = std::path::Path::new(data_dir).join(format!("appendonlydir.{}-{}", reason, ts));
+    std::fs::rename(&aof_dir, &moved)?;
+    Ok(Some(moved))
 }
 
 /// The master this boot replicates from, or `None` when it starts as one.
@@ -174,9 +306,11 @@ pub fn quote_conf_value(value: &str) -> String {
     out
 }
 
-pub fn generate_redis_conf(config: &Config, boot_master: &BootMaster) -> String {
-    let adopting_rdb = needs_rdb_to_aof_migration(&config.data_dir);
-
+pub fn generate_redis_conf(
+    config: &Config,
+    boot_master: &BootMaster,
+    adopting_rdb: bool,
+) -> String {
     let mut lines: Vec<String> = vec![
         format!("port {}", config.redis_port),
         format!("requirepass {}", quote_conf_value(&config.redis_password)),
@@ -309,6 +443,18 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    fn needs_rdb_to_aof_migration(data_dir: &str) -> bool {
+        super::needs_rdb_to_aof_migration(data_dir).unwrap()
+    }
+
+    fn generate_redis_conf(config: &Config, boot_master: &BootMaster) -> String {
+        super::generate_redis_conf(
+            config,
+            boot_master,
+            needs_rdb_to_aof_migration(&config.data_dir),
+        )
+    }
+
     fn config_at(data_dir: &str) -> Config {
         let mut config = Config::for_tests();
         config.data_dir = data_dir.to_string();
@@ -333,6 +479,20 @@ mod tests {
             b"file appendonly.aof.1.base.rdb seq 1 type b\n",
         )
         .unwrap();
+    }
+
+    /// Backdate every file in `appendonlydir` by `age`, the way a volume
+    /// whose AOF stopped being written looks on disk.
+    fn age_aof_files(dir: &std::path::Path, age: std::time::Duration) {
+        let when = std::time::SystemTime::now() - age;
+        for entry in fs::read_dir(dir.join("appendonlydir")).unwrap().flatten() {
+            fs::File::options()
+                .write(true)
+                .open(entry.path())
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(when))
+                .unwrap();
+        }
     }
 
     // --- needs_rdb_to_aof_migration: every branch ---
@@ -379,6 +539,95 @@ mod tests {
         assert!(!needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
     }
 
+    #[test]
+    fn an_rdb_that_outlived_its_committed_aof_is_adopted() {
+        // The 2026-09-15 incident volume: a bitnami service running
+        // REDIS_AOF_ENABLED=no, so `dump.rdb` is the live dataset, beside an
+        // AOF last written by a 7.2.5-era image over a year earlier. Trusting
+        // the manifest here booted an empty AOF and then overwrote the RDB.
+        let dir = tempdir().unwrap();
+        write_aof_manifest(dir.path());
+        age_aof_files(dir.path(), std::time::Duration::from_secs(434 * 86_400));
+        write_rdb(dir.path());
+        assert!(needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn a_live_aof_keeps_its_claim_over_a_shutdown_rdb() {
+        // Redis fsyncs the AOF and only then writes the shutdown RDB, so a
+        // healthy AOF node always leaves the RDB marginally newer. That
+        // ordering must not read as an abandoned AOF.
+        let dir = tempdir().unwrap();
+        write_aof_manifest(dir.path());
+        age_aof_files(dir.path(), std::time::Duration::from_secs(2));
+        write_rdb(dir.path());
+        assert!(!needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn freshness_comes_from_the_newest_aof_file_not_the_manifest() {
+        // The manifest is only rewritten when a rewrite commits; the incr
+        // file is appended continuously. Reading the manifest alone would
+        // make a busy node look stale and hand the dataset to an older RDB.
+        let dir = tempdir().unwrap();
+        write_aof_manifest(dir.path());
+        age_aof_files(dir.path(), std::time::Duration::from_secs(434 * 86_400));
+        write_rdb(dir.path());
+        fs::write(
+            dir.path().join("appendonlydir/appendonly.aof.1.incr.aof"),
+            b"recent write",
+        )
+        .unwrap();
+        assert!(!needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn an_rdb_this_image_wrote_never_displaces_its_own_aof() {
+        // This image's own quiet restart: no writes for half an hour, then a
+        // clean stop. Redis fsyncs the AOF (no mtime change), appends
+        // nothing, then writes the shutdown RDB — the same on-disk shape as
+        // an abandoned AOF, half an hour "stale". The exit path recorded the
+        // RDB as ours, so the AOF keeps its claim and no re-adoption fires.
+        let dir = tempdir().unwrap();
+        write_aof_manifest(dir.path());
+        age_aof_files(dir.path(), std::time::Duration::from_secs(30 * 60));
+        write_rdb(dir.path());
+        crate::rdb_owner::record(dir.path().to_str().unwrap()).unwrap();
+        assert!(!needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn the_marker_speaks_only_for_the_rdb_it_recorded() {
+        // The customer reverted to an AOF-off image, which kept saving
+        // dump.rdb for a year, then re-patched. Our marker names the RDB we
+        // left, not the one now on disk, so freshness decides: adopt.
+        let dir = tempdir().unwrap();
+        write_aof_manifest(dir.path());
+        write_rdb(dir.path());
+        crate::rdb_owner::record(dir.path().to_str().unwrap()).unwrap();
+        age_aof_files(dir.path(), std::time::Duration::from_secs(434 * 86_400));
+        fs::write(dir.path().join("dump.rdb"), b"REDIS0011saved by the old image").unwrap();
+        assert!(needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn an_unreadable_marker_falls_back_to_freshness() {
+        // Garbage where the marker should be answers nothing, and the
+        // decision is exactly what it would be with no marker at all.
+        let dir = tempdir().unwrap();
+        write_aof_manifest(dir.path());
+        age_aof_files(dir.path(), std::time::Duration::from_secs(434 * 86_400));
+        write_rdb(dir.path());
+        fs::write(
+            crate::rdb_owner::marker_path(dir.path().to_str().unwrap()),
+            "??\n",
+        )
+        .unwrap();
+        assert!(needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
+        age_aof_files(dir.path(), std::time::Duration::from_secs(2));
+        assert!(!needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
+    }
+
     // --- quarantine_manifestless_aof_dir: every branch ---
 
     #[test]
@@ -415,6 +664,103 @@ mod tests {
             fs::read(moved.join("appendonly.aof.1.incr.aof")).unwrap(),
             b"orphan"
         );
+    }
+
+    // --- quarantine_stale_aof_dir: every branch ---
+
+    #[test]
+    fn stale_quarantine_does_nothing_without_an_aof_dir() {
+        let dir = tempdir().unwrap();
+        let moved = quarantine_stale_aof_dir(dir.path().to_str().unwrap()).unwrap();
+        assert!(moved.is_none());
+    }
+
+    #[test]
+    fn stale_quarantine_leaves_a_manifestless_dir_to_the_other_path() {
+        // The two quarantines split on manifest presence so exactly one of
+        // them fires per adoption boot.
+        let dir = tempdir().unwrap();
+        write_manifestless_aof_dir(dir.path());
+        let moved = quarantine_stale_aof_dir(dir.path().to_str().unwrap()).unwrap();
+        assert!(moved.is_none());
+        assert!(dir.path().join("appendonlydir").exists());
+    }
+
+    #[test]
+    fn stale_quarantine_moves_a_committed_dir_aside_preserving_contents() {
+        let dir = tempdir().unwrap();
+        write_aof_manifest(dir.path());
+        let moved = quarantine_stale_aof_dir(dir.path().to_str().unwrap())
+            .unwrap()
+            .expect("should have quarantined");
+        // Renamed, not deleted: a superseded AOF is still the only record of
+        // whatever the older image accepted before it stopped being written.
+        assert!(!dir.path().join("appendonlydir").exists());
+        assert!(moved.join("appendonly.aof.manifest").exists());
+    }
+
+    #[test]
+    fn unreadable_aof_entry_refuses_to_choose_instead_of_using_a_partial_scan() {
+        let dir = tempdir().unwrap();
+        write_aof_manifest(dir.path());
+        age_aof_files(dir.path(), std::time::Duration::from_secs(86_400));
+        write_rdb(dir.path());
+        // A dangling incremental file must not be silently omitted from the
+        // freshness scan, even when every readable file looks abandoned.
+        std::os::unix::fs::symlink(
+            "missing-incremental",
+            dir.path().join("appendonlydir/latest.aof"),
+        )
+        .unwrap();
+        assert!(super::needs_rdb_to_aof_migration(dir.path().to_str().unwrap()).is_err());
+        assert!(dir.path().join("dump.rdb").exists());
+        assert!(dir
+            .path()
+            .join("appendonlydir/appendonly.aof.manifest")
+            .exists());
+    }
+
+    #[test]
+    fn malformed_persistence_paths_do_not_look_like_absent_data() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("dump.rdb")).unwrap();
+        assert!(super::needs_rdb_to_aof_migration(dir.path().to_str().unwrap()).is_err());
+        fs::remove_dir(dir.path().join("dump.rdb")).unwrap();
+        write_rdb(dir.path());
+        fs::write(dir.path().join("appendonlydir"), "not a directory").unwrap();
+        assert!(super::needs_rdb_to_aof_migration(dir.path().to_str().unwrap()).is_err());
+        assert!(quarantine_manifestless_aof_dir(dir.path().to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_broken_manifest_is_not_treated_as_an_uncommitted_aof() {
+        let dir = tempdir().unwrap();
+        write_rdb(dir.path());
+        fs::create_dir(dir.path().join("appendonlydir")).unwrap();
+        std::os::unix::fs::symlink(
+            "missing",
+            dir.path().join("appendonlydir/appendonly.aof.manifest"),
+        )
+        .unwrap();
+        let path = dir.path().to_str().unwrap();
+        assert!(super::needs_rdb_to_aof_migration(path).is_err());
+        assert!(quarantine_manifestless_aof_dir(path).is_err());
+        assert!(quarantine_stale_aof_dir(path).is_err());
+    }
+
+    #[test]
+    fn config_uses_the_captured_decision_after_persistence_changes() {
+        let dir = tempdir().unwrap();
+        write_aof_manifest(dir.path());
+        write_rdb(dir.path());
+        let path = dir.path().to_str().unwrap();
+        let decision = super::needs_rdb_to_aof_migration(path).unwrap();
+        assert!(!decision);
+        age_aof_files(dir.path(), std::time::Duration::from_secs(86_400));
+        assert!(super::needs_rdb_to_aof_migration(path).unwrap());
+        let conf =
+            super::generate_redis_conf(&config_at(path), &BootMaster::NoLocalState, decision);
+        assert!(conf.contains("appendonly yes\n"));
     }
 
     // --- generate_redis_conf: every branch ---
