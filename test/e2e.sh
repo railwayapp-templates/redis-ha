@@ -728,6 +728,38 @@ t_stale_aof_loses_to_newer_rdb() {
   ok "$t"
 }
 
+# A mountpoint cannot be renamed (EBUSY), even as root. Redis must not
+# start if preserving the stale AOF fails; both original datasets survive.
+t_stale_aof_quarantine_failure_stops_boot() {
+  local t=t_stale_aof_quarantine_failure_stops_boot n=quarantine-fail before after
+  mkvol quarantine-data
+  mkvol quarantine-aof
+  seed_rdb_volume quarantine-data /data livekey livevalue
+  inject_stale_committed_aof quarantine-data /data 434
+  docker run --rm -v quarantine-data:/data -v quarantine-aof:/aof alpine:latest \
+    sh -c 'cp -a /data/appendonlydir/. /aof/' >/dev/null 2>&1
+  before=$(docker run --rm -v quarantine-data:/data alpine:latest sha256sum /data/dump.rdb)
+  start_node "$n" quarantine-data /data -v quarantine-aof:/data/appendonlydir -e SENTINEL_ENABLED=false
+  wait_for_log_line "$n" "failed to preserve superseded AOF" 30 \
+    || { ko "$t" "wrapper did not refuse the failed quarantine" "$n"; return; }
+  local i
+  for i in $(seq 1 30); do
+    [ "$(docker inspect -f '{{.State.Running}}' "$n")" = false ] && break
+    sleep 1
+  done
+  [ "$(docker inspect -f '{{.State.ExitCode}}' "$n")" != 0 ] \
+    || { ko "$t" "wrapper did not exit with failure" "$n"; return; }
+  if docker logs "$n" 2>&1 | grep -F 'Ready to accept connections' >/dev/null; then
+    ko "$t" "Redis started despite failed quarantine" "$n"; return
+  fi
+  after=$(docker run --rm -v quarantine-data:/data alpine:latest sha256sum /data/dump.rdb)
+  [ "$before" = "$after" ] || { ko "$t" "original RDB was modified" "$n"; return; }
+  docker run --rm -v quarantine-aof:/aof alpine:latest test -f /aof/appendonly.aof.manifest \
+    || { ko "$t" "original AOF was lost" "$n"; return; }
+  docker rm -f "$n" >/dev/null 2>&1
+  ok "$t"
+}
+
 # This image's own quiet restart. Redis fsyncs the AOF without touching any
 # appendonlydir mtime, appends nothing when nothing is buffered, and only
 # then writes the shutdown RDB — so a node that took no writes for a while
@@ -3298,6 +3330,7 @@ ALL_TESTS=(
   t_adoption_survives_restart
   t_crash_window_recovery
   t_stale_aof_loses_to_newer_rdb
+  t_stale_aof_quarantine_failure_stops_boot
   t_idle_restart_trusts_own_aof
   t_rdb_saved_by_another_image_is_adopted
   t_adoption_at_custom_mount

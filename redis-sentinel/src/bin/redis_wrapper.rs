@@ -228,7 +228,11 @@ async fn main() -> Result<()> {
     // redis.conf would poison `persisted_requirepass` on the next boot,
     // pinning the node to whatever prefix of the password survived.
     let redis_conf_path = format!("{}/redis.conf", config.data_dir);
-    let redis_conf = generate_redis_conf(&config, &boot_master);
+    // Decide exactly once, before writing config or moving persistence files.
+    // A failed inspection must stop startup rather than guess a data source.
+    let adopting_rdb = needs_rdb_to_aof_migration(&config.data_dir)
+        .context("cannot safely choose Redis persistence source")?;
+    let redis_conf = generate_redis_conf(&config, &boot_master, adopting_rdb);
     write_atomic(Path::new(&redis_conf_path), &redis_conf, None)
         .context("failed to write redis.conf")?;
     info!(path = %redis_conf_path, "wrote redis.conf");
@@ -313,10 +317,7 @@ async fn main() -> Result<()> {
         role: role.to_string(),
     });
 
-    // Captured before spawning: once Redis is up it writes its own
-    // appendonlydir, so the check would no longer be true.
-    let adopting_rdb = needs_rdb_to_aof_migration(&config.data_dir);
-    // Same reason, same moment: whether this boot replicates from another
+    // Capture before spawning: whether this boot replicates from another
     // node with nothing loadable of its own (or resumes an earlier boot's
     // unfinished first sync) — the redis.conf just written stamped
     // `replica-priority 0` for exactly that boot, `arm` persists the gate for
@@ -331,10 +332,10 @@ async fn main() -> Result<()> {
                 "moved manifest-less appendonlydir aside before AOF migration"
             ),
             Ok(None) => {}
-            Err(err) => tracing::error!(
-                error = %err,
-                "failed to move manifest-less appendonlydir aside"
-            ),
+            Err(err) => {
+                return Err(err)
+                    .context("failed to preserve manifest-less AOF; refusing to start Redis")
+            }
         }
         // Mutually exclusive with the branch above, on manifest presence: a
         // loadable AOF the RDB has outlived. It cannot stay where Redis (or
@@ -345,10 +346,10 @@ async fn main() -> Result<()> {
                 "appendonlydir predates the RDB on this volume — moved aside before AOF migration"
             ),
             Ok(None) => {}
-            Err(err) => tracing::error!(
-                error = %err,
-                "failed to move superseded appendonlydir aside"
-            ),
+            Err(err) => {
+                return Err(err)
+                    .context("failed to preserve superseded AOF; refusing to start Redis")
+            }
         }
     }
 
