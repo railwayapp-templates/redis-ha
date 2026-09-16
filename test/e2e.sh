@@ -196,7 +196,13 @@ wait_for_ping() { # wait_for_ping NODE [timeout]
 wait_for_log_line() { # wait_for_log_line NODE PATTERN [timeout]
   local i
   for i in $(seq 1 "${3:-60}"); do
-    docker logs "$1" 2>&1 | grep -q "$2" && return 0
+    # Not `grep -q`: under `pipefail` it exits on the first match, docker logs
+    # takes SIGPIPE while still writing, and the pipeline reports 141 — a false
+    # negative. Same trap that flaked t_never_synced_replica_is_not_promotable
+    # with "sg-3 never logged the lift" after the lift line was already in the
+    # dump (and that the demote / failover-abort greps in this file already
+    # avoid).
+    docker logs "$1" 2>&1 | grep -- "$2" >/dev/null && return 0
     sleep 1
   done
   return 1
