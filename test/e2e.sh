@@ -196,7 +196,13 @@ wait_for_ping() { # wait_for_ping NODE [timeout]
 wait_for_log_line() { # wait_for_log_line NODE PATTERN [timeout]
   local i
   for i in $(seq 1 "${3:-60}"); do
-    docker logs "$1" 2>&1 | grep -q "$2" && return 0
+    # Not `grep -q`: under `pipefail` it exits on the first match, docker logs
+    # takes SIGPIPE while still writing, and the pipeline reports 141 — a false
+    # negative. Same trap that flaked t_never_synced_replica_is_not_promotable
+    # with "sg-3 never logged the lift" after the lift line was already in the
+    # dump (and that the demote / failover-abort greps in this file already
+    # avoid).
+    docker logs "$1" 2>&1 | grep -- "$2" >/dev/null && return 0
     sleep 1
   done
   return 1
@@ -403,14 +409,21 @@ promote_by_pausing() { # promote_by_pausing MASTER CANDIDATE...
 }
 
 role_payload() { # role_payload NODE  ->  the /role JSON body, whatever the status
-  # The body is the last line health_http prints (headers first, via -S).
-  health_http "$1" GET /role | tail -1
+  # Read the body directly. Do NOT scrape `health_http | tail -1`: wget writes
+  # its "ERROR <status>" line (and a trailing blank line) to stderr AFTER the
+  # body, health_http merges streams with 2>&1, and tail then returns empty —
+  # which is exactly how t_never_synced_replica_is_not_promotable failed on
+  # main with `got ''` despite /role serving {"promotable":false}.
+  docker exec "$1" wget -qO- --content-on-error "http://127.0.0.1:8080/role" 2>/dev/null || true
 }
 
 switchover_payload() { # switchover_payload NODE  ->  the /switchover JSON body, whatever the status
-  # The credential is sent unconditionally: a node that does not enforce
-  # ignores it, so this reads the route's own verdict either way.
-  health_http "$1" POST /switchover --header="$(basic_auth_header railway "$PW")" | tail -1
+  # Same body-only read as role_payload (see above). The credential is sent
+  # unconditionally: a node that does not enforce ignores it, so this reads
+  # the route's own verdict either way.
+  docker exec "$1" wget -qO- --content-on-error --post-data= \
+    --header="$(basic_auth_header railway "$PW")" \
+    "http://127.0.0.1:8080/switchover" 2>/dev/null || true
 }
 
 replica_priority() { # replica_priority NODE  ->  the node's own replica-priority
