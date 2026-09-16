@@ -11,8 +11,9 @@
 #
 # The scenarios encode the conversion behaviors this image guarantees:
 # adopting an RDB-only dataset (a standalone Railway redis being converted to
-# HA), preferring a live RDB over an AOF an older image abandoned beside it,
-# surviving the CONFIG SET → manifest-commit crash window, following the
+# HA), preferring a live RDB over an AOF an older image abandoned beside it
+# while never mistaking its own quiet restart for that, surviving the
+# CONFIG SET → manifest-commit crash window, following the
 # volume mount path, and Sentinel failover preserving adopted data — plus the
 # live-traffic contracts: conversion and failover under a continuously
 # writing client (through the real HAProxy edge for the failover case),
@@ -723,6 +724,69 @@ t_stale_aof_loses_to_newer_rdb() {
   local count
   count=$(docker logs "$n" 2>&1 | grep -c "adopted dataset has an RDB")
   [ "$count" = "1" ] || { ko "$t" "adoption fired ${count} times, expected 1" "$n"; return; }
+  docker rm -f "$n" >/dev/null 2>&1
+  ok "$t"
+}
+
+# This image's own quiet restart. Redis fsyncs the AOF without touching any
+# appendonlydir mtime, appends nothing when nothing is buffered, and only
+# then writes the shutdown RDB — so a node that took no writes for a while
+# leaves dump.rdb newer than every AOF file by exactly that idle time, the
+# same on-disk shape as the abandoned AOF above. Read by timestamps alone
+# that re-adopts the RDB on every quiet redeploy: a full AOF rewrite per boot
+# and a full appendonlydir.superseded-* copy left on the volume each time.
+# The .rdb_owner marker names the RDB this image's redis-server wrote; a boot
+# that finds it unchanged trusts the AOF whatever the gap.
+t_idle_restart_trusts_own_aof() {
+  local t=t_idle_restart_trusts_own_aof n=idle-1
+  mkvol idle-vol
+  start_node "$n" idle-vol /data
+  wait_for_ping "$n" || { ko "$t" "node did not come up" "$n"; return; }
+  rcli "$n" SET idlekey idlevalue >/dev/null
+  wait_for_file_in_volume idle-vol appendonlydir/appendonly.aof.manifest \
+    || { ko "$t" "AOF never committed" "$n"; return; }
+  # A clean stop: shutdown save, then the supervisor records the RDB it left.
+  docker stop -t 30 "$n" >/dev/null 2>&1
+  docker run --rm -v idle-vol:/v alpine:latest test -e /v/.rdb_owner >/dev/null 2>&1 \
+    || { ko "$t" "the stop did not record the RDB it left behind" "$n"; return; }
+  # The idle, applied after the fact: the AOF stopped being written a day
+  # before the shutdown RDB. dump.rdb and the marker stay exactly as left.
+  docker run --rm -v idle-vol:/v "$SEED_IMAGE" \
+    sh -c "find /v/appendonlydir -exec touch -d '1 day ago' {} +" >/dev/null 2>&1
+  docker start "$n" >/dev/null 2>&1
+  wait_for_ping "$n" || { ko "$t" "did not come back after restart" "$n"; return; }
+  [ "$(rcli "$n" GET idlekey)" = "idlevalue" ] \
+    || { ko "$t" "dataset lost across an idle restart" "$n"; return; }
+  local count
+  count=$(docker logs "$n" 2>&1 | grep -c "adopted dataset has an RDB")
+  [ "$count" = "0" ] \
+    || { ko "$t" "an idle restart re-adopted the RDB this image wrote (${count}x)" "$n"; return; }
+  docker run --rm -v idle-vol:/v alpine:latest \
+    sh -c 'ls -d /v/appendonlydir.superseded-* 2>/dev/null | grep -q .' >/dev/null 2>&1 \
+    && { ko "$t" "an idle restart left a superseded appendonlydir behind" "$n"; return; }
+  ok "$t"
+}
+
+# The marker speaks only for the RDB it recorded. A dump.rdb saved by some
+# other image after this one left — the customer reverted, ran the old
+# template for a while, re-patched — names a different file, and the
+# timestamp comparison decides again: the newer RDB is adopted.
+t_rdb_saved_by_another_image_is_adopted() {
+  local t=t_rdb_saved_by_another_image_is_adopted n=idle-1
+  docker ps --format '{{.Names}}' | grep -q "^${n}$" \
+    || { ko "$t" "requires t_idle_restart_trusts_own_aof to have run" "$n"; return; }
+  docker stop -t 30 "$n" >/dev/null 2>&1
+  # Another image saves the RDB after we left: same bytes, a new write.
+  docker run --rm -v idle-vol:/v "$SEED_IMAGE" sh -c "
+    find /v/appendonlydir -exec touch -d '1 day ago' {} + && touch /v/dump.rdb
+  " >/dev/null 2>&1
+  docker start "$n" >/dev/null 2>&1
+  wait_for_log_line "$n" "appendonlydir predates the RDB on this volume" \
+    || { ko "$t" "an RDB written by another image was trusted as our own" "$n"; return; }
+  wait_for_log_line "$n" "enabled AOF after loading adopted RDB" \
+    || { ko "$t" "AOF migration never completed" "$n"; return; }
+  [ "$(rcli "$n" GET idlekey)" = "idlevalue" ] \
+    || { ko "$t" "dataset lost adopting an RDB another image saved" "$n"; return; }
   docker rm -f "$n" >/dev/null 2>&1
   ok "$t"
 }
@@ -3234,6 +3298,8 @@ ALL_TESTS=(
   t_adoption_survives_restart
   t_crash_window_recovery
   t_stale_aof_loses_to_newer_rdb
+  t_idle_restart_trusts_own_aof
+  t_rdb_saved_by_another_image_is_adopted
   t_adoption_at_custom_mount
   t_data_dir_outside_volume_warns
   t_large_rdb_loading_retry

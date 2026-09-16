@@ -7,6 +7,7 @@
 //! existing `graceful_shutdown` sequence run, unchanged.
 
 use crate::demote_on_shutdown::{self, DemoteTarget};
+use crate::rdb_owner;
 use crate::redis_conf::aof_manifest_exists;
 use anyhow::{Context, Result};
 use common::{Telemetry, TelemetryEvent};
@@ -220,11 +221,18 @@ pub async fn spawn_sentinel(data_dir: &str) -> Result<Child> {
 /// sanitizer the restart exists to run. `demote_on_shutdown` is skipped on
 /// this path on purpose: the trigger condition is "no node is master", so
 /// there is nothing to demote and no live consensus to run an election.
+///
+/// Every path out of here runs after redis-server has exited, and records
+/// the `dump.rdb` it left in `data_dir` as this image's own
+/// (`rdb_owner`): the shutdown save on a clean stop, the last BGSAVE on a
+/// crash. Either is a snapshot the AOF already holds in full, and the next
+/// boot must not read it as an RDB that outlived the AOF.
 pub async fn supervise(
     mut redis: Child,
     mut sentinel: Option<Child>,
     demote_target: DemoteTarget,
     mut restart_rx: tokio::sync::mpsc::Receiver<String>,
+    data_dir: String,
 ) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -241,6 +249,7 @@ pub async fn supervise(
                     Ok(s) => error!(code = s.code(), "redis-server exited unexpectedly"),
                     Err(e) => error!(error = %e, "redis-server wait error"),
                 }
+                own_rdb_after_redis_exit(&data_dir);
                 // Kill sentinel before exiting
                 if let (Some(ref mut s), Some(pid)) = (&mut sentinel, sentinel_pid) {
                     let _ = signal::kill(pid, Signal::SIGTERM);
@@ -264,12 +273,13 @@ pub async fn supervise(
                     let _ = signal::kill(pid, Signal::SIGTERM);
                     let _ = redis.wait().await;
                 }
+                own_rdb_after_redis_exit(&data_dir);
                 std::process::exit(1);
             }
 
             Some(reason) = restart_rx.recv() => {
                 warn!(%reason, "self-heal requested a restart through the boot path");
-                graceful_shutdown(redis_pid, sentinel_pid, &mut redis, &mut sentinel).await;
+                graceful_shutdown(redis_pid, sentinel_pid, &mut redis, &mut sentinel, &data_dir).await;
                 // Non-zero on purpose — see the function doc.
                 std::process::exit(1);
             }
@@ -277,14 +287,14 @@ pub async fn supervise(
             _ = sigterm.recv() => {
                 info!("received SIGTERM, shutting down");
                 demote_on_shutdown::demote_before_shutdown(&demote_target, sentinel.is_some()).await;
-                graceful_shutdown(redis_pid, sentinel_pid, &mut redis, &mut sentinel).await;
+                graceful_shutdown(redis_pid, sentinel_pid, &mut redis, &mut sentinel, &data_dir).await;
                 std::process::exit(0);
             }
 
             _ = sigint.recv() => {
                 info!("received SIGINT, shutting down");
                 demote_on_shutdown::demote_before_shutdown(&demote_target, sentinel.is_some()).await;
-                graceful_shutdown(redis_pid, sentinel_pid, &mut redis, &mut sentinel).await;
+                graceful_shutdown(redis_pid, sentinel_pid, &mut redis, &mut sentinel, &data_dir).await;
                 std::process::exit(0);
             }
         }
@@ -296,6 +306,7 @@ async fn graceful_shutdown(
     sentinel_pid: Option<Pid>,
     redis: &mut Child,
     sentinel: &mut Option<Child>,
+    data_dir: &str,
 ) {
     // Sentinel first so it doesn't trigger spurious failovers. By the time
     // this runs, `demote_on_shutdown::demote_before_shutdown` (called by
@@ -325,6 +336,21 @@ async fn graceful_shutdown(
                 let _ = redis.kill().await;
             }
         }
+    }
+    own_rdb_after_redis_exit(data_dir);
+}
+
+/// redis-server has exited under this supervisor: whatever `dump.rdb` is on
+/// the volume now, it wrote (or it predates this run and was already
+/// accounted for at boot). Record it so the next boot trusts the AOF beside
+/// it instead of comparing timestamps — see `rdb_owner`.
+fn own_rdb_after_redis_exit(data_dir: &str) {
+    if let Err(err) = rdb_owner::record(data_dir) {
+        warn!(
+            error = %err,
+            "could not record the RDB redis-server left behind — the next boot falls back \
+             to comparing its timestamp against the AOF"
+        );
     }
 }
 

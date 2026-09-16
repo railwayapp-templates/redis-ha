@@ -1,7 +1,9 @@
 use crate::boot_role::BootMaster;
 use crate::config::Config;
 
-/// How much newer `dump.rdb` must be before it outranks a committed AOF.
+/// How much newer `dump.rdb` must be before it outranks a committed AOF —
+/// the fallback for an RDB this image did not write itself (no
+/// [`crate::rdb_owner`] marker, or one naming a different file).
 ///
 /// Redis fsyncs the AOF and only afterwards writes the shutdown RDB, so on a
 /// node that genuinely runs AOF the RDB is always a few milliseconds newer.
@@ -9,6 +11,12 @@ use crate::config::Config;
 /// discriminates is a dataset the customer has been persisting via RDB while
 /// an AOF written by an earlier image sits untouched beside it — the bitnami
 /// lineage with `REDIS_AOF_ENABLED=no`, where the gap is days or years.
+///
+/// It cannot discriminate idleness: a node that took no writes for longer
+/// than this before a clean stop leaves the same shape (fsync touches no
+/// mtime, nothing buffered means nothing appended, then the shutdown RDB).
+/// That is why an RDB this image's own redis-server wrote never reaches
+/// this comparison — the marker settles it first.
 const STALE_AOF_MARGIN: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Whether this boot has to adopt the RDB rather than the AOF.
@@ -27,6 +35,12 @@ const STALE_AOF_MARGIN: std::time::Duration = std::time::Duration::from_secs(600
 ///     overwrote the live `dump.rdb` with it on shutdown (incident
 ///     2026-09-15: an AOF base from 7.2.5 loaded 0 keys over 57,401).
 ///
+/// One shape is excluded before any timestamp is read: a `dump.rdb` this
+/// image's own redis-server wrote — its shutdown save, a BGSAVE, a replica's
+/// full-sync transfer — recorded by [`crate::rdb_owner`]. That RDB is a
+/// snapshot of a dataset the AOF beside it already holds in full, however
+/// long the node idled before it stopped, and the AOF stays the source.
+///
 /// Either way: start with AOF off, let Redis load the RDB, and switch AOF on
 /// at runtime (`CONFIG SET appendonly yes`), which is the documented
 /// migration and rewrites the AOF from the in-memory dataset. The losing
@@ -42,6 +56,11 @@ pub fn needs_rdb_to_aof_migration(data_dir: &str) -> bool {
     // next boot and strand the (still intact) dump.rdb all over again.
     if !aof_manifest_exists(data_dir) {
         return true;
+    }
+    // Our own redis-server wrote this RDB: the AOF beside it is the source,
+    // whatever the mtimes say (see STALE_AOF_MARGIN on why they can lie).
+    if crate::rdb_owner::owns_rdb(data_dir) {
+        return false;
     }
     rdb_outranks_committed_aof(data_dir)
 }
@@ -515,6 +534,53 @@ mod tests {
             b"recent write",
         )
         .unwrap();
+        assert!(!needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn an_rdb_this_image_wrote_never_displaces_its_own_aof() {
+        // This image's own quiet restart: no writes for half an hour, then a
+        // clean stop. Redis fsyncs the AOF (no mtime change), appends
+        // nothing, then writes the shutdown RDB — the same on-disk shape as
+        // an abandoned AOF, half an hour "stale". The exit path recorded the
+        // RDB as ours, so the AOF keeps its claim and no re-adoption fires.
+        let dir = tempdir().unwrap();
+        write_aof_manifest(dir.path());
+        age_aof_files(dir.path(), std::time::Duration::from_secs(30 * 60));
+        write_rdb(dir.path());
+        crate::rdb_owner::record(dir.path().to_str().unwrap()).unwrap();
+        assert!(!needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn the_marker_speaks_only_for_the_rdb_it_recorded() {
+        // The customer reverted to an AOF-off image, which kept saving
+        // dump.rdb for a year, then re-patched. Our marker names the RDB we
+        // left, not the one now on disk, so freshness decides: adopt.
+        let dir = tempdir().unwrap();
+        write_aof_manifest(dir.path());
+        write_rdb(dir.path());
+        crate::rdb_owner::record(dir.path().to_str().unwrap()).unwrap();
+        age_aof_files(dir.path(), std::time::Duration::from_secs(434 * 86_400));
+        fs::write(dir.path().join("dump.rdb"), b"REDIS0011saved by the old image").unwrap();
+        assert!(needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn an_unreadable_marker_falls_back_to_freshness() {
+        // Garbage where the marker should be answers nothing, and the
+        // decision is exactly what it would be with no marker at all.
+        let dir = tempdir().unwrap();
+        write_aof_manifest(dir.path());
+        age_aof_files(dir.path(), std::time::Duration::from_secs(434 * 86_400));
+        write_rdb(dir.path());
+        fs::write(
+            crate::rdb_owner::marker_path(dir.path().to_str().unwrap()),
+            "??\n",
+        )
+        .unwrap();
+        assert!(needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
+        age_aof_files(dir.path(), std::time::Duration::from_secs(2));
         assert!(!needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
     }
 

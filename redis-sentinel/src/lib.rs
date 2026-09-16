@@ -9,6 +9,7 @@ pub mod health_server;
 pub mod link_heal;
 pub mod process_manager;
 pub mod quorum;
+pub mod rdb_owner;
 pub mod redis_conf;
 pub mod sentinel_auth;
 pub mod sentinel_conf;
