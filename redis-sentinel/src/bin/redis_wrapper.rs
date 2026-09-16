@@ -28,7 +28,7 @@ use redis_sentinel::{
     quorum,
     redis_conf::{
         generate_redis_conf, needs_rdb_to_aof_migration, persisted_requirepass,
-        quarantine_manifestless_aof_dir,
+        quarantine_manifestless_aof_dir, quarantine_stale_aof_dir,
     },
     sentinel_auth,
     sentinel_conf::{conf_requires_auth, generate_sentinel_conf},
@@ -334,6 +334,20 @@ async fn main() -> Result<()> {
             Err(err) => tracing::error!(
                 error = %err,
                 "failed to move manifest-less appendonlydir aside"
+            ),
+        }
+        // Mutually exclusive with the branch above, on manifest presence: a
+        // loadable AOF the RDB has outlived. It cannot stay where Redis (or
+        // the closing rewrite) will find it.
+        match quarantine_stale_aof_dir(&config.data_dir) {
+            Ok(Some(superseded)) => tracing::warn!(
+                to = %superseded.display(),
+                "appendonlydir predates the RDB on this volume — moved aside before AOF migration"
+            ),
+            Ok(None) => {}
+            Err(err) => tracing::error!(
+                error = %err,
+                "failed to move superseded appendonlydir aside"
             ),
         }
     }
