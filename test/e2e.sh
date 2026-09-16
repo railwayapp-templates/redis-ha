@@ -772,9 +772,10 @@ t_stale_aof_quarantine_failure_stops_boot() {
 t_idle_restart_trusts_own_aof() {
   local t=t_idle_restart_trusts_own_aof n=idle-1
   mkvol idle-vol
-  start_node "$n" idle-vol /data
+  start_node "$n" idle-vol /data -e SENTINEL_ENABLED=false
   wait_for_ping "$n" || { ko "$t" "node did not come up" "$n"; return; }
-  rcli "$n" SET idlekey idlevalue >/dev/null
+  [ "$(rcli "$n" SET idlekey idlevalue)" = "OK" ] \
+    || { ko "$t" "fixture write was not acknowledged" "$n"; return; }
   wait_for_file_in_volume idle-vol appendonlydir/appendonly.aof.manifest \
     || { ko "$t" "AOF never committed" "$n"; return; }
   # A clean stop: shutdown save, then the supervisor records the RDB it left.
@@ -796,6 +797,7 @@ t_idle_restart_trusts_own_aof() {
   docker run --rm -v idle-vol:/v alpine:latest \
     sh -c 'ls -d /v/appendonlydir.superseded-* 2>/dev/null | grep -q .' >/dev/null 2>&1 \
     && { ko "$t" "an idle restart left a superseded appendonlydir behind" "$n"; return; }
+  docker rm -f "$n" >/dev/null 2>&1
   ok "$t"
 }
 
@@ -804,12 +806,17 @@ t_idle_restart_trusts_own_aof() {
 # template for a while, re-patched — names a different file, and the
 # timestamp comparison decides again: the newer RDB is adopted.
 t_rdb_saved_by_another_image_is_adopted() {
-  local t=t_rdb_saved_by_another_image_is_adopted n=idle-1
-  docker ps --format '{{.Names}}' | grep -q "^${n}$" \
-    || { ko "$t" "requires t_idle_restart_trusts_own_aof to have run" "$n"; return; }
+  local t=t_rdb_saved_by_another_image_is_adopted n=foreign-1
+  mkvol foreign-vol
+  start_node "$n" foreign-vol /data -e SENTINEL_ENABLED=false
+  wait_for_ping "$n" || { ko "$t" "node did not come up" "$n"; return; }
+  [ "$(rcli "$n" SET idlekey idlevalue)" = "OK" ] \
+    || { ko "$t" "fixture write was not acknowledged" "$n"; return; }
+  wait_for_file_in_volume foreign-vol appendonlydir/appendonly.aof.manifest \
+    || { ko "$t" "AOF never committed" "$n"; return; }
   docker stop -t 30 "$n" >/dev/null 2>&1
   # Another image saves the RDB after we left: same bytes, a new write.
-  docker run --rm -v idle-vol:/v "$SEED_IMAGE" sh -c "
+  docker run --rm -v foreign-vol:/v "$SEED_IMAGE" sh -c "
     find /v/appendonlydir -exec touch -d '1 day ago' {} + && touch /v/dump.rdb
   " >/dev/null 2>&1
   docker start "$n" >/dev/null 2>&1

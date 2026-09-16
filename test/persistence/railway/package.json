@@ -1,0 +1,7 @@
+{
+  "name": "redis-persistence-railway-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node run.mjs" },
+  "dependencies": { "redis": "4.7.1" }
+}

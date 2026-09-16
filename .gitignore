@@ -4,3 +4,9 @@
 
 # Rust build artifacts
 **/target/
+
+# Persistence E2E local artifacts
+**/node_modules/
+**/__pycache__/
+persistence-results/
+railway-persistence-results/

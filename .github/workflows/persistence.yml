@@ -40,6 +40,7 @@ jobs:
           SEED_IMAGE: ${{ matrix.seed }}
         run: python3 test/persistence/run.py
       - name: Migration fault and replication battery
+        if: success() || failure()
         env:
           SEED_IMAGE: ${{ matrix.seed }}
         run: |

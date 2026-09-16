@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import time
+import traceback
 import uuid
 from pathlib import Path
 
@@ -28,7 +29,8 @@ def docker(*args, input=None, check=True):
                        timeout=180)
     if check and r.returncode:
         raise RuntimeError(f'docker {args[:3]}: {r.stderr.decode(errors="replace")[-2000:]}')
-    return r.stdout.decode().strip()
+    output = r.stdout + (r.stderr if args[0] == 'logs' else b'')
+    return output.decode(errors='replace').strip()
 
 
 def wait(fn, description, seconds=90):
@@ -56,8 +58,10 @@ def fs(v, script):
 
 
 def cli(c, *args, db=0):
-    return json.loads(docker('exec', c, 'redis-cli', '--no-auth-warning', '-a', PW,
-                            '-n', db, '--json', *args))
+    output = docker('exec', c, 'redis-cli', '-2', '--no-auth-warning', '-a', PW,
+                    '-n', db, '--json', *args)
+    # redis-cli treats INFO as raw text even when --json is requested.
+    return output if args[0] == 'INFO' else json.loads(output)
 
 
 def start(v, target=False, nested=False, aof=False):
@@ -71,7 +75,7 @@ def start(v, target=False, nested=False, aof=False):
                  '-e', 'SENTINEL_ENABLED=false', '-e', 'REDIS_AOF_ENABLED=no', IMAGE]
     else:
         fs(v, 'mkdir -p ' + ('/v/redis/data' if nested else '/v'))
-        args += ['--user', '0', SEED, 'redis-server', '--dir', path,
+        args += ['--user', '0', '--entrypoint', 'redis-server', SEED, '--dir', path,
                  '--requirepass', PW, '--appendonly', 'yes' if aof else 'no', '--save', '']
     docker(*args)
     return c
@@ -241,6 +245,9 @@ try:
             fn()
             result = {'case': name, 'status': 'passed'}
         except Exception as e:
+            traceback.print_exc()
+            for c in containers:
+                print(docker('logs', '--tail', '40', c, check=False), flush=True)
             result = {'case': name, 'status': 'failed', 'error': str(e)}
         result['seconds'] = round(time.monotonic() - start_time, 2)
         results.append(result)
