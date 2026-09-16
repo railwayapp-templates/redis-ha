@@ -236,6 +236,11 @@ cases = [
     ('partial-aof-inspection', lambda: inspection_failure('entry')),
     ('broken-manifest', lambda: inspection_failure('manifest')),
 ]
+selected = os.environ.get('PERSISTENCE_CASES')
+if selected:
+    names = set(selected.split(','))
+    assert names <= {name for name, _ in cases}, 'unknown persistence scenario'
+    cases = [(name, fn) for name, fn in cases if name in names]
 try:
     docker('pull', SEED)
     docker('pull', 'alpine:3.22')

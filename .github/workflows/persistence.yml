@@ -35,6 +35,24 @@ jobs:
           load: true
           cache-from: type=gha,scope=e2e-node
           cache-to: type=gha,scope=persistence-${{ matrix.version }},mode=max
+      - name: Prove the regression fails before PR 67
+        env:
+          SEED_IMAGE: ${{ matrix.seed }}
+          IMAGE: ghcr.io/railwayapp-templates/redis-ha/redis-sentinel:${{ matrix.version }}-686489d
+          PERSISTENCE_CASES: stale-empty-aof-bitnami-nested
+          ARTIFACTS: negative-control
+        run: |
+          docker pull "$IMAGE"
+          if python3 test/persistence/run.py; then
+            echo "The unpatched image unexpectedly preserved the dataset"
+            exit 1
+          fi
+          python3 - <<'PYTHON'
+          import json
+          rows = json.load(open('negative-control/results.json'))['results']
+          assert len(rows) == 1 and rows[0]['status'] == 'failed', rows
+          assert rows[0]['error'].startswith('missing/corrupt data in keys'), rows
+          PYTHON
       - name: Exact dataset and restart battery
         env:
           SEED_IMAGE: ${{ matrix.seed }}
@@ -52,4 +70,5 @@ jobs:
           name: persistence-${{ matrix.version }}
           path: |
             persistence-results/
+            negative-control/
             migration-faults.log

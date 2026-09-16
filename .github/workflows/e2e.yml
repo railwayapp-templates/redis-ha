@@ -3,7 +3,7 @@ name: E2E
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, 'pcs/redis-persistence-*']
 
 concurrency:
   group: e2e-${{ github.ref }}
