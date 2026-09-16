@@ -18,6 +18,7 @@ IMAGE = os.environ.get('IMAGE', 'redis-sentinel-e2e:local')
 SEED = os.environ.get('SEED_IMAGE', 'redis:8.2.1')
 COUNT = int(os.environ.get('PERSISTENCE_KEYS', '57401'))
 PREFIX = 'persist-' + uuid.uuid4().hex[:10]
+OLD_STAMP = time.strftime('%Y%m%d%H%M.%S', time.gmtime(time.time() - 434 * 86400))
 PW = 'persistence-regression-only'
 ARTIFACTS = Path(os.environ.get('ARTIFACTS', 'persistence-results'))
 ARTIFACTS.mkdir(parents=True, exist_ok=True)
@@ -91,7 +92,7 @@ def stop(c, graceful=True):
 
 def age(v, nested=False):
     p = '/v/redis/data' if nested else '/v'
-    fs(v, f"find {p}/appendonlydir -type f -exec touch -d '434 days ago' {{}} +")
+    fs(v, f"find {p}/appendonlydir -type f -exec touch -t {OLD_STAMP} {{}} +")
 
 
 def manifest(c, nested=False):
@@ -156,6 +157,7 @@ def stale_fixture(nested=False, nonempty=False):
     old = start(v, nested=nested)
     ready(old)
     seed(old)
+    verify(old)
     stop(old)
     return v
 
@@ -195,7 +197,7 @@ def live_incremental(marker):
     time.sleep(2)
     docker('exec', n, 'redis-cli', '-a', PW, '--no-auth-warning', 'SHUTDOWN', 'NOSAVE')
     wait(lambda: docker('inspect', '-f', '{{.State.Running}}', n) == 'false', 'AOF source shutdown')
-    fs(v, "find /v/appendonlydir -type f ! -name '*.incr.aof' -exec touch -d '434 days ago' {} +")
+    fs(v, f"find /v/appendonlydir -type f ! -name '*.incr.aof' -exec touch -t {OLD_STAMP} {{}} +")
     if marker == 'corrupt':
         fs(v, "echo invalid > /v/.rdb_owner")
     n = start(v, target=True)
