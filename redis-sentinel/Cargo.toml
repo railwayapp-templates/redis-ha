@@ -8,6 +8,7 @@ name = "redis-wrapper"
 path = "src/bin/redis_wrapper.rs"
 
 [dependencies]
+sha2 = "0.10"
 common = { path = "../common" }
 anyhow.workspace = true
 tokio.workspace = true
