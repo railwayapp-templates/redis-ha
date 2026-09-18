@@ -63,6 +63,20 @@ async fn connect(port: u16, password: &str) -> Result<MultiplexedConnection> {
     redis::cmd("PING").query_async::<String>(&mut conn).await?;
     Ok(conn)
 }
+async fn rejects_password(port: u16, password: &str) -> Result<bool> {
+    match connect(port, password).await {
+        Ok(_) => Ok(false),
+        Err(error)
+            if error
+                .downcast_ref::<redis::RedisError>()
+                .is_some_and(|error| error.kind() == redis::ErrorKind::AuthenticationFailed) =>
+        {
+            Ok(true)
+        }
+        Err(error) => Err(error), // A transport failure is not proof of revocation.
+    }
+}
+
 async fn connect_either(port: u16, request: &Rotation) -> Result<MultiplexedConnection> {
     match connect(port, &request.new_password).await {
         Ok(conn) => Ok(conn),
@@ -250,9 +264,7 @@ async fn apply(config: &Config, request: Rotation) -> Result<Value> {
                 .await
                 .is_err()
                 || (request.current_password != request.new_password
-                    && connect(config.sentinel_port, &request.current_password)
-                        .await
-                        .is_ok())
+                    && !rejects_password(config.sentinel_port, &request.current_password).await?)
             {
                 RESTART_SENTINEL.notify_one();
                 // The supervisor rewrites AFTER stopping Sentinel, because
@@ -262,9 +274,8 @@ async fn apply(config: &Config, request: Rotation) -> Result<Value> {
                         .await
                         .is_ok()
                         && (request.current_password == request.new_password
-                            || connect(config.sentinel_port, &request.current_password)
-                                .await
-                                .is_err())
+                            || rejects_password(config.sentinel_port, &request.current_password)
+                                .await?)
                     {
                         break;
                     }
@@ -323,15 +334,11 @@ async fn apply(config: &Config, request: Rotation) -> Result<Value> {
             );
             if request.current_password != request.new_password {
                 anyhow::ensure!(
-                    connect(config.redis_port, &request.current_password)
-                        .await
-                        .is_err(),
+                    rejects_password(config.redis_port, &request.current_password).await?,
                     "old data password still accepted"
                 );
                 anyhow::ensure!(
-                    connect(config.sentinel_port, &request.current_password)
-                        .await
-                        .is_err(),
+                    rejects_password(config.sentinel_port, &request.current_password).await?,
                     "old Sentinel password still accepted"
                 );
             }
