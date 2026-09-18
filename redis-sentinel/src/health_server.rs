@@ -153,7 +153,7 @@ async fn get_or_connect(
 ) -> Option<MultiplexedConnection> {
     let mut guard = slot.lock().await;
     if guard.is_none() {
-        match Client::open(url) {
+        match Client::open(crate::credentials::active_url(url)) {
             Ok(client) => match client.get_multiplexed_async_connection().await {
                 Ok(conn) => *guard = Some(conn),
                 Err(e) => warn!(error = %e, label, "connection failed"),
@@ -223,7 +223,10 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         Ok(true) => (StatusCode::OK, Json(json!({"status": "ok"}))),
         _ => {
             *state.redis_conn.lock().await = None;
-            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"status": "down"})))
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"status": "down"})),
+            )
         }
     }
 }
@@ -264,7 +267,10 @@ async fn role(State(state): State<AppState>) -> impl IntoResponse {
             // Timeout — treat as unhealthy
             *state.redis_conn.lock().await = None;
             *state.sentinel_conn.lock().await = None;
-            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"role": "unknown", "reason": "timeout"})))
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"role": "unknown", "reason": "timeout"})),
+            )
         }
     }
 }
@@ -343,7 +349,8 @@ fn answer_confirms_self(
     private_domain: &str,
     redis_port: u16,
 ) -> bool {
-    crate::boot_role::normalize_host(answer_host) == crate::boot_role::normalize_host(private_domain)
+    crate::boot_role::normalize_host(answer_host)
+        == crate::boot_role::normalize_host(private_domain)
         && answer_port
             .trim()
             .parse::<u16>()
@@ -372,8 +379,12 @@ async fn sentinel_confirms_master(state: &AppState, master_name: &str) -> bool {
         return false;
     }
     let master_host = &parts[0];
-    let confirmed =
-        answer_confirms_self(master_host, &parts[1], &state.private_domain, state.redis_port);
+    let confirmed = answer_confirms_self(
+        master_host,
+        &parts[1],
+        &state.private_domain,
+        state.redis_port,
+    );
     if !confirmed {
         info!(
             sentinel_master = %master_host,
@@ -728,6 +739,7 @@ async fn run_health_server(
         ));
     let app = Router::new()
         .route("/health", get(health))
+        .route("/credentials/rotate", post(crate::credentials::rotate))
         .route("/role", get(role))
         .merge(mutating)
         .with_state(state);

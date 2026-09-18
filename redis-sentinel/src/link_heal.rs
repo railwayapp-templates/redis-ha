@@ -187,8 +187,7 @@ fn attached_to_wrong_master(
 ) -> bool {
     match (master_addr, target) {
         (Some((mh, mp)), Some((th, tp))) => {
-            crate::boot_role::normalize_host(mh) != crate::boot_role::normalize_host(th)
-                || mp != tp
+            crate::boot_role::normalize_host(mh) != crate::boot_role::normalize_host(th) || mp != tp
         }
         _ => false,
     }
@@ -242,12 +241,25 @@ enum HealReason {
 enum LinkHealAction {
     NoOp,
     Wait,
-    Reheal { attempt: u32, host: String, port: u16, reason: HealReason },
+    Reheal {
+        attempt: u32,
+        host: String,
+        port: u16,
+        reason: HealReason,
+    },
     /// Sentinel's answer is this node itself: complete the promotion via
     /// `REPLICAOF NO ONE` rather than repointing at our own address.
-    PromoteSelf { attempt: u32, reason: HealReason },
-    EmitRecovered { recovered_in_secs: u64, attempts: u32 },
-    EmitGaveUp { attempts: u32 },
+    PromoteSelf {
+        attempt: u32,
+        reason: HealReason,
+    },
+    EmitRecovered {
+        recovered_in_secs: u64,
+        attempts: u32,
+    },
+    EmitGaveUp {
+        attempts: u32,
+    },
 }
 
 /// Pure (zero-I/O) decision function, unit-tested directly.
@@ -369,7 +381,7 @@ fn accrue_stall_window(
 // ====================================================================
 
 async fn connect(url: &str) -> Option<MultiplexedConnection> {
-    match Client::open(url) {
+    match Client::open(crate::credentials::active_url(url)) {
         Ok(client) => match client.get_multiplexed_async_connection().await {
             Ok(conn) => Some(conn),
             Err(e) => {
@@ -384,7 +396,9 @@ async fn connect(url: &str) -> Option<MultiplexedConnection> {
     }
 }
 
-async fn fetch_replication_snapshot(conn: &mut MultiplexedConnection) -> Option<ReplicationSnapshot> {
+async fn fetch_replication_snapshot(
+    conn: &mut MultiplexedConnection,
+) -> Option<ReplicationSnapshot> {
     let info: String = redis::cmd("INFO")
         .arg("replication")
         .query_async(conn)
@@ -713,7 +727,8 @@ async fn iteration(
 
     let last_action_at =
         read_state_field(state_path, "last_action_at").and_then(|s| s.parse::<i64>().ok());
-    let action_attempts_in_window = recent_action_count(state_path, now, cfg.thresholds.window_secs);
+    let action_attempts_in_window =
+        recent_action_count(state_path, now, cfg.thresholds.window_secs);
     if action_attempts_in_window < cfg.thresholds.max_attempts_per_window {
         *gave_up_emitted = false;
     }
@@ -744,7 +759,12 @@ async fn iteration(
 
     match action {
         LinkHealAction::NoOp | LinkHealAction::Wait => {}
-        LinkHealAction::Reheal { attempt, host, port, reason } => {
+        LinkHealAction::Reheal {
+            attempt,
+            host,
+            port,
+            reason,
+        } => {
             match reason {
                 HealReason::StalledLink => info!(
                     host = %host,
@@ -985,7 +1005,10 @@ mod stall_window_tests {
     #[test]
     fn consecutive_stalled_observations_keep_the_original_since() {
         let w = Some(StallWindow { since: 100 });
-        assert_eq!(accrue_stall_window(true, w, 500), Some(StallWindow { since: 100 }));
+        assert_eq!(
+            accrue_stall_window(true, w, 500),
+            Some(StallWindow { since: 100 })
+        );
     }
 }
 
@@ -1249,7 +1272,10 @@ mod state_file_tests {
     fn write_then_read_round_trips() {
         let (_f, path) = state_path();
         write_state_field(&path, "last_action_at", "12345").unwrap();
-        assert_eq!(read_state_field(&path, "last_action_at"), Some("12345".to_string()));
+        assert_eq!(
+            read_state_field(&path, "last_action_at"),
+            Some("12345".to_string())
+        );
     }
 
     #[test]
@@ -1257,7 +1283,10 @@ mod state_file_tests {
         let (_f, path) = state_path();
         write_state_field(&path, "last_action_at", "1").unwrap();
         write_state_field(&path, "last_action_at", "2").unwrap();
-        assert_eq!(read_state_field(&path, "last_action_at"), Some("2".to_string()));
+        assert_eq!(
+            read_state_field(&path, "last_action_at"),
+            Some("2".to_string())
+        );
     }
 
     #[test]

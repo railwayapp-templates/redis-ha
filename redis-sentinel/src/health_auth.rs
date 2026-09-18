@@ -126,9 +126,16 @@ pub async fn require_credential(
     request: Request,
     next: Next,
 ) -> Response {
-    let Some(credential) = credential else {
+    let Some(mut credential) = credential else {
         return next.run(request).await;
     };
+    if let Ok(config) = crate::config::Config::from_env() {
+        if credential.password == config.redis_password {
+            if let Some(password) = crate::redis_conf::persisted_requirepass(&config.data_dir) {
+                credential.password = password;
+            }
+        }
+    }
     let authorization = request.headers().get(header::AUTHORIZATION);
     if credential.authorizes(authorization) {
         return next.run(request).await;
