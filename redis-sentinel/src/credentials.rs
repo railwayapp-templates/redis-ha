@@ -415,42 +415,6 @@ pub fn rewrite_sentinel_password(data_dir: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn replication_requires_synced_members() {
-        assert!(!replication_ready(
-            "role:slave\nmaster_link_status:up\nmaster_sync_in_progress:1",
-            3
-        ));
-        assert!(replication_ready(
-            "role:slave\nmaster_link_status:up\nmaster_sync_in_progress:0",
-            3
-        ));
-        assert!(!replication_ready(
-            "role:master\nslave0:ip=a,state=online\nslave1:ip=b,state=wait_bgsave",
-            3
-        ));
-        assert!(replication_ready(
-            "role:master\nslave0:ip=a,state=online\nslave1:ip=b,state=online",
-            3
-        ));
-    }
-    #[test]
-    fn changes_credentials_without_forgetting_topology() {
-        let original = "requirepass old\nsentinel sentinel-pass old\nsentinel auth-pass cluster old\nuser default on #old #new ~* +@all\nsentinel known-sentinel cluster node 26379 id\nsentinel config-epoch cluster 42\n";
-        let updated = rewrite_sentinel(original, "p:a ss");
-        assert!(updated.contains("requirepass \"p:a ss\""));
-        assert!(updated.contains("sentinel auth-pass cluster \"p:a ss\""));
-        assert!(updated.contains("sentinel known-sentinel cluster node 26379 id"));
-        assert!(updated.contains("sentinel config-epoch cluster 42"));
-        assert!(updated.contains("user default on ~* +@all resetpass #"));
-        assert!(!updated.contains("#old"));
-        assert_eq!(updated, rewrite_sentinel(&updated, "p:a ss"));
-    }
-}
-
 /// Preserve the staged overlap across a container restart. The journal is
 /// written before live ACL changes, so even an interrupted PREPARE is safe.
 pub fn staged_config(config: &str, data_dir: &str, active_password: &str) -> Result<String> {
@@ -567,5 +531,41 @@ pub async fn adopt_proven_boot_password(config: &mut Config) -> bool {
         true
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn replication_requires_synced_members() {
+        assert!(!replication_ready(
+            "role:slave\nmaster_link_status:up\nmaster_sync_in_progress:1",
+            3
+        ));
+        assert!(replication_ready(
+            "role:slave\nmaster_link_status:up\nmaster_sync_in_progress:0",
+            3
+        ));
+        assert!(!replication_ready(
+            "role:master\nslave0:ip=a,state=online\nslave1:ip=b,state=wait_bgsave",
+            3
+        ));
+        assert!(replication_ready(
+            "role:master\nslave0:ip=a,state=online\nslave1:ip=b,state=online",
+            3
+        ));
+    }
+    #[test]
+    fn changes_credentials_without_forgetting_topology() {
+        let original = "requirepass old\nsentinel sentinel-pass old\nsentinel auth-pass cluster old\nuser default on #old #new ~* +@all\nsentinel known-sentinel cluster node 26379 id\nsentinel config-epoch cluster 42\n";
+        let updated = rewrite_sentinel(original, "p:a ss");
+        assert!(updated.contains("requirepass \"p:a ss\""));
+        assert!(updated.contains("sentinel auth-pass cluster \"p:a ss\""));
+        assert!(updated.contains("sentinel known-sentinel cluster node 26379 id"));
+        assert!(updated.contains("sentinel config-epoch cluster 42"));
+        assert!(updated.contains("user default on ~* +@all resetpass #"));
+        assert!(!updated.contains("#old"));
+        assert_eq!(updated, rewrite_sentinel(&updated, "p:a ss"));
     }
 }
