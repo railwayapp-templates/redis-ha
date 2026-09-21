@@ -118,7 +118,12 @@ pub async fn probe_unauthenticated(host: &str, port: u16, deadline: Duration) ->
     let Some(mut conn) = connect(&url, deadline).await else {
         return UnauthedProbe::NoAnswer;
     };
-    match timeout(deadline, redis::cmd("PING").query_async::<String>(&mut conn)).await {
+    match timeout(
+        deadline,
+        redis::cmd("PING").query_async::<String>(&mut conn),
+    )
+    .await
+    {
         Ok(Ok(reply)) if reply.eq_ignore_ascii_case("pong") => UnauthedProbe::Open,
         Ok(Err(err)) if is_noauth(&err) => UnauthedProbe::RequiresAuth,
         _ => UnauthedProbe::NoAnswer,
@@ -129,7 +134,7 @@ pub async fn probe_unauthenticated(host: &str, port: u16, deadline: Duration) ->
 /// protocol handshake) by `deadline`. `None` on refusal, timeout, or a bad
 /// URL — callers treat all three as "this endpoint has no answer".
 pub async fn connect(url: &str, deadline: Duration) -> Option<MultiplexedConnection> {
-    let client = Client::open(url).ok()?;
+    let client = Client::open(crate::credentials::active_url(url)).ok()?;
     match timeout(deadline, client.get_multiplexed_async_connection()).await {
         Ok(Ok(conn)) => Some(conn),
         _ => None,

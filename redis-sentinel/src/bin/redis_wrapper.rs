@@ -21,9 +21,7 @@ use redis_sentinel::{
     },
     config::{data_dir_is_on_volume, Config},
     demote_on_shutdown::DemoteTarget,
-    ghost_master,
-    health_server,
-    link_heal,
+    ghost_master, health_server, link_heal,
     process_manager::{enable_aof_after_rdb_load, spawn_redis, spawn_sentinel, supervise},
     quorum, rdb_owner,
     redis_conf::{
@@ -43,7 +41,7 @@ async fn main() -> Result<()> {
     let _guard = init_logging("redis-wrapper");
 
     let mut config = Config::from_env().context("invalid configuration")?;
-    let telemetry = Telemetry::from_env("redis-ha");
+    let telemetry = tokio::task::spawn_blocking(|| Telemetry::from_env("redis-ha")).await?;
 
     // The password this node actually runs with is the one already persisted
     // on the volume, not whatever REDIS_PASSWORD holds right now. The
@@ -65,8 +63,10 @@ async fn main() -> Result<()> {
     // with the new value and cannot authenticate against its peers. The
     // warning below is the durable signal that the variable has drifted from
     // the active password.
+    let rotated_at_boot =
+        redis_sentinel::credentials::adopt_proven_boot_password(&mut config).await;
     if let Some(active_password) = persisted_requirepass(&config.data_dir) {
-        if active_password != config.redis_password {
+        if active_password != config.redis_password && !rotated_at_boot {
             tracing::warn!(
                 "REDIS_PASSWORD differs from the password this node's dataset already runs \
                  with — keeping the active password; variable edits do not rotate the \
@@ -74,8 +74,9 @@ async fn main() -> Result<()> {
             );
             telemetry.send(TelemetryEvent::ComponentError {
                 component: "redis-wrapper".to_string(),
-                error: "REDIS_PASSWORD variable drifted from the active password; kept the active one"
-                    .to_string(),
+                error:
+                    "REDIS_PASSWORD variable drifted from the active password; kept the active one"
+                        .to_string(),
                 context: "startup".to_string(),
             });
             config.redis_password = active_password;
@@ -117,8 +118,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    fs::create_dir_all(&config.data_dir)
-        .context("failed to create data directory")?;
+    fs::create_dir_all(&config.data_dir).context("failed to create data directory")?;
 
     // At most one container runs against this dataset at a time: wait for a
     // previous container's supervisor to release the volume before reading
@@ -233,6 +233,11 @@ async fn main() -> Result<()> {
     let adopting_rdb = needs_rdb_to_aof_migration(&config.data_dir)
         .context("cannot safely choose Redis persistence source")?;
     let redis_conf = generate_redis_conf(&config, &boot_master, adopting_rdb);
+    let redis_conf = redis_sentinel::credentials::staged_config(
+        &redis_conf,
+        &config.data_dir,
+        &config.redis_password,
+    )?;
     write_atomic(Path::new(&redis_conf_path), &redis_conf, None)
         .context("failed to write redis.conf")?;
     info!(path = %redis_conf_path, "wrote redis.conf");
@@ -245,30 +250,29 @@ async fn main() -> Result<()> {
     // already-authed cluster, off when joining a cluster that runs open —
     // see `sentinel_auth` for why a mixed-auth cluster cannot vote.
     let sentinel_conf_path = format!("{}/sentinel.conf", config.data_dir);
-    let local_sentinel_requires_auth = if config.sentinel_enabled
-        && !Path::new(&sentinel_conf_path).exists()
-    {
-        let sentinel_password = sentinel_auth::first_boot_sentinel_password(&config).await;
-        let sentinel_conf = generate_sentinel_conf(&config, &boot_master, &sentinel_password);
-        // Atomic AND durable, unlike redis.conf's every-boot rewrite: this
-        // file is written exactly once and preserved forever after, so a
-        // torn write here would be permanent — no usable monitor line for
-        // the boot-role resolver, the empty-master guard's conf-path arm
-        // silently gone, auth resolution reading garbage. The 0600 lands on
-        // the temp file BEFORE the rename, so the credential-bearing conf
-        // is never more readable than that at its final path.
-        write_atomic(Path::new(&sentinel_conf_path), &sentinel_conf, Some(0o600))
-            .context("failed to write sentinel.conf")?;
-        info!(path = %sentinel_conf_path, "wrote sentinel.conf (first boot)");
-        conf_requires_auth(&sentinel_conf)
-    } else if config.sentinel_enabled {
-        info!(path = %sentinel_conf_path, "sentinel.conf exists, preserving");
-        fs::read_to_string(&sentinel_conf_path)
-            .map(|existing| conf_requires_auth(&existing))
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    let local_sentinel_requires_auth =
+        if config.sentinel_enabled && !Path::new(&sentinel_conf_path).exists() {
+            let sentinel_password = sentinel_auth::first_boot_sentinel_password(&config).await;
+            let sentinel_conf = generate_sentinel_conf(&config, &boot_master, &sentinel_password);
+            // Atomic AND durable, unlike redis.conf's every-boot rewrite: this
+            // file is written exactly once and preserved forever after, so a
+            // torn write here would be permanent — no usable monitor line for
+            // the boot-role resolver, the empty-master guard's conf-path arm
+            // silently gone, auth resolution reading garbage. The 0600 lands on
+            // the temp file BEFORE the rename, so the credential-bearing conf
+            // is never more readable than that at its final path.
+            write_atomic(Path::new(&sentinel_conf_path), &sentinel_conf, Some(0o600))
+                .context("failed to write sentinel.conf")?;
+            info!(path = %sentinel_conf_path, "wrote sentinel.conf (first boot)");
+            conf_requires_auth(&sentinel_conf)
+        } else if config.sentinel_enabled {
+            info!(path = %sentinel_conf_path, "sentinel.conf exists, preserving");
+            fs::read_to_string(&sentinel_conf_path)
+                .map(|existing| conf_requires_auth(&existing))
+                .unwrap_or(false)
+        } else {
+            false
+        };
     // The password to use for THIS wrapper's own connections to the
     // co-located Sentinel — gated on the file, not on the env-derived
     // default. A preserved conf from before Sentinel auth existed has no
@@ -398,6 +402,10 @@ async fn main() -> Result<()> {
 
     // Spawn Sentinel (colocated)
     let sentinel_proc = if config.sentinel_enabled {
+        if rotated_at_boot {
+            redis_sentinel::credentials::rewrite_sentinel_password(&config.data_dir)?;
+        }
+        redis_sentinel::credentials::reconcile_sentinel_boot(&config.data_dir)?;
         Some(spawn_sentinel(&config.data_dir).await?)
     } else {
         None

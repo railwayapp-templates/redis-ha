@@ -87,7 +87,7 @@ pub async fn enable_aof_after_rdb_load(
     telemetry: &Telemetry,
 ) {
     let url = crate::sentinel_query::build_redis_url("127.0.0.1", port, password);
-    let client = match Client::open(url) {
+    let client = match Client::open(crate::credentials::active_url(url)) {
         Ok(client) => client,
         Err(err) => {
             error!(error = %err, "failed to build redis client for the AOF migration");
@@ -238,12 +238,26 @@ pub async fn supervise(
     let mut sigint = signal(SignalKind::interrupt())?;
 
     let redis_pid = redis.id().map(|id| Pid::from_raw(id as i32));
-    let sentinel_pid = sentinel.as_ref()
+    let mut sentinel_pid = sentinel
+        .as_ref()
         .and_then(|s| s.id())
         .map(|id| Pid::from_raw(id as i32));
 
     loop {
         tokio::select! {
+            _ = crate::credentials::RESTART_SENTINEL.notified() => {
+                if let Some(ref mut child) = sentinel {
+                    if let Some(pid) = sentinel_pid { let _ = signal::kill(pid, Signal::SIGTERM); }
+                    if tokio::time::timeout(Duration::from_secs(5), child.wait()).await.is_err() {
+                        child.kill().await?;
+                        child.wait().await?;
+                    }
+                    crate::credentials::rewrite_sentinel_password(&data_dir)?;
+                    let child = spawn_sentinel(&data_dir).await?;
+                    sentinel_pid = child.id().map(|id| Pid::from_raw(id as i32));
+                    sentinel = Some(child);
+                }
+            }
             status = redis.wait() => {
                 match status {
                     Ok(s) => error!(code = s.code(), "redis-server exited unexpectedly"),
