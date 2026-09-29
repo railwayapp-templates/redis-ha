@@ -79,7 +79,7 @@ discovered from Docker Hub on every run; `REDIS_SUPPORTED_MAJORS` in
 
 - Renders `redis.conf` and `sentinel.conf` from env vars at startup
 - Manages `redis-server` + `redis-sentinel` as supervised child processes
-- Serves `/health` (liveness) and `/role` (master check; a replica's 503 body also carries `promotable`, `false` while its first full sync is outstanding) on `HEALTH_PORT` (default 8080), plus `POST /switchover` (promote this node) — credential-gated once `HEALTH_API_PASSWORD` is set (see Health API auth)
+- Serves `/health` (liveness) and `/role` (master check; JSON body in the vocabulary shared with mongo-ha and mysql-ha — `{"role":"primary"}` on a 200; a replica's 503 carries its replication `state` (`connected`, `syncing`, `link-down`), `ready` (true only when `connected`), and `promotable`, `false` while its first full sync is outstanding; a local master Sentinel does not confirm is `{"role":"fenced","state":"master","ready":false}`) on `HEALTH_PORT` (default 8080), plus `POST /switchover` (promote this node) — credential-gated once `HEALTH_API_PASSWORD` is set (see Health API auth)
 
 ### `haproxy` (`haproxy-entrypoint`)
 

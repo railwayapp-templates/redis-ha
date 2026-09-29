@@ -4,17 +4,26 @@
 //! plus one action endpoint the Railway dashboard drives:
 //!
 //!   GET /health      → 200 if Redis is up and responding to PING, 503 otherwise.
-//!   GET /role        → 200 {"role":"master"} only if BOTH conditions hold:
+//!   GET /role        → 200 {"role":"primary"} only if BOTH conditions hold:
 //!                        1. local Redis reports role:master
 //!                        2. local Sentinel confirms this node is the current master
 //!                      503 in all other cases, including when Sentinel is unreachable.
-//!                      A replica's 503 body also says whether /switchover
-//!                      would accept it: {"role":"replica","promotable":false,
-//!                      "reason":...} while its first full sync is outstanding
-//!                      (see `sync_gate`), "promotable":true once it holds the
-//!                      dataset, and no field at all when that could not be
-//!                      read — so a caller can hold the action instead of
-//!                      having it refused.
+//!                      The body is one vocabulary shared with mongo-ha and
+//!                      mysql-ha (the Railway dashboard reads it engine-blind):
+//!                      a replica's 503 names its own replication state —
+//!                      {"role":"replica","state":"connected"|"syncing"|
+//!                      "link-down","ready":<bool>} — so three 503s read as
+//!                      "syncing" or "no primary", never as three replicas of
+//!                      nobody; a local master Sentinel does not confirm is
+//!                      {"role":"fenced","state":"master","ready":false}. A
+//!                      replica's body also says whether /switchover would
+//!                      accept it: "promotable":false with a "reason" while
+//!                      its first full sync is outstanding (see `sync_gate`),
+//!                      "promotable":true once it holds the dataset, and no
+//!                      field at all when that could not be read — so a
+//!                      caller can hold the action instead of having it
+//!                      refused. Fields that could not be read are absent,
+//!                      never guessed.
 //!   POST /switchover → ask THIS node to become the primary (the generic
 //!                      clusterWiring.dataNodeSwitchover contract). Sentinel
 //!                      has no "promote node X" command, only "start an
@@ -252,15 +261,19 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 /// partition itself.
 async fn role(State(state): State<AppState>) -> impl IntoResponse {
     match timeout(Duration::from_secs(2), is_sentinel_confirmed_master(&state)).await {
-        Ok(true) => (StatusCode::OK, Json(json!({"role": "master"}))),
+        Ok(true) => (StatusCode::OK, Json(json!({"role": "primary"}))),
         Ok(false) => {
             let promotable = timeout(Duration::from_secs(1), replica_is_promotable(&state))
                 .await
                 .ok()
                 .flatten();
+            let replication = timeout(Duration::from_secs(1), local_replication_state(&state))
+                .await
+                .ok()
+                .flatten();
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(replica_role_payload(promotable)),
+                Json(replica_role_payload(promotable, replication)),
             )
         }
         Err(_) => {
@@ -291,11 +304,78 @@ async fn replica_is_promotable(state: &AppState) -> Option<bool> {
     Some(!crate::sync_gate::blocks_switchover(&priority))
 }
 
-/// The 503 body for a node that is not the confirmed master. The
-/// `promotable` field is only present when it could be read: a caller must
-/// treat its absence as unknown, never as a refusal.
-fn replica_role_payload(promotable: Option<bool>) -> serde_json::Value {
-    match promotable {
+/// What `INFO replication` says this node is, for the /role body of a node
+/// that is not the confirmed master.
+#[derive(Debug, PartialEq)]
+enum ReplicationState {
+    /// Local Redis calls itself master but Sentinel does not confirm it —
+    /// out of write rotation, and not a replica of anyone.
+    Master,
+    /// A replica: `state` is where it stands with its master, `ready` whether
+    /// it holds the dataset and serves reads ("connected" only).
+    Replica { state: &'static str, ready: bool },
+}
+
+/// Redis has no member-state vocabulary of its own, so the replica's state is
+/// named from the two `INFO replication` fields that describe it:
+/// `master_sync_in_progress:1` is "syncing" (the first full copy still in
+/// flight), `master_link_status:up` is "connected", and anything else is
+/// "link-down". Pure, so the mapping is unit-tested.
+fn replication_state_from_info(info: &str) -> Option<ReplicationState> {
+    let mut role: Option<&str> = None;
+    let mut link_up = false;
+    let mut sync_in_progress = false;
+    for line in info.lines() {
+        let line = line.trim_end();
+        if let Some(v) = line.strip_prefix("role:") {
+            role = Some(v.trim());
+        } else if let Some(v) = line.strip_prefix("master_link_status:") {
+            link_up = v.trim() == "up";
+        } else if let Some(v) = line.strip_prefix("master_sync_in_progress:") {
+            sync_in_progress = v.trim() == "1";
+        }
+    }
+    match role? {
+        "master" => Some(ReplicationState::Master),
+        "slave" => Some(if sync_in_progress {
+            ReplicationState::Replica {
+                state: "syncing",
+                ready: false,
+            }
+        } else if link_up {
+            ReplicationState::Replica {
+                state: "connected",
+                ready: true,
+            }
+        } else {
+            ReplicationState::Replica {
+                state: "link-down",
+                ready: false,
+            }
+        }),
+        _ => None,
+    }
+}
+
+async fn local_replication_state(state: &AppState) -> Option<ReplicationState> {
+    let mut cmd = redis::cmd("INFO");
+    cmd.arg("replication");
+    let info: String = query_cached(&state.redis_conn, &state.redis_url, "Redis", cmd).await?;
+    replication_state_from_info(&info)
+}
+
+/// The 503 body for a node that is not the confirmed master. Every field
+/// beyond `role` is only present when it could be read: a caller must treat
+/// an absent `promotable` as unknown, never as a refusal, and an absent
+/// `state`/`ready` as "not told", never as "not ready".
+fn replica_role_payload(
+    promotable: Option<bool>,
+    replication: Option<ReplicationState>,
+) -> serde_json::Value {
+    if let Some(ReplicationState::Master) = replication {
+        return json!({"role": "fenced", "state": "master", "ready": false});
+    }
+    let mut payload = match promotable {
         Some(false) => json!({
             "role": "replica",
             "promotable": false,
@@ -303,7 +383,12 @@ fn replica_role_payload(promotable: Option<bool>) -> serde_json::Value {
         }),
         Some(true) => json!({"role": "replica", "promotable": true}),
         None => json!({"role": "replica"}),
+    };
+    if let Some(ReplicationState::Replica { state, ready }) = replication {
+        payload["state"] = json!(state);
+        payload["ready"] = json!(ready);
     }
+    payload
 }
 
 async fn ping_redis(state: &AppState) -> bool {
@@ -1003,9 +1088,14 @@ mod observed_priority_for_host_tests {
 mod replica_role_payload_tests {
     use super::*;
 
+    const CONNECTED: Option<ReplicationState> = Some(ReplicationState::Replica {
+        state: "connected",
+        ready: true,
+    });
+
     #[test]
     fn a_gated_replica_says_so_and_why() {
-        let payload = replica_role_payload(Some(false));
+        let payload = replica_role_payload(Some(false), CONNECTED);
         assert_eq!(payload["role"], "replica");
         assert_eq!(payload["promotable"], false);
         assert_eq!(payload["reason"], NOT_PROMOTABLE_REASON);
@@ -1013,16 +1103,83 @@ mod replica_role_payload_tests {
 
     #[test]
     fn a_synced_replica_is_promotable_with_no_reason_to_give() {
-        let payload = replica_role_payload(Some(true));
+        let payload = replica_role_payload(Some(true), CONNECTED);
         assert_eq!(payload["role"], "replica");
         assert_eq!(payload["promotable"], true);
         assert!(payload.get("reason").is_none());
     }
 
     #[test]
-    fn an_unreadable_priority_leaves_the_field_out_rather_than_guessing() {
-        let payload = replica_role_payload(None);
-        assert_eq!(payload, json!({"role": "replica"}));
+    fn unreadable_fields_are_left_out_rather_than_guessed() {
+        assert_eq!(replica_role_payload(None, None), json!({"role": "replica"}));
+        // INFO answered, the priority did not: state travels, promotable stays out.
+        assert_eq!(
+            replica_role_payload(None, CONNECTED),
+            json!({"role": "replica", "state": "connected", "ready": true})
+        );
+    }
+
+    // The reported case: every node answering 503 at once. A body that names
+    // the replica's own state lets the dashboard tell "still syncing" from
+    // "connected to a master that is not there", instead of three "Replica"s.
+    #[test]
+    fn a_replica_names_its_replication_state_and_readiness() {
+        let payload = replica_role_payload(
+            Some(false),
+            Some(ReplicationState::Replica {
+                state: "syncing",
+                ready: false,
+            }),
+        );
+        assert_eq!(payload["role"], "replica");
+        assert_eq!(payload["state"], "syncing");
+        assert_eq!(payload["ready"], false);
+        assert_eq!(payload["promotable"], false);
+
+        let payload = replica_role_payload(Some(true), CONNECTED);
+        assert_eq!(payload["state"], "connected");
+        assert_eq!(payload["ready"], true);
+    }
+
+    #[test]
+    fn a_local_master_sentinel_does_not_confirm_is_fenced_not_a_replica() {
+        assert_eq!(
+            replica_role_payload(Some(true), Some(ReplicationState::Master)),
+            json!({"role": "fenced", "state": "master", "ready": false})
+        );
+    }
+
+    #[test]
+    fn replication_state_is_read_off_info_replication() {
+        assert_eq!(
+            replication_state_from_info(
+                "# Replication\r\nrole:slave\r\nmaster_link_status:up\r\nmaster_sync_in_progress:0\r\n"
+            ),
+            CONNECTED
+        );
+        assert_eq!(
+            replication_state_from_info(
+                "role:slave\r\nmaster_link_status:down\r\nmaster_sync_in_progress:1\r\n"
+            ),
+            Some(ReplicationState::Replica {
+                state: "syncing",
+                ready: false
+            })
+        );
+        assert_eq!(
+            replication_state_from_info(
+                "role:slave\r\nmaster_link_status:down\r\nmaster_sync_in_progress:0\r\n"
+            ),
+            Some(ReplicationState::Replica {
+                state: "link-down",
+                ready: false
+            })
+        );
+        assert_eq!(
+            replication_state_from_info("role:master\r\nconnected_slaves:2\r\n"),
+            Some(ReplicationState::Master)
+        );
+        assert_eq!(replication_state_from_info("# Replication\r\n"), None);
     }
 }
 
