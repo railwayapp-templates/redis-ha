@@ -3,7 +3,7 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -232,7 +232,7 @@ impl Telemetry {
 
     pub fn send(&self, event: TelemetryEvent) {
         if !self.enabled {
-            tracing::debug!(event = event.event_type(), "telemetry disabled off-Railway");
+            debug!(event = event.event_type(), "telemetry disabled off-Railway");
             return;
         }
         let payload = self.build_payload(&event);
@@ -262,20 +262,20 @@ impl Telemetry {
                     let body = resp.text().unwrap_or_default();
                     match classify(status.as_u16(), &body) {
                         SendOutcome::Sent => {
-                            info!(event = %event.event_type(), attempt, "telemetry sent")
+                            debug!(event = %event.event_type(), attempt, "telemetry sent")
                         }
                         SendOutcome::Rejected(why) => {
-                            warn!(event = %event.event_type(), %status, reason = %why, body = %truncate(&body), "telemetry rejected")
+                            debug!(event = %event.event_type(), %status, reason = %why, body = %truncate(&body), "telemetry rejected")
                         }
                     }
                     return;
                 }
                 Err(e) if attempt < SEND_ATTEMPTS => {
-                    warn!(event = %event.event_type(), attempt, error = %e, "telemetry send failed, retrying");
+                    debug!(event = %event.event_type(), attempt, error = %e.without_url(), "telemetry send failed, retrying");
                     std::thread::sleep(RETRY_DELAY);
                 }
                 Err(e) => {
-                    warn!(event = %event.event_type(), attempt, error = %e, "telemetry send failed")
+                    debug!(event = %event.event_type(), attempt, error = %e.without_url(), "telemetry send failed")
                 }
             }
         }

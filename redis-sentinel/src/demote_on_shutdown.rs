@@ -517,14 +517,14 @@ pub async fn demote_before_shutdown(target: &DemoteTarget, sentinel_colocated: b
     if !should_attempt_demote(role) {
         info!(
             ?role,
-            "demote-on-shutdown: not master, skipping (no failover to trigger)"
+            "demote-on-shutdown: this node isn't the primary; nothing to hand off"
         );
         return;
     }
 
     info!(
         master_name = %target.redis_master_name,
-        "demote-on-shutdown: master shutting down — requesting SENTINEL FAILOVER before stopping redis"
+        "demote-on-shutdown: handing the primary role to another node before shutting down"
     );
 
     let deadline = Duration::from_millis(u64::env_parse(DEMOTE_TIMEOUT_ENV, DEFAULT_TIMEOUT_MS));
@@ -539,12 +539,12 @@ pub async fn demote_before_shutdown(target: &DemoteTarget, sentinel_colocated: b
         match pause_writes(&redis_url, pause_ms).await {
             Ok(()) => info!(
                 pause_ms,
-                "demote-on-shutdown: paused writes on the local redis for the failover window"
+                "demote-on-shutdown: paused writes for the handoff window"
             ),
             Err(err) => warn!(
                 error = %err,
                 pause_ms,
-                "demote-on-shutdown: CLIENT PAUSE WRITE failed — proceeding without the write pause"
+                "demote-on-shutdown: could not pause writes; handing off without the write pause"
             ),
         }
     }
@@ -558,13 +558,13 @@ pub async fn demote_before_shutdown(target: &DemoteTarget, sentinel_colocated: b
         Err(err) if err.to_ascii_uppercase().contains("INPROG") => {
             warn!(
                 error = %err,
-                "demote-on-shutdown: SENTINEL FAILOVER already in progress — waiting for it"
+                "demote-on-shutdown: a failover is already in progress; waiting for it"
             );
         }
         Err(err) => {
             warn!(
                 error = %err,
-                "demote-on-shutdown: SENTINEL FAILOVER request failed — proceeding with normal shutdown"
+                "demote-on-shutdown: could not hand off the primary role; shutting down normally"
             );
             return;
         }
@@ -584,12 +584,12 @@ pub async fn demote_before_shutdown(target: &DemoteTarget, sentinel_colocated: b
     if wait.confirmed {
         info!(
             elapsed_ms = start.elapsed().as_millis() as u64,
-            "demote-on-shutdown: failover confirmed — proceeding with shutdown"
+            "demote-on-shutdown: handoff complete; shutting down"
         );
     } else {
         warn!(
             timeout_ms = deadline.as_millis() as u64,
-            "demote-on-shutdown: timed out waiting for the failover to land — proceeding with normal shutdown"
+            "demote-on-shutdown: timed out waiting for the handoff; shutting down normally"
         );
     }
 
@@ -608,13 +608,13 @@ pub async fn demote_before_shutdown(target: &DemoteTarget, sentinel_colocated: b
     ) {
         match reattach_to_new_master(&redis_url, &host, port).await {
             Ok(()) => info!(
-                new_master = %format!("{host}:{port}"),
-                "demote-on-shutdown: re-pointed the local redis at the new master before shutdown"
+                new_primary = %format!("{host}:{port}"),
+                "demote-on-shutdown: now replicating from the new primary until shutdown"
             ),
             Err(err) => warn!(
                 error = %err,
-                new_master = %format!("{host}:{port}"),
-                "demote-on-shutdown: best-effort REPLICAOF failed — proceeding with shutdown"
+                new_primary = %format!("{host}:{port}"),
+                "demote-on-shutdown: could not attach to the new primary; shutting down anyway"
             ),
         }
     }

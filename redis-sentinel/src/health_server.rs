@@ -389,7 +389,7 @@ async fn sentinel_confirms_master(state: &AppState, master_name: &str) -> bool {
         info!(
             sentinel_master = %master_host,
             this_node = %state.private_domain,
-            "sentinel says master is elsewhere — returning 503"
+            "sentinel says the primary is elsewhere — returning 503"
         );
     }
     confirmed
@@ -631,7 +631,7 @@ fn spawn_settle_watch(state: AppState) {
         restore_bias(&state).await;
         state.switchover_in_flight.store(false, Ordering::SeqCst);
         if promoted {
-            info!("switchover settled: this node is now master");
+            info!("switchover settled: this node is now primary");
         } else {
             warn!(
                 timeout_secs = SETTLE_TIMEOUT.as_secs(),
@@ -822,19 +822,19 @@ pub fn spawn(
                 Ok(Ok(())) => {
                     // axum::serve only returns on a graceful-shutdown signal
                     // we never send, so this is unexpected but not fatal.
-                    warn!("health-server: run loop returned cleanly — respawning in 5s");
+                    warn!("health server returned unexpectedly; restarting in 5s");
                     Some("run loop returned cleanly".to_string())
                 }
                 Ok(Err(e)) => {
-                    warn!(error = %e, "health-server: bind/serve failed — respawning in 5s");
+                    warn!(error = %e, "health server failed; restarting in 5s");
                     Some(format!("bind/serve failed: {e:#}"))
                 }
                 Err(e) if e.is_panic() => {
-                    warn!(panic = ?e, "health-server: task panicked — respawning in 5s");
+                    warn!(panic = ?e, "health server panicked; restarting in 5s");
                     Some("task panicked".to_string())
                 }
                 Err(e) => {
-                    warn!(error = %e, "health-server: join error — respawning in 5s");
+                    warn!(error = %e, "health server task was cancelled; restarting in 5s");
                     Some(format!("join error: {e}"))
                 }
             };

@@ -305,8 +305,8 @@ pub(crate) fn quarantine_dead_world_state(config: &Config, host: &str, port: u16
     warn!(
         master = %format!("{host}:{port}"),
         declared = ?declared_hosts(config),
-        "sentinel.conf names a master outside the declared topology — \
-         quarantining the stale state and re-resolving"
+        "sentinel.conf names a primary outside the declared topology — \
+         setting the stale state aside and re-resolving"
     );
     match crate::sentinel_conf::quarantine_ghost_sentinel_conf(&config.data_dir) {
         Ok(Some(ghost)) => info!(to = %ghost.display(), "moved ghost sentinel.conf aside"),
@@ -644,8 +644,8 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
                 && !undeclared_master_is_member(&config.redis_password, &host, port).await
             {
                 info!(
-                    "peer sentinels name {}:{} as master — outside the declared topology \
-                     and not a live member; falling back to the env topology",
+                    "peer sentinels name {}:{} as primary — outside the declared topology \
+                     and not a live node; falling back to the env topology",
                     host, port
                 );
             } else {
@@ -662,7 +662,7 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
                     None => {
                         peers_named_self = true;
                         info!(
-                            "peer sentinels name this node as master, but this is a first boot \
+                            "peer sentinels name this node as primary, but this is a first boot \
                              with no local sentinel state — not self-promoting off a peer answer"
                         );
                     }
@@ -758,14 +758,14 @@ async fn peer_check_self_master(config: &Config) -> Option<BootMaster> {
     }
     let Some((host, port)) = query_peer_sentinels(config).await else {
         info!(
-            "sentinel.conf names this node as master and no peer sentinel answered — \
-             keeping the master role"
+            "sentinel.conf names this node as primary and no peer sentinel answered — \
+             keeping the primary role"
         );
         return None;
     };
     match classify_self_master_peer_answer(config, host, port) {
         SelfMasterPeerAnswer::ConfirmsSelf => {
-            info!("peer sentinels confirm this node as master");
+            info!("peer sentinels confirm this node as primary");
             None
         }
         SelfMasterPeerAnswer::NamesOther(host, port) => {
@@ -773,15 +773,15 @@ async fn peer_check_self_master(config: &Config) -> Option<BootMaster> {
                 && !undeclared_master_is_member(&config.redis_password, &host, port).await
             {
                 info!(
-                    "peer sentinels name {}:{} as master — outside the declared topology \
-                     and not a live member; keeping the master role from sentinel.conf",
+                    "peer sentinels name {}:{} as primary — outside the declared topology \
+                     and not a live node; keeping the primary role from sentinel.conf",
                     host, port
                 );
                 return None;
             }
             info!(
                 "boot role: replica of {}:{} (peer sentinels contradict this node's \
-                 sentinel.conf, which still names this node as master — the failover \
+                 sentinel.conf, which still names this node as primary — the failover \
                  happened while this node was down)",
                 host, port
             );

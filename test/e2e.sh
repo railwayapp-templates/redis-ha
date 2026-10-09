@@ -1653,9 +1653,9 @@ t_sigterm_master_demotes_before_exit() {
   # Not `grep -q` — see t_restart_old_master_rejoins_as_replica on the
   # SIGPIPE false negative (this exact assertion flaked red in CI with the
   # demote line demonstrably present in the dumped log).
-  docker logs demote-1 2>&1 | grep -F "demote-on-shutdown: master shutting down" >/dev/null \
+  docker logs demote-1 2>&1 | grep -F "demote-on-shutdown: handing the primary role" >/dev/null \
     || { ko "$t" "demote-1 never attempted the pre-shutdown failover" demote-1; return; }
-  docker logs demote-1 2>&1 | grep -F "demote-on-shutdown: failover confirmed" >/dev/null \
+  docker logs demote-1 2>&1 | grep -F "demote-on-shutdown: handoff complete" >/dev/null \
     || { ko "$t" "demote-1 never confirmed the failover before exiting" demote-1; return; }
 
   # And it must have actually been fast — nowhere near the -t budget, which
@@ -2280,7 +2280,7 @@ t_ghost_master_selfheal_restores_writes() {
     || { ko "$t" "ghostm-3 restarted before (or with) the root — stagger broken" ghostm-3; return; }
 
   # The restart was the watcher's decision, not a crash...
-  docker logs ghostm-1 2>&1 | grep -F "ghost-master: restarting through the boot path" >/dev/null \
+  docker logs ghostm-1 2>&1 | grep -F "ghost-master: restarting this node" >/dev/null \
     || { ko "$t" "root restart was not the ghost-master watcher's decision" ghostm-1; return; }
   # ...and the cure is the existing boot-time sanitizer: the ghost state is
   # quarantined on the volume (preserved, never deleted).
@@ -2356,7 +2356,7 @@ t_ghost_selfheal_ignores_normal_failover() {
       || { ko "$t" "${n} self-restarted across a normal failover" "$n"; return; }
     docker logs "$n" 2>&1 | grep -F "ghost-master: restarting" >/dev/null \
       && { ko "$t" "${n} decided to restart across a normal failover" "$n"; return; }
-    docker logs "$n" 2>&1 | grep -F "ghost-master: sentinel consensus names" >/dev/null \
+    docker logs "$n" 2>&1 | grep -F "ghost-master: Sentinel names a primary" >/dev/null \
       && { ko "$t" "${n} opened a ghost dwell across a normal failover" "$n"; return; }
   done
 

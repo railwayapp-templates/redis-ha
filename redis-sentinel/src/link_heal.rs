@@ -779,7 +779,7 @@ async fn iteration(
                     attempt,
                     mismatch_for_secs,
                     attached_to = ?snapshot.master_addr,
-                    "link-heal: repointing a replica durably attached to the wrong master"
+                    "link-heal: repointing a replica durably attached to the wrong primary"
                 ),
             }
             // Persist before the call so backoff/cap apply even if the
@@ -856,7 +856,7 @@ async fn iteration(
         }
         LinkHealAction::EmitGaveUp { attempts } => {
             if !*gave_up_emitted {
-                warn!(attempts, "link-heal: giving up, leaving node for a human");
+                warn!(attempts, "link-heal: couldn't repair the replication link after {attempts} attempts. Check this node's logs and restart it.");
                 telemetry.send(TelemetryEvent::LinkHealGaveUp { node, attempts });
                 *gave_up_emitted = true;
             }
