@@ -2206,7 +2206,7 @@ t_link_heal_repoints_wrong_master_attachment() {
   wait_for_replica_attached_host wrongm-4 wrongm-1 90 \
     || { ko "$t" "node never attached to the demoted master (fault injection failed)" wrongm-4 wrongm-1; return; }
 
-  wait_for_log_line wrongm-4 "repointing a replica durably attached to the wrong master" 90 \
+  wait_for_log_line wrongm-4 "repointing a replica durably attached to the wrong primary" 90 \
     || { ko "$t" "wrong-master watch never acted" wrongm-4; return; }
   wait_for_replica_repointed wrongm-4 "$promoted" 90 \
     || { ko "$t" "replica never landed on the real master after the heal" wrongm-4 "$promoted"; return; }
@@ -3016,7 +3016,7 @@ t_password_variable_edit_does_not_rotate() {
     | grep -q PONG \
     && { ko "$t" "the edited variable value authenticated — the password rotated" "$n"; return; }
   # ...and the wrapper said why, durably.
-  wait_for_log_line "$n" "variable edits do not rotate the database password" 10 \
+  wait_for_log_line "$n" "This node keeps using the database.s current password" 10 \
     || { ko "$t" "drift warning never logged" "$n"; return; }
 
   docker rm -f "$n" >/dev/null 2>&1
