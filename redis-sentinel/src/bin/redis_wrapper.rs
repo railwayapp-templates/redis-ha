@@ -68,9 +68,9 @@ async fn main() -> Result<()> {
     if let Some(active_password) = persisted_requirepass(&config.data_dir) {
         if active_password != config.redis_password && !rotated_at_boot {
             tracing::warn!(
-                "REDIS_PASSWORD differs from the password this node's dataset already runs \
-                 with — keeping the active password; variable edits do not rotate the \
-                 database password"
+                "The current password in REDIS_PASSWORD doesn't match the database's. This \
+                 node keeps using the database's current password. Regenerate the password \
+                 from the database's Credentials tab."
             );
             telemetry.send(TelemetryEvent::ComponentError {
                 component: "redis-wrapper".to_string(),
@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
             tracing::warn!(
                 data_dir = %config.data_dir,
                 volume_mount_path = %mount,
-                "data directory is outside the mounted volume — data will not persist across redeploys"
+                "The data directory is outside the mounted volume, so data won't persist across redeploys. Set DATA_DIR to a path under the volume mount, or unset it, and redeploy."
             );
             telemetry.send(TelemetryEvent::ComponentError {
                 component: "redis-wrapper".to_string(),
@@ -173,10 +173,10 @@ async fn main() -> Result<()> {
             // over to, and refusing would crash-loop a single-node service
             // until an operator flips the kill switch.
             tracing::warn!(
-                "this node's own sentinel.conf names this node ({}) as the current master \
+                "this node's own sentinel.conf names this node ({}) as the current primary \
                  and {} holds no loadable dataset, but no peer sentinels are configured — \
                  there is no replica to protect and nothing to fail over to, so this boot \
-                 proceeds as an empty master",
+                 proceeds as an empty primary",
                 config.private_domain,
                 config.data_dir
             );

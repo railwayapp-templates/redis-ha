@@ -40,7 +40,7 @@ pub fn run_monitoring_loop(mut child: Child, telemetry: &Telemetry) -> Result<()
             }
             Ok(false) => {
                 if !no_primary_alerted {
-                    warn!("no healthy primary backend — cluster has no writable master");
+                    warn!("no healthy primary backend — cluster has no primary");
                     telemetry.send(TelemetryEvent::NoPrimary {
                         backends: vec!["redis_primary_backend".to_string()],
                     });

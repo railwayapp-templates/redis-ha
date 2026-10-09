@@ -558,7 +558,7 @@ async fn iteration(ctx: &WatcherContext, state: &mut WatcherState, cfg: &Watcher
     match observe(ctx).await {
         Verdict::Clear(reason) => {
             if state.ghost_since.is_some() {
-                info!(reason, "ghost-master: condition cleared — dwell reset");
+                info!(reason, "ghost-master: condition cleared");
             }
             state.ghost_since = None;
             state.gave_up_emitted = false;
@@ -572,8 +572,8 @@ async fn iteration(ctx: &WatcherContext, state: &mut WatcherState, cfg: &Watcher
                     hold_secs =
                         cfg.thresholds.dwell_secs
                             + u64::from(ctx.rank) * cfg.thresholds.stagger_secs,
-                    "ghost-master: sentinel state names a master that is not a live \
-                     cluster member — dwell started"
+                    "ghost-master: Sentinel names a primary that is no longer part of this \
+                     cluster; watching before acting"
                 );
                 now
             });
@@ -586,7 +586,7 @@ async fn iteration(ctx: &WatcherContext, state: &mut WatcherState, cfg: &Watcher
                         warn!(
                             attempts,
                             window_secs = cfg.thresholds.window_secs,
-                            "ghost-master: restart cap reached — staying up and serving probes"
+                            "ghost-master: restart limit reached; leaving this node running. Check this node's logs and restart it."
                         );
                         ctx.telemetry.send(TelemetryEvent::GhostMasterGaveUp {
                             node: ctx.private_domain.clone(),
@@ -605,8 +605,7 @@ async fn iteration(ctx: &WatcherContext, state: &mut WatcherState, cfg: &Watcher
                         shape,
                         ghost_for_secs,
                         attempt,
-                        "ghost-master: restarting through the boot path so the boot-time \
-                         sanitizer can quarantine the dead sentinel state"
+                        "ghost-master: restarting this node to clear the stale Sentinel state"
                     );
                     ctx.telemetry.send(TelemetryEvent::GhostMasterRestart {
                         node: ctx.private_domain.clone(),
