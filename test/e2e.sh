@@ -403,7 +403,7 @@ wait_for_role_master() { # wait_for_role_master NODE [timeout]
   local i
   for i in $(seq 1 "${2:-90}"); do
     docker exec "$1" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
-      | grep -q '"role":"master"' && return 0
+      | grep -q '"role":"primary"' && return 0
     sleep 1
   done
   return 1
@@ -538,7 +538,7 @@ promote_by_pausing() { # promote_by_pausing MASTER CANDIDATE...
   for i in $(seq 1 180); do
     for n in "$@"; do
       docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
-        | grep -q '"role":"master"' && { echo "$n"; return 0; }
+        | grep -q '"role":"primary"' && { echo "$n"; return 0; }
     done
     sleep 1
   done
@@ -1324,7 +1324,7 @@ t_sentinel_failover() {
   for i in $(seq 1 180); do
     for n in ha-2 ha-3; do
       docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
-        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+        | grep -q '"role":"primary"' && { promoted="$n"; break 2; }
     done
     sleep 1
   done
@@ -1520,7 +1520,7 @@ t_health_api_auth_gates_switchover() {
     || { ko "$t" "cluster never became ready" hapi-1 hapi-2 hapi-3; return; }
 
   # The probes never ask for a credential: 200 for /health everywhere, and
-  # /role answers its verdict (200 master / 503 replica), never 401.
+  # /role answers its verdict (200 primary / 503 replica), never 401.
   local n code
   for n in hapi-1 hapi-2 hapi-3; do
     code=$(health_http_code "$n" GET /health)
@@ -1680,7 +1680,7 @@ t_sigterm_master_demotes_before_exit() {
   for i in $(seq 1 15); do
     for n in demote-2 demote-3; do
       docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
-        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+        | grep -q '"role":"primary"' && { promoted="$n"; break 2; }
     done
     sleep 1
   done
@@ -1829,7 +1829,7 @@ t_down_for_failover_master_boots_as_replica() {
   for i in $(seq 1 180); do
     for n in stale-2 stale-3; do
       docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
-        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+        | grep -q '"role":"primary"' && { promoted="$n"; break 2; }
     done
     sleep 1
   done
@@ -2083,7 +2083,7 @@ t_link_heal_recovers_from_partition_during_failover() {
   for i in $(seq 1 180); do
     for n in part-2 part-3 part-4; do
       docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
-        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+        | grep -q '"role":"primary"' && { promoted="$n"; break 2; }
     done
     sleep 1
   done
@@ -3116,7 +3116,7 @@ t_wiped_master_volume_does_not_wipe_cluster() {
   for i in $(seq 1 180); do
     for n in wipe-2 wipe-3; do
       docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
-        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+        | grep -q '"role":"primary"' && { promoted="$n"; break 2; }
     done
     sleep 1
   done
@@ -3206,7 +3206,7 @@ t_wiped_dataset_with_surviving_conf_does_not_wipe_cluster() {
   for i in $(seq 1 180); do
     for n in dwipe-2 dwipe-3; do
       docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
-        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+        | grep -q '"role":"primary"' && { promoted="$n"; break 2; }
     done
     sleep 1
   done
@@ -3543,6 +3543,9 @@ t_never_synced_replica_is_not_promotable() {
     payload=$(role_payload "$n")
     printf '%s' "$payload" | grep -F '"promotable":true' >/dev/null \
       || { ko "$t" "synced $n /role did not report promotable:true (got '${payload}')" "$n"; return; }
+    printf '%s' "$payload" | grep -F '"state":"connected"' >/dev/null \
+      && printf '%s' "$payload" | grep -F '"ready":true' >/dev/null \
+      || { ko "$t" "synced $n /role did not report state:connected, ready:true (got '${payload}')" "$n"; return; }
     docker exec "$n" test ! -e /data/.sync_gate_pending \
       || { ko "$t" "$n still carries the pending marker after its lift" "$n"; return; }
   done
