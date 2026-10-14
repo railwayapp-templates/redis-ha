@@ -421,7 +421,17 @@ health_http() { # health_http NODE GET|POST PATH [extra wget args...]  ->  heade
 }
 
 health_http_code() { # health_http_code NODE GET|POST PATH [extra wget args...]  ->  final status code
-  health_http "$@" | sed -n 's/^ *HTTP\/1\.[01] \([0-9][0-9][0-9]\).*/\1/p' | tail -1
+  # An EMPTY result is never a verdict the server gave — it is the exec or
+  # the connection failing to happen at all (seen once on a loaded CI runner,
+  # with the node provably healthy in its dump) — so it is retried a couple
+  # of times; any actual status, 2xx or 5xx, is returned as is.
+  local i code
+  for i in 1 2 3; do
+    code=$(health_http "$@" | sed -n 's/^ *HTTP\/1\.[01] \([0-9][0-9][0-9]\).*/\1/p' | tail -1)
+    [ -n "$code" ] && { echo "$code"; return; }
+    sleep 1
+  done
+  echo "$code"
 }
 
 basic_auth_header() { # basic_auth_header USER PASSWORD  ->  "Authorization: Basic ..."
@@ -3967,19 +3977,64 @@ t_peer_pins_follow_a_peer_to_its_new_address() {
   ok "$t"
 }
 
+# A tiny resolver for the expiry scenario: answers A for the names in KNOWN
+# ("name=ip,..."), NODATA for their other record types, and NXDOMAIN for any
+# other name. Docker's embedded DNS forwards an unknown name to the host's
+# upstream, and what THAT answers (NXDOMAIN, SERVFAIL, nothing within the
+# deadline) depends on the machine — on a CI runner it stayed silent, which
+# the watcher correctly reads as "hold", not "gone". The verdict under test
+# has to come from a resolver the scenario controls.
+start_stub_resolver() { # start_stub_resolver NAME KNOWN  ->  the stub's address
+  docker run -d --name "$1" --label "$LABEL" --network "$NET" -e KNOWN="$2" python:3-alpine python3 -c '
+import os, socket
+known = {}
+for kv in os.environ.get("KNOWN", "").split(","):
+    if "=" in kv:
+        n, ip = kv.split("=", 1); known[n.lower()] = ip
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("0.0.0.0", 53))
+while True:
+    data, addr = s.recvfrom(512)
+    if len(data) < 12: continue
+    i, labels = 12, []
+    while i < len(data) and data[i]:
+        l = data[i]; labels.append(data[i+1:i+1+l].decode("ascii", "replace")); i += 1 + l
+    i += 1; qtype = int.from_bytes(data[i:i+2], "big"); qend = i + 4
+    ip = known.get(".".join(labels).lower())
+    if ip is None:
+        resp = data[:2] + b"\x81\x83" + b"\x00\x01\x00\x00\x00\x00\x00\x00" + data[12:qend]
+    elif qtype == 1:
+        ans = b"\xc0\x0c\x00\x01\x00\x01" + (30).to_bytes(4, "big") + b"\x00\x04" + socket.inet_aton(ip)
+        resp = data[:2] + b"\x81\x80" + b"\x00\x01\x00\x01\x00\x00\x00\x00" + data[12:qend] + ans
+    else:
+        resp = data[:2] + b"\x81\x80" + b"\x00\x01\x00\x00\x00\x00\x00\x00" + data[12:qend]
+    s.sendto(resp, addr)
+' >/dev/null || return 1
+  local i ip
+  for i in $(seq 1 30); do
+    ip=$(container_ip "$1")
+    [ -n "$ip" ] && docker exec "$1" sh -c 'nc -z -u 127.0.0.1 53' 2>/dev/null && { echo "$ip"; return 0; }
+    sleep 1
+  done
+  echo "$ip"
+}
+
 # The other half of "a pin is a cache": a peer that is gone for good stops
-# being pinned. With the expiry shortened, removing a replica makes the
-# resolver answer NXDOMAIN for its name; the master holds the last address
-# for the expiry window and then drops the pin, so the name goes back to
-# plain DNS instead of pointing at an address someone else may be given.
+# being pinned. With the expiry shortened, the master is pointed at a
+# resolver that answers NXDOMAIN for the removed replica's name (and keeps
+# answering the others); it holds the last address for the expiry window
+# and then drops the pin, so the name goes back to plain DNS instead of
+# pointing at an address someone else may be given.
 t_peer_pins_drop_a_removed_peer_after_expiry() {
   local t=t_peer_pins_drop_a_removed_peer_after_expiry
   start_ha_trio pinexp -e PEER_HOST_PINS_ABSENT_EXPIRY_SECONDS=12 \
     || { ko "$t" "trio never reached failover-ready state" pinexp-1 pinexp-2 pinexp-3; return; }
-  local ip3
+  local ip3 stub
   ip3=$(container_ip pinexp-3)
   wait_for_hosts_pin pinexp-1 pinexp-3 "$ip3" 30 \
     || { ko "$t" "master never pinned pinexp-3" pinexp-1; return; }
+  stub=$(start_stub_resolver pinexp-dns "pinexp-1=$(container_ip pinexp-1),pinexp-2=$(container_ip pinexp-2)")
+  [ -n "$stub" ] || { ko "$t" "stub resolver never came up" pinexp-dns; return; }
+  docker exec pinexp-1 sh -c "cp /etc/resolv.conf /tmp/resolv.conf.orig && printf 'nameserver ${stub}\n' > /etc/resolv.conf"
   docker rm -f pinexp-3 >/dev/null 2>&1
   wait_for_log_line pinexp-1 'peer-pins: pinexp-3 has no address right now' 30 \
     || { ko "$t" "master never noticed pinexp-3 lost its address" pinexp-1; return; }
@@ -3998,7 +4053,8 @@ t_peer_pins_drop_a_removed_peer_after_expiry() {
   # The surviving peer is untouched by the drop.
   [ "$(hosts_pin pinexp-1 pinexp-2)" = "$(container_ip pinexp-2)" ] \
     || { ko "$t" "dropping one pin disturbed another" pinexp-1; return; }
-  docker rm -f pinexp-1 pinexp-2 >/dev/null 2>&1
+  restore_resolver pinexp-1
+  docker rm -f pinexp-1 pinexp-2 pinexp-dns >/dev/null 2>&1
   ok "$t"
 }
 
