@@ -7,7 +7,14 @@
 //!   GET /role        → 200 {"role":"master"} only if BOTH conditions hold:
 //!                        1. local Redis reports role:master
 //!                        2. local Sentinel confirms this node is the current master
-//!                      503 in all other cases, including when Sentinel is unreachable.
+//!                      503 in all other cases — with one bounded exception: a
+//!                      Sentinel that gives NO answer (stalled, in TILT,
+//!                      restarting) is not a demotion. Within
+//!                      `ROLE_SENTINEL_GRACE_SECONDS` (default 60) of the last
+//!                      confirmation, and only while Redis itself still accepts
+//!                      writes (its min-replicas-to-write fence is satisfied),
+//!                      the node stays advertised, with "sentinel":"unreachable"
+//!                      in the body. See `role` for why that is safe.
 //!                      A replica's 503 body also says whether /switchover
 //!                      would accept it: {"role":"replica","promotable":false,
 //!                      "reason":...} while its first full sync is outstanding
@@ -79,7 +86,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use common::{Telemetry, TelemetryEvent};
+use common::{ConfigExt, Telemetry, TelemetryEvent};
 use redis::{aio::MultiplexedConnection, Client};
 use serde_json::json;
 use std::net::SocketAddr;
@@ -114,6 +121,19 @@ struct AppState {
     /// already landed — can restore it. `take()`-based so exactly one
     /// restorer wins.
     bias_restore: Arc<Mutex<Option<String>>>,
+    /// When the local Sentinel last named this node the primary. `None`
+    /// until it has, and reset to `None` the moment it names another node
+    /// — the grace below only ever extends a confirmation, never invents one.
+    sentinel_confirmed_at: Arc<Mutex<Option<Instant>>>,
+    /// How long after that confirmation a silent Sentinel keeps this node
+    /// advertised (`ROLE_SENTINEL_GRACE_SECONDS`); zero fails closed at once.
+    sentinel_grace: Duration,
+    /// Whether the current "Sentinel not answering" episode has been
+    /// logged — HAProxy probes several times a second during one, and the
+    /// log must say it once, then say when it ended.
+    sentinel_silence_reported: Arc<AtomicBool>,
+    /// Whether the current episode's grace expiry has been logged.
+    sentinel_grace_expired_reported: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -123,6 +143,7 @@ impl AppState {
         private_domain: String,
         redis_master_name: String,
         redis_port: u16,
+        sentinel_grace: Duration,
     ) -> Self {
         Self {
             redis_url,
@@ -134,6 +155,10 @@ impl AppState {
             sentinel_conn: Arc::new(Mutex::new(None)),
             switchover_in_flight: Arc::new(AtomicBool::new(false)),
             bias_restore: Arc::new(Mutex::new(None)),
+            sentinel_confirmed_at: Arc::new(Mutex::new(None)),
+            sentinel_grace,
+            sentinel_silence_reported: Arc::new(AtomicBool::new(false)),
+            sentinel_grace_expired_reported: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -231,29 +256,97 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// `ROLE_SENTINEL_GRACE_SECONDS`: how long a silent Sentinel keeps a
+/// confirmed primary advertised. The stalls this covers run 10–30s (one
+/// glibc lookup against a dead resolver is 5s × 2 attempts, times the
+/// search list) and Sentinel's TILT holds for a fixed 30s after one, so a
+/// minute spans one whole episode. Sentinel is a supervised child of this
+/// wrapper — a Sentinel that EXITS takes the container with it — so what
+/// the grace can shelter is only ever a Sentinel that is alive and not
+/// answering. `0` fails closed on the first unanswered probe, the previous
+/// behavior.
+const DEFAULT_ROLE_SENTINEL_GRACE_SECONDS: u64 = 60;
+/// Per-step budgets for one /role probe. Together they stay under HAProxy's
+/// `timeout check` (3s in the template): a probe that answers 503 at 2.2s
+/// is a failed check, a probe that answers nothing at 3s is the same failed
+/// check plus a timeout log line the operator has to explain.
+const LOCAL_REDIS_BUDGET: Duration = Duration::from_millis(700);
+const SENTINEL_BUDGET: Duration = Duration::from_secs(1);
+const FENCE_BUDGET: Duration = Duration::from_millis(500);
+
 /// Split-brain-safe master check.
 ///
-/// Returns 200 only when both conditions hold:
-///   1. Local Redis reports role:master.
-///   2. Local Sentinel's `SENTINEL get-master-addr-by-name` confirms this
-///      node's hostname as the current master.
+/// 200 when local Redis reports role:master AND the local Sentinel's
+/// `SENTINEL get-master-addr-by-name` names this node. A Sentinel that
+/// names ANOTHER node is a demotion this node has not caught up with yet
+/// and is 503 at once. A Sentinel that gives NO answer — stalled in a DNS
+/// lookup on its main thread, in TILT, mid-restart — is not a demotion,
+/// and used to be treated as one: every such stall became 503s, HAProxy
+/// pulling the primary and resetting every client connection, on a Redis
+/// that was serving the whole time. Now, within `ROLE_SENTINEL_GRACE_SECONDS`
+/// of the last confirmation and only while Redis itself still accepts
+/// writes — its `min-replicas-to-write` fence satisfied — the node stays
+/// advertised, with `"sentinel":"unreachable"` in the body. Past the grace,
+/// with the fence closed, or with no confirmation on record, it fails
+/// closed exactly as before.
 ///
-/// Condition (2) is not a quorum check: `get-master-addr-by-name` answers
-/// from the local Sentinel's own state, and that state keeps naming this
-/// node for as long as this Sentinel has not itself observed a newer epoch —
-/// an isolated master's Sentinel does not necessarily flip that answer the
-/// moment a partition opens. We still treat an unreachable Sentinel as 503
-/// (fail-closed), which covers the case where this node cannot reach its own
-/// colocated Sentinel at all, but that is narrower than fencing every
-/// partition immediately. The write-safety backstop for the partition
-/// window is `min-replicas-to-write` at the Redis layer (see the module
-/// doc); this check's job is to stop HAProxy from routing here once this
-/// node's own Sentinel has registered the demotion, not to detect the
-/// partition itself.
+/// Why the grace is safe: a real failover demotes this node through its
+/// own Redis (`REPLICAOF` from the winning Sentinel), so role:slave and a
+/// 503 need no Sentinel answer at all. The remaining case — an old primary
+/// cut off from every Sentinel but still reachable by the edge — is the one
+/// `min-replicas-to-write` exists for: its replicas stop acking, Redis
+/// refuses writes, and the fence check here goes 503 with it. The grace
+/// only keeps HAProxy's sessions on a node Redis itself still considers
+/// writable, which is also the only node a majority can have as primary.
 async fn role(State(state): State<AppState>) -> impl IntoResponse {
-    match timeout(Duration::from_secs(2), is_sentinel_confirmed_master(&state)).await {
-        Ok(true) => (StatusCode::OK, Json(json!({"role": "master"}))),
-        Ok(false) => {
+    let view = match timeout(LOCAL_REDIS_BUDGET, replication_view(&state)).await {
+        Ok(Some(view)) => view,
+        _ => {
+            *state.redis_conn.lock().await = None;
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"role": "unknown", "reason": "timeout"})),
+            );
+        }
+    };
+    if !view.is_master {
+        let promotable = timeout(Duration::from_secs(1), replica_is_promotable(&state))
+            .await
+            .ok()
+            .flatten();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(replica_role_payload(promotable)),
+        );
+    }
+    let verdict = match timeout(
+        SENTINEL_BUDGET,
+        sentinel_verdict(&state, &state.redis_master_name),
+    )
+    .await
+    {
+        Ok(verdict) => verdict,
+        Err(_) => SentinelVerdict::NoAnswer,
+    };
+    match verdict {
+        SentinelVerdict::ConfirmsSelf => {
+            *state.sentinel_confirmed_at.lock().await = Some(Instant::now());
+            if state.sentinel_silence_reported.swap(false, Ordering::SeqCst) {
+                info!("The local Sentinel is answering again; primary confirmation restored");
+            }
+            state
+                .sentinel_grace_expired_reported
+                .store(false, Ordering::SeqCst);
+            (StatusCode::OK, Json(json!({"role": "master"})))
+        }
+        SentinelVerdict::NamesOther(other) => {
+            *state.sentinel_confirmed_at.lock().await = None;
+            state.sentinel_silence_reported.store(false, Ordering::SeqCst);
+            info!(
+                sentinel_master = %other,
+                this_node = %state.private_domain,
+                "sentinel says the primary is elsewhere — returning 503"
+            );
             let promotable = timeout(Duration::from_secs(1), replica_is_promotable(&state))
                 .await
                 .ok()
@@ -263,15 +356,114 @@ async fn role(State(state): State<AppState>) -> impl IntoResponse {
                 Json(replica_role_payload(promotable)),
             )
         }
-        Err(_) => {
-            // Timeout — treat as unhealthy
-            *state.redis_conn.lock().await = None;
+        SentinelVerdict::NoAnswer => {
+            // The cached connection may itself be what is stuck: drop it so
+            // the next probe redials, as the old timeout arm did.
             *state.sentinel_conn.lock().await = None;
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"role": "unknown", "reason": "timeout"})),
-            )
+            let confirmed_ago = state
+                .sentinel_confirmed_at
+                .lock()
+                .await
+                .map(|at| at.elapsed());
+            let fence = timeout(FENCE_BUDGET, min_replicas_to_write(&state))
+                .await
+                .ok()
+                .flatten();
+            let accepts_writes = fence.map(|threshold| redis_accepts_writes(&view, threshold));
+            let grace_secs = state.sentinel_grace.as_secs();
+            let ago = confirmed_ago.unwrap_or_default().as_secs();
+            let unavailable = || {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"role": "unknown", "reason": "sentinel unreachable"})),
+                )
+            };
+            match silent_sentinel_decision(confirmed_ago, state.sentinel_grace, accepts_writes) {
+                SilentSentinel::KeepRouting => {
+                    if !state.sentinel_silence_reported.swap(true, Ordering::SeqCst) {
+                        warn!(
+                            grace_secs,
+                            acknowledged_replicas = view.good_replicas.unwrap_or(0),
+                            "The local Sentinel isn't answering; this node stays advertised as the primary for up to {grace_secs}s because Redis still accepts writes with {} acknowledged replica(s)",
+                            view.good_replicas.unwrap_or(0)
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "role": "master",
+                            "sentinel": "unreachable",
+                            "confirmed_ago_seconds": ago,
+                        })),
+                    )
+                }
+                SilentSentinel::GraceExpired => {
+                    if !state
+                        .sentinel_grace_expired_reported
+                        .swap(true, Ordering::SeqCst)
+                    {
+                        warn!(
+                            unanswered_secs = ago,
+                            grace_secs,
+                            "The local Sentinel hasn't confirmed this node for {ago}s, past the {grace_secs}s grace; this node is no longer advertised as the primary until Sentinel confirms it again"
+                        );
+                    }
+                    unavailable()
+                }
+                SilentSentinel::WritesFenced => {
+                    if !state.sentinel_silence_reported.swap(true, Ordering::SeqCst) {
+                        warn!(
+                            "The local Sentinel isn't answering and Redis is refusing writes (min-replicas-to-write); not advertising this node as the primary"
+                        );
+                    }
+                    unavailable()
+                }
+                SilentSentinel::NeverConfirmed | SilentSentinel::Disabled => {
+                    // Not an episode: nothing was confirmed to begin with
+                    // (Sentinel still booting, or the grace is off), so the
+                    // per-probe line is what it always was and the first
+                    // confirmation is not "answering again".
+                    warn!("sentinel unreachable — failing closed for /role");
+                    unavailable()
+                }
+            }
         }
+    }
+}
+
+/// What /role does about a Sentinel that is not answering. Pure, so the
+/// rule is unit-tested without a Sentinel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SilentSentinel {
+    /// Confirmed within the grace and Redis accepts writes: stay advertised.
+    KeepRouting,
+    /// The last confirmation is older than the grace.
+    GraceExpired,
+    /// Redis is refusing writes (or could not say): the fence is the fence.
+    WritesFenced,
+    /// Sentinel never confirmed this node since the wrapper started.
+    NeverConfirmed,
+    /// `ROLE_SENTINEL_GRACE_SECONDS=0`: fail closed at once, as before.
+    Disabled,
+}
+
+fn silent_sentinel_decision(
+    confirmed_ago: Option<Duration>,
+    grace: Duration,
+    accepts_writes: Option<bool>,
+) -> SilentSentinel {
+    if grace.is_zero() {
+        return SilentSentinel::Disabled;
+    }
+    let Some(ago) = confirmed_ago else {
+        return SilentSentinel::NeverConfirmed;
+    };
+    if ago > grace {
+        return SilentSentinel::GraceExpired;
+    }
+    match accepts_writes {
+        Some(true) => SilentSentinel::KeepRouting,
+        _ => SilentSentinel::WritesFenced,
     }
 }
 
@@ -317,16 +509,61 @@ async fn ping_redis(state: &AppState) -> bool {
     matches!(reply, Some(s) if s == "PONG")
 }
 
-/// Check (1): local Redis says role:master.
-async fn local_role_is_master(state: &AppState) -> bool {
+/// What `INFO replication` says about this node, read in one round trip.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ReplicationView {
+    is_master: bool,
+    connected_replicas: u32,
+    /// `min_slaves_good_slaves`: replicas acking within
+    /// `min-replicas-max-lag`. Redis prints it only while the
+    /// `min-replicas-to-write` fence is configured, hence optional.
+    good_replicas: Option<u32>,
+}
+
+fn parse_replication_info(info: &str) -> ReplicationView {
+    let mut view = ReplicationView::default();
+    for line in info.lines() {
+        let line = line.trim();
+        if let Some(role) = line.strip_prefix("role:") {
+            view.is_master = role.trim() == "master";
+        } else if let Some(n) = line.strip_prefix("connected_slaves:") {
+            view.connected_replicas = n.trim().parse().unwrap_or(0);
+        } else if let Some(n) = line.strip_prefix("min_slaves_good_slaves:") {
+            view.good_replicas = n.trim().parse().ok();
+        }
+    }
+    view
+}
+
+/// Whether Redis, by its own fence, is taking writes right now: the
+/// `min-replicas-to-write` threshold is off, or enough replicas are
+/// acking. A missing good-replica count with the fence on reads as fenced.
+fn redis_accepts_writes(view: &ReplicationView, min_replicas_to_write: u32) -> bool {
+    min_replicas_to_write == 0 || view.good_replicas.unwrap_or(0) >= min_replicas_to_write
+}
+
+async fn replication_view(state: &AppState) -> Option<ReplicationView> {
     let mut cmd = redis::cmd("INFO");
     cmd.arg("replication");
-    let Some(info) =
-        query_cached::<String>(&state.redis_conn, &state.redis_url, "Redis", cmd).await
-    else {
-        return false;
-    };
-    info.lines().any(|l| l.trim() == "role:master")
+    let info = query_cached::<String>(&state.redis_conn, &state.redis_url, "Redis", cmd).await?;
+    Some(parse_replication_info(&info))
+}
+
+/// Check (1): local Redis says role:master.
+async fn local_role_is_master(state: &AppState) -> bool {
+    replication_view(state).await.is_some_and(|view| view.is_master)
+}
+
+/// The configured `min-replicas-to-write`, `None` when Redis did not say.
+async fn min_replicas_to_write(state: &AppState) -> Option<u32> {
+    let mut cmd = redis::cmd("CONFIG");
+    cmd.arg("GET").arg("min-replicas-to-write");
+    let reply: Vec<String> =
+        query_cached(&state.redis_conn, &state.redis_url, "Redis", cmd).await?;
+    crate::sentinel_query::config_get_value(&reply)?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Whether Sentinel's `get-master-addr-by-name` answer names this node,
@@ -358,10 +595,19 @@ fn answer_confirms_self(
             .unwrap_or(false)
 }
 
-/// Check (2): Sentinel confirms this node is the current master.
-///
-/// Fails closed: if Sentinel is unreachable, returns false.
-async fn sentinel_confirms_master(state: &AppState, master_name: &str) -> bool {
+/// What the local Sentinel said when asked who the primary is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SentinelVerdict {
+    /// Its answer names this node.
+    ConfirmsSelf,
+    /// Its answer names another node (host:port as announced).
+    NamesOther(String),
+    /// No usable answer: unreachable, timed out, or a malformed reply.
+    NoAnswer,
+}
+
+/// Check (2): the local Sentinel's `get-master-addr-by-name`, classified.
+async fn sentinel_verdict(state: &AppState, master_name: &str) -> SentinelVerdict {
     // Returns a two-element bulk array: [host, port]
     let mut cmd = redis::cmd("SENTINEL");
     cmd.arg("get-master-addr-by-name").arg(master_name);
@@ -369,38 +615,36 @@ async fn sentinel_confirms_master(state: &AppState, master_name: &str) -> bool {
         query_cached::<Vec<String>>(&state.sentinel_conn, &state.sentinel_url, "Sentinel", cmd)
             .await
     else {
-        warn!("sentinel unreachable — failing closed for /role");
-        return false;
+        return SentinelVerdict::NoAnswer;
     };
-
     if parts.len() != 2 {
         warn!("unexpected sentinel response shape");
         *state.sentinel_conn.lock().await = None;
-        return false;
+        return SentinelVerdict::NoAnswer;
     }
-    let master_host = &parts[0];
-    let confirmed = answer_confirms_self(
-        master_host,
-        &parts[1],
-        &state.private_domain,
-        state.redis_port,
-    );
-    if !confirmed {
-        info!(
-            sentinel_master = %master_host,
-            this_node = %state.private_domain,
-            "sentinel says the primary is elsewhere — returning 503"
-        );
+    if answer_confirms_self(&parts[0], &parts[1], &state.private_domain, state.redis_port) {
+        SentinelVerdict::ConfirmsSelf
+    } else {
+        SentinelVerdict::NamesOther(format!("{}:{}", parts[0], parts[1]))
     }
-    confirmed
 }
 
+/// Check (2) as a bare bool, for callers that need the strict answer and
+/// nothing else (the switchover path). Fails closed: no answer is `false`.
+async fn sentinel_confirms_master(state: &AppState, master_name: &str) -> bool {
+    matches!(
+        sentinel_verdict(state, master_name).await,
+        SentinelVerdict::ConfirmsSelf
+    )
+}
+
+/// The strict dual check: local role:master AND Sentinel confirms it now.
+/// /role itself applies the silent-Sentinel grace on top; this is for the
+/// callers that must not (the switchover path).
 async fn is_sentinel_confirmed_master(state: &AppState) -> bool {
-    // Fast path: skip the Sentinel round-trip if local Redis already says replica.
     if !local_role_is_master(state).await {
         return false;
     }
-    // Sentinel confirmation is the actual fence.
     sentinel_confirms_master(state, &state.redis_master_name).await
 }
 
@@ -721,12 +965,21 @@ async fn run_health_server(
         sentinel_port,
         &local_sentinel_password,
     );
+    let sentinel_grace = Duration::from_secs(u64::env_parse(
+        "ROLE_SENTINEL_GRACE_SECONDS",
+        DEFAULT_ROLE_SENTINEL_GRACE_SECONDS,
+    ));
+    info!(
+        grace_secs = sentinel_grace.as_secs(),
+        "/role keeps a confirmed primary advertised through a silent Sentinel for up to this long"
+    );
     let state = AppState::new(
         redis_url,
         sentinel_url,
         private_domain,
         redis_master_name,
         redis_port,
+        sentinel_grace,
     );
 
     // The credential gate is a route layer on the mutating route alone:
@@ -1045,5 +1298,110 @@ mod priority_from_config_get_tests {
     fn key_only_reply_falls_back_to_redis_default() {
         let reply = vec!["replica-priority".to_string()];
         assert_eq!(priority_from_config_get(&reply), DEFAULT_REPLICA_PRIORITY);
+    }
+}
+
+#[cfg(test)]
+mod replication_view_tests {
+    use super::*;
+
+    #[test]
+    fn reads_a_fenced_master_with_its_acking_replicas() {
+        let info = "# Replication\r\nrole:master\r\nconnected_slaves:2\r\nmin_slaves_good_slaves:1\r\nslave0:ip=redis-2,port=6379,state=online,offset=10,lag=1\r\nmaster_failover_state:no-failover\r\n";
+        assert_eq!(
+            parse_replication_info(info),
+            ReplicationView {
+                is_master: true,
+                connected_replicas: 2,
+                good_replicas: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn a_replica_is_never_a_master_and_carries_no_fence_count() {
+        let info =
+            "role:slave\r\nmaster_host:redis-1\r\nmaster_link_status:up\r\nconnected_slaves:0\r\n";
+        let view = parse_replication_info(info);
+        assert!(!view.is_master);
+        assert_eq!(view.connected_replicas, 0);
+        assert_eq!(view.good_replicas, None);
+    }
+
+    #[test]
+    fn accepts_writes_follows_the_fence() {
+        let fenced_open = ReplicationView {
+            is_master: true,
+            connected_replicas: 2,
+            good_replicas: Some(2),
+        };
+        assert!(redis_accepts_writes(&fenced_open, 1));
+        assert!(redis_accepts_writes(&fenced_open, 2));
+        assert!(!redis_accepts_writes(&fenced_open, 3));
+        // Fence off: writes flow regardless of replicas.
+        let lonely = ReplicationView {
+            is_master: true,
+            connected_replicas: 0,
+            good_replicas: None,
+        };
+        assert!(redis_accepts_writes(&lonely, 0));
+        // Fence on but Redis printed no good-replica count: read as fenced.
+        assert!(!redis_accepts_writes(&lonely, 1));
+    }
+}
+
+#[cfg(test)]
+mod silent_sentinel_tests {
+    use super::*;
+
+    const GRACE: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn a_recent_confirmation_with_open_writes_keeps_routing() {
+        assert_eq!(
+            silent_sentinel_decision(Some(Duration::from_secs(5)), GRACE, Some(true)),
+            SilentSentinel::KeepRouting
+        );
+        // Right at the boundary still counts.
+        assert_eq!(
+            silent_sentinel_decision(Some(GRACE), GRACE, Some(true)),
+            SilentSentinel::KeepRouting
+        );
+    }
+
+    #[test]
+    fn past_the_grace_it_fails_closed_even_with_open_writes() {
+        assert_eq!(
+            silent_sentinel_decision(Some(Duration::from_secs(61)), GRACE, Some(true)),
+            SilentSentinel::GraceExpired
+        );
+    }
+
+    #[test]
+    fn a_closed_or_unknown_fence_fails_closed_inside_the_grace() {
+        assert_eq!(
+            silent_sentinel_decision(Some(Duration::from_secs(5)), GRACE, Some(false)),
+            SilentSentinel::WritesFenced
+        );
+        assert_eq!(
+            silent_sentinel_decision(Some(Duration::from_secs(5)), GRACE, None),
+            SilentSentinel::WritesFenced
+        );
+    }
+
+    #[test]
+    fn no_confirmation_on_record_never_keeps_routing() {
+        assert_eq!(
+            silent_sentinel_decision(None, GRACE, Some(true)),
+            SilentSentinel::NeverConfirmed
+        );
+    }
+
+    #[test]
+    fn zero_grace_is_the_old_fail_closed_behavior() {
+        assert_eq!(
+            silent_sentinel_decision(Some(Duration::from_secs(1)), Duration::ZERO, Some(true)),
+            SilentSentinel::Disabled
+        );
     }
 }
