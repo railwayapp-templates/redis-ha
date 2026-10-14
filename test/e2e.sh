@@ -3567,6 +3567,180 @@ t_never_synced_replica_is_not_promotable() {
 }
 
 # ----- runner ------------------------------------------------------------------
+# ----- /role through a silent Sentinel ---------------------------------------
+
+sentinel_pid() { # sentinel_pid NODE  ->  pid of the colocated redis-sentinel
+  # Matched on the process title redis sets for itself (`redis-server
+  # *:26379 [sentinel]`), not on the spawn arguments: redis rewrites its
+  # cmdline at startup, and a substring match on the arguments found the
+  # scanning shell (whose own cmdline carries the pattern), not Sentinel.
+  docker exec "$1" sh -c 'for p in /proc/[0-9]*; do
+    c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null)
+    case "$c" in redis-server*"[sentinel]"*) basename "$p"; break ;; esac
+  done'
+}
+
+process_state() { # process_state NODE PID  ->  the state letter from /proc/PID/stat (T = stopped)
+  # The state is the first field AFTER the parenthesised comm, which for a
+  # redis process is its rewritten title ("redis-server *:") — spaces and
+  # all — so a naive third-field read lands inside the name.
+  docker exec "$1" sh -c "sed 's/.*) //' /proc/$2/stat | cut -d' ' -f1" 2>/dev/null
+}
+
+# `kill` is a shell builtin in the redis image (no procps), so it has to run
+# inside `sh -c` — `docker exec NODE kill` finds no such executable.
+stop_sentinel() { # stop_sentinel NODE PID  ->  SIGSTOP, verified
+  docker exec "$1" sh -c "kill -STOP $2" && [ "$(process_state "$1" "$2")" = "T" ]
+}
+
+resume_sentinel() { # resume_sentinel NODE PID
+  docker exec "$1" sh -c "kill -CONT $2"
+}
+
+# The colocated Sentinel freezing is not a demotion. SIGSTOP is the exact
+# shape of the production stall (a main thread stuck in a DNS lookup, then
+# TILT): the process is alive, every command to it hangs, Redis is serving.
+# Before: /role 503 within 2s, the edge pulled the primary and reset every
+# client. Now: the node stays advertised (body says the Sentinel is
+# unreachable), the edge keeps its sessions, the writer through the edge
+# never pauses, and the moment the Sentinel is resumed the plain answer is
+# back — one warn line at the start of the episode, one info line at the end.
+t_role_keeps_primary_routable_while_sentinel_is_silent() {
+  local t=t_role_keeps_primary_routable_while_sentinel_is_silent
+  if ! docker image inspect "$EDGE_IMAGE" >/dev/null 2>&1; then
+    log "building ${EDGE_IMAGE}"
+    docker build -q -f "${REPO_ROOT}/haproxy/Dockerfile" -t "$EDGE_IMAGE" "$REPO_ROOT" >/dev/null || {
+      ko "$t" "edge image build failed"; return;
+    }
+  fi
+  start_ha_trio silent \
+    || { ko "$t" "trio never reached failover-ready state" silent-1 silent-2 silent-3; return; }
+  docker run -d --name silent-edge --label "$LABEL" --network "$NET" \
+    --network-alias silent-edge --hostname silent-edge \
+    -e REDIS_NODES="silent-1:6379,silent-2:6379,silent-3:6379" \
+    "$EDGE_IMAGE" >/dev/null
+  local i
+  for i in $(seq 1 60); do
+    docker exec -e PW="$PW" silent-edge sh -c \
+      'redis-cli -a "$PW" -h 127.0.0.1 SET edgeprobe ok 2>/dev/null' | grep -q OK && break
+    sleep 1
+  done
+  start_seq_writer silent-writer silent-edge
+  wait_for_new_ack silent-writer 0 60 \
+    || { ko "$t" "writer never got an ack through the edge" silent-edge silent-writer; return; }
+  [ "$(role_payload silent-1)" = '{"role":"master"}' ] \
+    || { ko "$t" "primary's /role is not the plain confirmed answer before the stall: $(role_payload silent-1)" silent-1; return; }
+
+  local pid down_before code body again_before
+  pid=$(sentinel_pid silent-1)
+  [ -n "$pid" ] || { ko "$t" "could not find the colocated Sentinel's pid" silent-1; return; }
+  down_before=$(docker logs silent-edge 2>&1 | grep -ac 'is DOWN')
+  again_before=$(docker logs silent-1 2>&1 | grep -ac "The local Sentinel is answering again")
+  [ "$again_before" = "0" ] \
+    || { ko "$t" "an 'answering again' line was logged before any episode (boot-time probes must not count as one)" silent-1; return; }
+  stop_sentinel silent-1 "$pid" \
+    || { ko "$t" "SIGSTOP did not leave the Sentinel (pid ${pid}) in the stopped state — the stall was never induced" silent-1; return; }
+  for i in $(seq 1 10); do
+    code=$(health_http_code silent-1 GET /role)
+    if [ "$code" != "200" ]; then
+      resume_sentinel silent-1 "$pid"
+      ko "$t" "/role answered ${code:-nothing} $((i * 2))s into the Sentinel stall" silent-1 silent-edge
+      return
+    fi
+    sleep 2
+  done
+  body=$(role_payload silent-1)
+  if ! echo "$body" | grep -q '"sentinel":"unreachable"'; then
+    resume_sentinel silent-1 "$pid"
+    ko "$t" "/role did not say the Sentinel is unreachable during the stall: ${body}" silent-1
+    return
+  fi
+  if [ "$(docker logs silent-edge 2>&1 | grep -ac 'is DOWN')" != "$down_before" ]; then
+    resume_sentinel silent-1 "$pid"
+    ko "$t" "the edge marked the primary DOWN during the Sentinel stall" silent-edge silent-1
+    return
+  fi
+  local pre_count
+  pre_count=$(acked_count silent-writer)
+  if ! wait_for_new_ack silent-writer "$pre_count" 15; then
+    resume_sentinel silent-1 "$pid"
+    ko "$t" "writes through the edge stopped during the Sentinel stall" silent-edge silent-writer silent-1
+    return
+  fi
+  if [ "$(docker logs silent-1 2>&1 | grep -ac "The local Sentinel isn't answering")" != "1" ]; then
+    resume_sentinel silent-1 "$pid"
+    ko "$t" "expected exactly one 'Sentinel isn't answering' line, got $(docker logs silent-1 2>&1 | grep -ac "The local Sentinel isn't answering")" silent-1
+    return
+  fi
+  resume_sentinel silent-1 "$pid"
+  for i in $(seq 1 30); do
+    [ "$(docker logs silent-1 2>&1 | grep -ac "The local Sentinel is answering again")" = "1" ] && break
+    sleep 1
+  done
+  [ "$(docker logs silent-1 2>&1 | grep -ac "The local Sentinel is answering again")" = "1" ] \
+    || { ko "$t" "the end of the episode was never logged exactly once" silent-1; return; }
+  for i in $(seq 1 15); do
+    [ "$(role_payload silent-1)" = '{"role":"master"}' ] && break
+    sleep 1
+  done
+  [ "$(role_payload silent-1)" = '{"role":"master"}' ] \
+    || { ko "$t" "/role did not return to the plain confirmed answer after the Sentinel resumed: $(role_payload silent-1)" silent-1; return; }
+  docker rm -f silent-1 silent-2 silent-3 silent-edge silent-writer >/dev/null 2>&1
+  ok "$t"
+}
+
+# The grace is a window, not a bypass. With it shortened, a Sentinel stalled
+# past it takes the node off the edge (503, body naming the Sentinel) with
+# one warn line, and the node comes back the moment the Sentinel confirms it
+# again.
+t_role_fails_closed_once_the_sentinel_grace_expires() {
+  local t=t_role_fails_closed_once_the_sentinel_grace_expires
+  start_ha_trio grace -e ROLE_SENTINEL_GRACE_SECONDS=10 \
+    || { ko "$t" "trio never reached failover-ready state" grace-1 grace-2 grace-3; return; }
+  [ "$(role_payload grace-1)" = '{"role":"master"}' ] \
+    || { ko "$t" "primary's /role is not the plain confirmed answer before the stall" grace-1; return; }
+  local pid code i
+  pid=$(sentinel_pid grace-1)
+  [ -n "$pid" ] || { ko "$t" "could not find the colocated Sentinel's pid" grace-1; return; }
+  stop_sentinel grace-1 "$pid" \
+    || { ko "$t" "SIGSTOP did not leave the Sentinel (pid ${pid}) in the stopped state — the stall was never induced" grace-1; return; }
+  sleep 3
+  code=$(health_http_code grace-1 GET /role)
+  if [ "$code" != "200" ]; then
+    resume_sentinel grace-1 "$pid"
+    ko "$t" "/role answered ${code:-nothing} 3s into the stall, inside the 10s grace" grace-1
+    return
+  fi
+  for i in $(seq 1 25); do
+    [ "$(health_http_code grace-1 GET /role)" = "503" ] && break
+    sleep 1
+  done
+  if [ "$(health_http_code grace-1 GET /role)" != "503" ]; then
+    resume_sentinel grace-1 "$pid"
+    ko "$t" "/role never failed closed after the 10s grace" grace-1
+    return
+  fi
+  if ! role_payload grace-1 | grep -q 'sentinel unreachable'; then
+    resume_sentinel grace-1 "$pid"
+    ko "$t" "the expired answer does not name the Sentinel: $(role_payload grace-1)" grace-1
+    return
+  fi
+  if ! wait_for_log_line grace-1 'past the 10s grace' 5; then
+    resume_sentinel grace-1 "$pid"
+    ko "$t" "the grace expiry was never logged" grace-1
+    return
+  fi
+  resume_sentinel grace-1 "$pid"
+  for i in $(seq 1 20); do
+    [ "$(role_payload grace-1)" = '{"role":"master"}' ] && break
+    sleep 1
+  done
+  [ "$(role_payload grace-1)" = '{"role":"master"}' ] \
+    || { ko "$t" "/role did not recover after the Sentinel resumed: $(role_payload grace-1)" grace-1; return; }
+  docker rm -f grace-1 grace-2 grace-3 >/dev/null 2>&1
+  ok "$t"
+}
+
 ALL_TESTS=(
   t_fresh_boot
   t_standalone_boot_accepts_writes
@@ -3593,6 +3767,8 @@ ALL_TESTS=(
   t_edge_client_writes_survive_failover
   t_switchover_promotes_requested_node
   t_health_api_auth_gates_switchover
+  t_role_keeps_primary_routable_while_sentinel_is_silent
+  t_role_fails_closed_once_the_sentinel_grace_expires
   t_sigterm_master_demotes_before_exit
   t_restart_old_master_rejoins_as_replica
   t_down_for_failover_master_boots_as_replica
