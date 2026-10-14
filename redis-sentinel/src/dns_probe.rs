@@ -99,13 +99,13 @@ pub async fn probe_name_detailed(name: &str, deadline: Duration) -> (NameVerdict
     }
 }
 
-fn read_resolv_conf() -> String {
+pub(crate) fn read_resolv_conf() -> String {
     std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default()
 }
 
 /// The first `nameserver` entry, port 53. `None` when there is none — a
 /// container with no resolver has no opinion on anything.
-fn first_nameserver(resolv_conf: &str) -> Option<SocketAddr> {
+pub(crate) fn first_nameserver(resolv_conf: &str) -> Option<SocketAddr> {
     resolv_conf
         .lines()
         .map(str::trim)
@@ -123,7 +123,7 @@ fn first_nameserver(resolv_conf: &str) -> Option<SocketAddr> {
 /// One UDP round-trip; `None` when no matching, well-formed reply arrived.
 async fn query_rcode(name: &str, nameserver: SocketAddr) -> Option<u8> {
     let query_id = query_id();
-    let packet = encode_query(query_id, name)?;
+    let packet = encode_query(query_id, name, QTYPE_AAAA)?;
 
     let bind_addr: SocketAddr = if nameserver.is_ipv6() {
         "[::]:0".parse().ok()?
@@ -146,7 +146,7 @@ async fn query_rcode(name: &str, nameserver: SocketAddr) -> Option<u8> {
 }
 
 /// Not cryptographic — the id only pairs a reply with its query.
-fn query_id() -> u16 {
+pub(crate) fn query_id() -> u16 {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
@@ -154,9 +154,14 @@ fn query_id() -> u16 {
     (nanos ^ (std::process::id() << 8)) as u16
 }
 
-/// A standard recursion-desired AAAA question. `None` when the name cannot
-/// be encoded (empty, label over 63 bytes, name over 255).
-fn encode_query(id: u16, name: &str) -> Option<Vec<u8>> {
+/// DNS record types this crate asks for.
+pub(crate) const QTYPE_A: u16 = 1;
+pub(crate) const QTYPE_AAAA: u16 = 28;
+
+/// A standard recursion-desired question of type `qtype`. `None` when the
+/// name cannot be encoded (empty, label over 63 bytes, name over 255).
+/// Shared with `peer_pins`, which asks for both address types.
+pub(crate) fn encode_query(id: u16, name: &str, qtype: u16) -> Option<Vec<u8>> {
     let name = name.strip_suffix('.').unwrap_or(name);
     if name.is_empty() || name.len() > 255 {
         return None;
@@ -176,7 +181,7 @@ fn encode_query(id: u16, name: &str) -> Option<Vec<u8>> {
         packet.extend_from_slice(label.as_bytes());
     }
     packet.push(0); // root label
-    packet.extend_from_slice(&[0x00, 0x1c]); // QTYPE AAAA
+    packet.extend_from_slice(&qtype.to_be_bytes()); // QTYPE
     packet.extend_from_slice(&[0x00, 0x01]); // QCLASS IN
     Some(packet)
 }
@@ -232,15 +237,15 @@ mod tests {
 
     #[test]
     fn encode_rejects_unencodable_names() {
-        assert!(encode_query(1, "").is_none());
-        assert!(encode_query(1, "a..b").is_none());
-        assert!(encode_query(1, &"x".repeat(64)).is_none());
-        assert!(encode_query(1, &"a.".repeat(200)).is_none());
+        assert!(encode_query(1, "", QTYPE_AAAA).is_none());
+        assert!(encode_query(1, "a..b", QTYPE_AAAA).is_none());
+        assert!(encode_query(1, &"x".repeat(64), QTYPE_AAAA).is_none());
+        assert!(encode_query(1, &"a.".repeat(200), QTYPE_AAAA).is_none());
     }
 
     #[test]
     fn encode_builds_a_wellformed_question() {
-        let packet = encode_query(0xBEEF, "redis-2.railway.internal.").unwrap();
+        let packet = encode_query(0xBEEF, "redis-2.railway.internal.", QTYPE_AAAA).unwrap();
         assert_eq!(&packet[0..2], &[0xBE, 0xEF]);
         assert_eq!(packet[2], 0x01); // RD
         assert_eq!(&packet[4..6], &[0x00, 0x01]); // one question
