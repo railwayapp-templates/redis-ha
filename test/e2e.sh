@@ -421,7 +421,17 @@ health_http() { # health_http NODE GET|POST PATH [extra wget args...]  ->  heade
 }
 
 health_http_code() { # health_http_code NODE GET|POST PATH [extra wget args...]  ->  final status code
-  health_http "$@" | sed -n 's/^ *HTTP\/1\.[01] \([0-9][0-9][0-9]\).*/\1/p' | tail -1
+  # An EMPTY result is never a verdict the server gave — it is the exec or
+  # the connection failing to happen at all (seen once on a loaded CI runner,
+  # with the node provably healthy in its dump) — so it is retried a couple
+  # of times; any actual status, 2xx or 5xx, is returned as is.
+  local i code
+  for i in 1 2 3; do
+    code=$(health_http "$@" | sed -n 's/^ *HTTP\/1\.[01] \([0-9][0-9][0-9]\).*/\1/p' | tail -1)
+    [ -n "$code" ] && { echo "$code"; return; }
+    sleep 1
+  done
+  echo "$code"
 }
 
 basic_auth_header() { # basic_auth_header USER PASSWORD  ->  "Authorization: Basic ..."
@@ -3741,6 +3751,313 @@ t_role_fails_closed_once_the_sentinel_grace_expires() {
   ok "$t"
 }
 
+# ----- peer pins ---------------------------------------------------------------
+
+hosts_pin() { # hosts_pin NODE PEER  ->  the address(es) pinned for PEER on NODE, one per line
+  docker exec "$1" awk -v n="$2" '$1 !~ /^#/ && $2 == n {print $1}' /etc/hosts 2>/dev/null
+}
+
+wait_for_hosts_pin() { # wait_for_hosts_pin NODE PEER ADDRESS [timeout]
+  local i
+  for i in $(seq 1 "${4:-30}"); do
+    hosts_pin "$1" "$2" | grep -qx "$3" && return 0
+    sleep 1
+  done
+  return 1
+}
+
+container_ip() { # container_ip NAME  ->  the container's address on the test network
+  docker inspect -f "{{(index .NetworkSettings.Networks \"${NET}\").IPAddress}}" "$1" 2>/dev/null
+}
+
+# An address on the test network that nothing answers from. Queries to it
+# die at ARP — no reply, ever — which is what a stalled resolver looks like
+# to glibc (5s timeout, retry, search list). A closed port would refuse
+# instantly and stall nothing, which is why the blackhole is not loopback.
+blackhole_resolver_ip() {
+  docker network inspect "$NET" -f '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null \
+    | awk -F'[./]' '{ if ($5 <= 16) print $1"."$2".254.254"; else print $1"."$2"."$3".254" }'
+}
+
+stall_resolver() { # stall_resolver NODE...   (keeps the original resolv.conf for restore_resolver)
+  local bh n
+  bh=$(blackhole_resolver_ip)
+  for n in "$@"; do
+    docker exec "$n" sh -c "cp /etc/resolv.conf /tmp/resolv.conf.orig && printf 'nameserver ${bh}\n' > /etc/resolv.conf"
+  done
+}
+
+restore_resolver() { # restore_resolver NODE...
+  local n
+  for n in "$@"; do
+    docker exec "$n" sh -c 'cat /tmp/resolv.conf.orig > /etc/resolv.conf' 2>/dev/null
+  done
+}
+
+log_count() { # log_count PATTERN NODE...  ->  matching lines across the nodes
+  local pat="$1" n total=0 c; shift
+  for n in "$@"; do
+    c=$(docker logs "$n" 2>&1 | grep -ac -- "$pat")
+    total=$((total + c))
+  done
+  echo "$total"
+}
+
+tilt_count() { log_count '+tilt' "$@"; } # tilt_count NODE...  ->  '+tilt' lines across the nodes
+
+# Sentinel's own signature of a lookup that went to the (dead) resolver:
+# against a blackhole every getaddrinfo ends in failure, so a Sentinel that
+# never logs this never blocked on DNS — whatever else happened to it.
+RESOLVE_FAILED='Failed to resolve hostname'
+resolve_failures() { log_count "$RESOLVE_FAILED" "$@"; } # resolve_failures NODE...
+
+# Sentinel resolves peer hostnames on its main thread with no deadline, so a
+# resolver that stops answering freezes it into TILT, the health server's
+# /role times out on it, and the edge pulls the primary and resets every
+# client — the 2026-10 Railway incident shape, with no Redis fault at all.
+# Control first: the same stall against nodes with the pins disabled must
+# make Sentinel block on the resolver (its `Failed to resolve hostname`
+# line, which against a blackhole every lookup ends in) and tilt, or the
+# run below would prove nothing. Then the real run: pinned nodes ride out
+# 45s of a dead resolver without a single resolver failure, /role 200 at
+# every poll, the edge never marking the primary down, the writer through
+# the edge never pausing, and the pins untouched when the resolver returns.
+# A tilt with no resolver failure beside it is not a DNS block: Sentinel
+# also tilts on a backward wall-clock step (`delta < 0`), and a Lima/Colima
+# VM's guest agent steps the clock by ~100ms every ~20s to resync with the
+# macOS host — every node tilting in the same second, stall or no stall,
+# traced to its `SyncTime` journal lines — so it is noted, not failed on.
+t_peer_pins_keep_sentinel_up_through_resolver_stall() {
+  local t=t_peer_pins_keep_sentinel_up_through_resolver_stall
+  if ! docker image inspect "$EDGE_IMAGE" >/dev/null 2>&1; then
+    log "building ${EDGE_IMAGE}"
+    docker build -q -f "${REPO_ROOT}/haproxy/Dockerfile" -t "$EDGE_IMAGE" "$REPO_ROOT" >/dev/null || {
+      ko "$t" "edge image build failed"; return;
+    }
+  fi
+
+  # --- control: pins off, the stall must tilt Sentinel ---
+  start_ha_trio ctl -e PEER_HOST_PINS_DISABLED=1 \
+    || { ko "$t" "control trio never reached failover-ready state" ctl-1 ctl-2 ctl-3; return; }
+  [ -z "$(hosts_pin ctl-1 ctl-2)" ] \
+    || { ko "$t" "a control node pinned a peer with the watcher disabled" ctl-1; return; }
+  [ "$(resolve_failures ctl-1 ctl-2 ctl-3)" = "0" ] \
+    || { ko "$t" "a control node already failed a lookup before the stall — the resolver is not healthy to begin with" ctl-1; return; }
+  stall_resolver ctl-1 ctl-2 ctl-3
+  if ! wait_for_log_line ctl-1 "$RESOLVE_FAILED" 90; then
+    restore_resolver ctl-1 ctl-2 ctl-3
+    ko "$t" "the stalled resolver never made an unpinned Sentinel block on a lookup — the scenario cannot prove anything" ctl-1
+    return
+  fi
+  if ! wait_for_log_line ctl-1 '+tilt' 30; then
+    restore_resolver ctl-1 ctl-2 ctl-3
+    ko "$t" "an unpinned Sentinel failed a lookup against the dead resolver but never tilted" ctl-1
+    return
+  fi
+  note "control: an unpinned Sentinel blocked on the stalled resolver and tilted, as expected"
+  restore_resolver ctl-1 ctl-2 ctl-3
+  docker rm -f ctl-1 ctl-2 ctl-3 >/dev/null 2>&1
+
+  # --- the real run ---
+  start_ha_trio pins \
+    || { ko "$t" "trio never reached failover-ready state" pins-1 pins-2 pins-3; return; }
+  local n peer
+  for n in pins-1 pins-2 pins-3; do
+    for peer in pins-1 pins-2 pins-3; do
+      wait_for_hosts_pin "$n" "$peer" "$(container_ip "$peer")" 30 \
+        || { ko "$t" "${n} never pinned ${peer} at its current address" "$n"; return; }
+    done
+  done
+  docker run -d --name pins-edge --label "$LABEL" --network "$NET" \
+    --network-alias pins-edge --hostname pins-edge \
+    -e REDIS_NODES="pins-1:6379,pins-2:6379,pins-3:6379" \
+    "$EDGE_IMAGE" >/dev/null
+  local i
+  for i in $(seq 1 60); do
+    docker exec -e PW="$PW" pins-edge sh -c \
+      'redis-cli -a "$PW" -h 127.0.0.1 SET edgeprobe ok 2>/dev/null' | grep -q OK && break
+    sleep 1
+  done
+  start_seq_writer pins-writer pins-edge
+  wait_for_new_ack pins-writer 0 60 \
+    || { ko "$t" "writer never got an ack through the edge" pins-edge pins-writer; return; }
+
+  local tilt_before down_before failed_before code
+  tilt_before=$(tilt_count pins-1 pins-2 pins-3)
+  failed_before=$(resolve_failures pins-1 pins-2 pins-3)
+  down_before=$(docker logs pins-edge 2>&1 | grep -ac 'is DOWN')
+  stall_resolver pins-1 pins-2 pins-3
+  for i in $(seq 1 22); do
+    code=$(health_http_code pins-1 GET /role)
+    if [ "$code" != "200" ]; then
+      restore_resolver pins-1 pins-2 pins-3
+      ko "$t" "/role on the primary answered ${code:-nothing} $((i * 2))s into the resolver stall" pins-1 pins-edge
+      return
+    fi
+    sleep 2
+  done
+  local tilt_after down_after failed_after pre_count
+  tilt_after=$(tilt_count pins-1 pins-2 pins-3)
+  failed_after=$(resolve_failures pins-1 pins-2 pins-3)
+  down_after=$(docker logs pins-edge 2>&1 | grep -ac 'is DOWN')
+  if [ "$failed_after" != "$failed_before" ]; then
+    restore_resolver pins-1 pins-2 pins-3
+    ko "$t" "a pinned Sentinel still went to the resolver for a peer ($((failed_after - failed_before)) failed lookups)" pins-1 pins-2 pins-3
+    return
+  fi
+  if [ "$tilt_after" != "$tilt_before" ]; then
+    note "$((tilt_after - tilt_before)) +tilt with no resolver failure beside it: a clock step or scheduling pause on this host, not a DNS block"
+  fi
+  if [ "$down_after" != "$down_before" ]; then
+    restore_resolver pins-1 pins-2 pins-3
+    ko "$t" "the edge marked the primary DOWN during the resolver stall" pins-edge pins-1
+    return
+  fi
+  pre_count=$(acked_count pins-writer)
+  if ! wait_for_new_ack pins-writer "$pre_count" 15; then
+    restore_resolver pins-1 pins-2 pins-3
+    ko "$t" "writes through the edge stopped during the resolver stall" pins-edge pins-writer pins-1
+    return
+  fi
+  if ! wait_for_log_line pins-1 'peer-pins: the resolver gave no answer' 10; then
+    restore_resolver pins-1 pins-2 pins-3
+    ko "$t" "the watcher never noticed the stalled resolver — was the stall real?" pins-1
+    return
+  fi
+  for peer in pins-2 pins-3; do
+    if [ "$(hosts_pin pins-1 "$peer")" != "$(container_ip "$peer")" ]; then
+      restore_resolver pins-1 pins-2 pins-3
+      ko "$t" "the pin for ${peer} did not survive the stall" pins-1
+      return
+    fi
+  done
+  restore_resolver pins-1 pins-2 pins-3
+  wait_for_log_line pins-1 'peer-pins: the resolver is answering' 30 \
+    || { ko "$t" "the watcher never saw the resolver come back" pins-1; return; }
+  docker rm -f pins-1 pins-2 pins-3 pins-edge pins-writer >/dev/null 2>&1
+  ok "$t"
+}
+
+# A pin must follow a peer to its new address, or it would be worse than
+# DNS. Docker hands a restarted container the lowest free address — usually
+# its old one — so a filler takes that address first and the replica comes
+# back on a different one. The master's pin for it must move within a few
+# refreshes, with nothing stale left beside it, and replication must resume
+# to the new address.
+t_peer_pins_follow_a_peer_to_its_new_address() {
+  local t=t_peer_pins_follow_a_peer_to_its_new_address
+  start_ha_trio pinip \
+    || { ko "$t" "trio never reached failover-ready state" pinip-1 pinip-2 pinip-3; return; }
+  local old_ip new_ip
+  old_ip=$(container_ip pinip-2)
+  wait_for_hosts_pin pinip-1 pinip-2 "$old_ip" 30 \
+    || { ko "$t" "master never pinned pinip-2 at ${old_ip}" pinip-1; return; }
+  docker rm -f pinip-2 >/dev/null 2>&1
+  docker run -d --name pinip-filler --label "$LABEL" --network "$NET" alpine:latest sleep 600 >/dev/null
+  start_node pinip-2 pinip-vol-2 /data \
+    -e SENTINEL_HOSTS="pinip-1:26379,pinip-2:26379,pinip-3:26379" -e REPLICA_OF=pinip-1:6379
+  new_ip=$(container_ip pinip-2)
+  [ -n "$new_ip" ] || { ko "$t" "restarted replica has no address" pinip-2; return; }
+  if [ "$new_ip" = "$old_ip" ]; then
+    note "docker reused ${old_ip} for the restarted replica; the address-change half of this scenario is vacuous here"
+  fi
+  wait_for_hosts_pin pinip-1 pinip-2 "$new_ip" 30 \
+    || { ko "$t" "master's pin for pinip-2 did not move to ${new_ip} (still: $(hosts_pin pinip-1 pinip-2 | tr '\n' ' '))" pinip-1 pinip-2; return; }
+  [ "$(hosts_pin pinip-1 pinip-2 | wc -l | tr -d ' ')" = "1" ] \
+    || { ko "$t" "a stale address was left beside the new pin: $(hosts_pin pinip-1 pinip-2 | tr '\n' ' ')" pinip-1; return; }
+  wait_for_link_status pinip-2 up 60 \
+    || { ko "$t" "restarted replica never re-established its replication link" pinip-1 pinip-2; return; }
+  write_key pinip-1 after-move yes \
+    || { ko "$t" "master refused a write after the replica moved" pinip-1; return; }
+  wait_for_key pinip-2 after-move yes 30 \
+    || { ko "$t" "write never reached the replica at its new address" pinip-1 pinip-2; return; }
+  wait_for_sentinel_slave_view pinip-1 2 60 \
+    || { ko "$t" "master's Sentinel never saw both replicas live again" pinip-1 pinip-2; return; }
+  docker rm -f pinip-1 pinip-2 pinip-3 pinip-filler >/dev/null 2>&1
+  ok "$t"
+}
+
+# A tiny resolver for the expiry scenario: answers A for the names in KNOWN
+# ("name=ip,..."), NODATA for their other record types, and NXDOMAIN for any
+# other name. Docker's embedded DNS forwards an unknown name to the host's
+# upstream, and what THAT answers (NXDOMAIN, SERVFAIL, nothing within the
+# deadline) depends on the machine — on a CI runner it stayed silent, which
+# the watcher correctly reads as "hold", not "gone". The verdict under test
+# has to come from a resolver the scenario controls.
+start_stub_resolver() { # start_stub_resolver NAME KNOWN  ->  the stub's address
+  docker run -d --name "$1" --label "$LABEL" --network "$NET" -e KNOWN="$2" python:3-alpine python3 -c '
+import os, socket
+known = {}
+for kv in os.environ.get("KNOWN", "").split(","):
+    if "=" in kv:
+        n, ip = kv.split("=", 1); known[n.lower()] = ip
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("0.0.0.0", 53))
+while True:
+    data, addr = s.recvfrom(512)
+    if len(data) < 12: continue
+    i, labels = 12, []
+    while i < len(data) and data[i]:
+        l = data[i]; labels.append(data[i+1:i+1+l].decode("ascii", "replace")); i += 1 + l
+    i += 1; qtype = int.from_bytes(data[i:i+2], "big"); qend = i + 4
+    ip = known.get(".".join(labels).lower())
+    if ip is None:
+        resp = data[:2] + b"\x81\x83" + b"\x00\x01\x00\x00\x00\x00\x00\x00" + data[12:qend]
+    elif qtype == 1:
+        ans = b"\xc0\x0c\x00\x01\x00\x01" + (30).to_bytes(4, "big") + b"\x00\x04" + socket.inet_aton(ip)
+        resp = data[:2] + b"\x81\x80" + b"\x00\x01\x00\x01\x00\x00\x00\x00" + data[12:qend] + ans
+    else:
+        resp = data[:2] + b"\x81\x80" + b"\x00\x01\x00\x00\x00\x00\x00\x00" + data[12:qend]
+    s.sendto(resp, addr)
+' >/dev/null || return 1
+  local i ip
+  for i in $(seq 1 30); do
+    ip=$(container_ip "$1")
+    [ -n "$ip" ] && docker exec "$1" sh -c 'nc -z -u 127.0.0.1 53' 2>/dev/null && { echo "$ip"; return 0; }
+    sleep 1
+  done
+  echo "$ip"
+}
+
+# The other half of "a pin is a cache": a peer that is gone for good stops
+# being pinned. With the expiry shortened, the master is pointed at a
+# resolver that answers NXDOMAIN for the removed replica's name (and keeps
+# answering the others); it holds the last address for the expiry window
+# and then drops the pin, so the name goes back to plain DNS instead of
+# pointing at an address someone else may be given.
+t_peer_pins_drop_a_removed_peer_after_expiry() {
+  local t=t_peer_pins_drop_a_removed_peer_after_expiry
+  start_ha_trio pinexp -e PEER_HOST_PINS_ABSENT_EXPIRY_SECONDS=12 \
+    || { ko "$t" "trio never reached failover-ready state" pinexp-1 pinexp-2 pinexp-3; return; }
+  local ip3 stub
+  ip3=$(container_ip pinexp-3)
+  wait_for_hosts_pin pinexp-1 pinexp-3 "$ip3" 30 \
+    || { ko "$t" "master never pinned pinexp-3" pinexp-1; return; }
+  stub=$(start_stub_resolver pinexp-dns "pinexp-1=$(container_ip pinexp-1),pinexp-2=$(container_ip pinexp-2)")
+  [ -n "$stub" ] || { ko "$t" "stub resolver never came up" pinexp-dns; return; }
+  docker exec pinexp-1 sh -c "cp /etc/resolv.conf /tmp/resolv.conf.orig && printf 'nameserver ${stub}\n' > /etc/resolv.conf"
+  docker rm -f pinexp-3 >/dev/null 2>&1
+  wait_for_log_line pinexp-1 'peer-pins: pinexp-3 has no address right now' 30 \
+    || { ko "$t" "master never noticed pinexp-3 lost its address" pinexp-1; return; }
+  # Still held inside the window.
+  [ "$(hosts_pin pinexp-1 pinexp-3)" = "$ip3" ] \
+    || { ko "$t" "the pin was dropped before the expiry" pinexp-1; return; }
+  wait_for_log_line pinexp-1 'peer-pins: pinexp-3 has had no address for' 40 \
+    || { ko "$t" "the pin for the removed peer was never dropped" pinexp-1; return; }
+  local i
+  for i in $(seq 1 10); do
+    [ -z "$(hosts_pin pinexp-1 pinexp-3)" ] && break
+    sleep 1
+  done
+  [ -z "$(hosts_pin pinexp-1 pinexp-3)" ] \
+    || { ko "$t" "the dropped pin is still in /etc/hosts" pinexp-1; return; }
+  # The surviving peer is untouched by the drop.
+  [ "$(hosts_pin pinexp-1 pinexp-2)" = "$(container_ip pinexp-2)" ] \
+    || { ko "$t" "dropping one pin disturbed another" pinexp-1; return; }
+  restore_resolver pinexp-1
+  docker rm -f pinexp-1 pinexp-2 pinexp-dns >/dev/null 2>&1
+  ok "$t"
+}
+
 ALL_TESTS=(
   t_fresh_boot
   t_standalone_boot_accepts_writes
@@ -3784,6 +4101,9 @@ ALL_TESTS=(
   t_scale_down_prunes_dead_sentinels
   t_deleted_majority_unfences_via_nxdomain
   t_paused_majority_keeps_the_fence
+  t_peer_pins_keep_sentinel_up_through_resolver_stall
+  t_peer_pins_follow_a_peer_to_its_new_address
+  t_peer_pins_drop_a_removed_peer_after_expiry
   t_scaled_member_master_is_preserved_at_boot
   t_foreign_host_reusing_member_name_is_quarantined
   t_wiped_master_volume_does_not_wipe_cluster

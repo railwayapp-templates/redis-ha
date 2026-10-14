@@ -7,6 +7,7 @@ pub mod ghost_master;
 pub mod health_auth;
 pub mod health_server;
 pub mod link_heal;
+pub mod peer_pins;
 pub mod process_manager;
 pub mod quorum;
 pub mod rdb_owner;

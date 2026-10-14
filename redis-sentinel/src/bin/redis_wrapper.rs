@@ -21,7 +21,7 @@ use redis_sentinel::{
     },
     config::{data_dir_is_on_volume, Config},
     demote_on_shutdown::DemoteTarget,
-    ghost_master, health_server, link_heal,
+    ghost_master, health_server, link_heal, peer_pins,
     process_manager::{enable_aof_after_rdb_load, spawn_redis, spawn_sentinel, supervise},
     quorum, rdb_owner,
     redis_conf::{
@@ -400,6 +400,35 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Pin every peer's address in /etc/hosts BEFORE Sentinel starts, so
+    // even its first lookups come from the file: Sentinel resolves peer
+    // hostnames on its main thread with no deadline, and one stalled
+    // resolver query freezes it into TILT and pulls this node from the edge
+    // — see `peer_pins` for the mechanism and the refresh rules that keep a
+    // pin from outliving a peer's address.
+    let peer_pin_state = if config.sentinel_enabled {
+        let replication_source = match &boot_master {
+            BootMaster::ReplicaOf(host, _) => host.clone(),
+            _ => String::new(),
+        };
+        let extra_hosts = [config.replica_of.as_str(), replication_source.as_str()];
+        let settings = peer_pins::Settings::from_env(
+            &config.sentinel_hosts,
+            &config.private_domain,
+            &extra_hosts,
+            Some(redis_sentinel::sentinel_query::build_redis_url(
+                "127.0.0.1",
+                config.sentinel_port,
+                &local_sentinel_password,
+            )),
+            &config.redis_master_name,
+        );
+        let pins = peer_pins::prime(&settings).await;
+        Some((settings, pins))
+    } else {
+        None
+    };
+
     // Spawn Sentinel (colocated)
     let sentinel_proc = if config.sentinel_enabled {
         if rotated_at_boot {
@@ -410,6 +439,13 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // Keep the pins current from here on: new addresses after a peer's
+    // redeploy, members a scale-up adds, pins dropped once a removed peer
+    // has stayed without an address past the expiry.
+    if let Some((settings, pins)) = peer_pin_state {
+        peer_pins::spawn(settings, pins);
+    }
 
     // How an in-process watcher asks `supervise` for a restart through the
     // boot path (currently only the ghost-master watcher sends on it).
