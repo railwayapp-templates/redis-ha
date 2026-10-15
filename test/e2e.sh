@@ -403,7 +403,7 @@ wait_for_role_master() { # wait_for_role_master NODE [timeout]
   local i
   for i in $(seq 1 "${2:-90}"); do
     docker exec "$1" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
-      | grep -q '"role":"master"' && return 0
+      | grep -q '"role":"primary"' && return 0
     sleep 1
   done
   return 1
@@ -548,7 +548,7 @@ promote_by_pausing() { # promote_by_pausing MASTER CANDIDATE...
   for i in $(seq 1 180); do
     for n in "$@"; do
       docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
-        | grep -q '"role":"master"' && { echo "$n"; return 0; }
+        | grep -q '"role":"primary"' && { echo "$n"; return 0; }
     done
     sleep 1
   done
@@ -1334,7 +1334,7 @@ t_sentinel_failover() {
   for i in $(seq 1 180); do
     for n in ha-2 ha-3; do
       docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
-        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+        | grep -q '"role":"primary"' && { promoted="$n"; break 2; }
     done
     sleep 1
   done
@@ -1530,7 +1530,7 @@ t_health_api_auth_gates_switchover() {
     || { ko "$t" "cluster never became ready" hapi-1 hapi-2 hapi-3; return; }
 
   # The probes never ask for a credential: 200 for /health everywhere, and
-  # /role answers its verdict (200 master / 503 replica), never 401.
+  # /role answers its verdict (200 primary / 503 replica), never 401.
   local n code
   for n in hapi-1 hapi-2 hapi-3; do
     code=$(health_http_code "$n" GET /health)
@@ -1690,7 +1690,7 @@ t_sigterm_master_demotes_before_exit() {
   for i in $(seq 1 15); do
     for n in demote-2 demote-3; do
       docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
-        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+        | grep -q '"role":"primary"' && { promoted="$n"; break 2; }
     done
     sleep 1
   done
@@ -1839,7 +1839,7 @@ t_down_for_failover_master_boots_as_replica() {
   for i in $(seq 1 180); do
     for n in stale-2 stale-3; do
       docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
-        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+        | grep -q '"role":"primary"' && { promoted="$n"; break 2; }
     done
     sleep 1
   done
@@ -2093,7 +2093,7 @@ t_link_heal_recovers_from_partition_during_failover() {
   for i in $(seq 1 180); do
     for n in part-2 part-3 part-4; do
       docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
-        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+        | grep -q '"role":"primary"' && { promoted="$n"; break 2; }
     done
     sleep 1
   done
@@ -3126,7 +3126,7 @@ t_wiped_master_volume_does_not_wipe_cluster() {
   for i in $(seq 1 180); do
     for n in wipe-2 wipe-3; do
       docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
-        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+        | grep -q '"role":"primary"' && { promoted="$n"; break 2; }
     done
     sleep 1
   done
@@ -3216,7 +3216,7 @@ t_wiped_dataset_with_surviving_conf_does_not_wipe_cluster() {
   for i in $(seq 1 180); do
     for n in dwipe-2 dwipe-3; do
       docker exec "$n" sh -c 'wget -qO- http://127.0.0.1:8080/role' 2>/dev/null \
-        | grep -q '"role":"master"' && { promoted="$n"; break 2; }
+        | grep -q '"role":"primary"' && { promoted="$n"; break 2; }
     done
     sleep 1
   done
@@ -3553,6 +3553,9 @@ t_never_synced_replica_is_not_promotable() {
     payload=$(role_payload "$n")
     printf '%s' "$payload" | grep -F '"promotable":true' >/dev/null \
       || { ko "$t" "synced $n /role did not report promotable:true (got '${payload}')" "$n"; return; }
+    printf '%s' "$payload" | grep -F '"state":"connected"' >/dev/null \
+      && printf '%s' "$payload" | grep -F '"ready":true' >/dev/null \
+      || { ko "$t" "synced $n /role did not report state:connected, ready:true (got '${payload}')" "$n"; return; }
     docker exec "$n" test ! -e /data/.sync_gate_pending \
       || { ko "$t" "$n still carries the pending marker after its lift" "$n"; return; }
   done
@@ -3638,7 +3641,7 @@ t_role_keeps_primary_routable_while_sentinel_is_silent() {
   start_seq_writer silent-writer silent-edge
   wait_for_new_ack silent-writer 0 60 \
     || { ko "$t" "writer never got an ack through the edge" silent-edge silent-writer; return; }
-  [ "$(role_payload silent-1)" = '{"role":"master"}' ] \
+  [ "$(role_payload silent-1)" = '{"role":"primary"}' ] \
     || { ko "$t" "primary's /role is not the plain confirmed answer before the stall: $(role_payload silent-1)" silent-1; return; }
 
   local pid down_before code body again_before
@@ -3690,10 +3693,10 @@ t_role_keeps_primary_routable_while_sentinel_is_silent() {
   [ "$(docker logs silent-1 2>&1 | grep -ac "The local Sentinel is answering again")" = "1" ] \
     || { ko "$t" "the end of the episode was never logged exactly once" silent-1; return; }
   for i in $(seq 1 15); do
-    [ "$(role_payload silent-1)" = '{"role":"master"}' ] && break
+    [ "$(role_payload silent-1)" = '{"role":"primary"}' ] && break
     sleep 1
   done
-  [ "$(role_payload silent-1)" = '{"role":"master"}' ] \
+  [ "$(role_payload silent-1)" = '{"role":"primary"}' ] \
     || { ko "$t" "/role did not return to the plain confirmed answer after the Sentinel resumed: $(role_payload silent-1)" silent-1; return; }
   docker rm -f silent-1 silent-2 silent-3 silent-edge silent-writer >/dev/null 2>&1
   ok "$t"
@@ -3707,7 +3710,7 @@ t_role_fails_closed_once_the_sentinel_grace_expires() {
   local t=t_role_fails_closed_once_the_sentinel_grace_expires
   start_ha_trio grace -e ROLE_SENTINEL_GRACE_SECONDS=10 \
     || { ko "$t" "trio never reached failover-ready state" grace-1 grace-2 grace-3; return; }
-  [ "$(role_payload grace-1)" = '{"role":"master"}' ] \
+  [ "$(role_payload grace-1)" = '{"role":"primary"}' ] \
     || { ko "$t" "primary's /role is not the plain confirmed answer before the stall" grace-1; return; }
   local pid code i
   pid=$(sentinel_pid grace-1)
@@ -3742,10 +3745,10 @@ t_role_fails_closed_once_the_sentinel_grace_expires() {
   fi
   resume_sentinel grace-1 "$pid"
   for i in $(seq 1 20); do
-    [ "$(role_payload grace-1)" = '{"role":"master"}' ] && break
+    [ "$(role_payload grace-1)" = '{"role":"primary"}' ] && break
     sleep 1
   done
-  [ "$(role_payload grace-1)" = '{"role":"master"}' ] \
+  [ "$(role_payload grace-1)" = '{"role":"primary"}' ] \
     || { ko "$t" "/role did not recover after the Sentinel resumed: $(role_payload grace-1)" grace-1; return; }
   docker rm -f grace-1 grace-2 grace-3 >/dev/null 2>&1
   ok "$t"
