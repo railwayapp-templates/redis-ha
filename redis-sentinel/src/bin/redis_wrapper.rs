@@ -477,6 +477,17 @@ async fn main() -> Result<()> {
             config.private_domain.clone(),
             local_sentinel_password.clone(),
         );
+        // Keep Sentinel's inbound password, outbound `sentinel-pass` and the
+        // master's `auth-pass` equal to the pinned data password, so a
+        // runtime SET lost to a restart or overwritten by a stale writer
+        // converges here instead of stranding a rotation in VERIFY.
+        redis_sentinel::credential_reconcile::spawn(
+            config.data_dir.clone(),
+            config.sentinel_port,
+            config.redis_master_name.clone(),
+            config.redis_password.clone(),
+            local_sentinel_requires_auth,
+        );
         // Runtime cure for a ghost-mastered cluster: when quorum consensus
         // durably names a master that is not a live member and no node holds
         // the master role, restart through the boot path so the boot-time
