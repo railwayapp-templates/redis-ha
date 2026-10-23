@@ -257,7 +257,7 @@ fn parse_requirepass(conf: &str) -> Option<String> {
 /// Inverse of [`quote_conf_value`]: strips the surrounding quotes and the
 /// `\\`/`\"` escapes. An unquoted value (a hand-edited conf) passes through
 /// as-is.
-fn unquote_conf_value(value: &str) -> String {
+pub(crate) fn unquote_conf_value(value: &str) -> String {
     let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) else {
         return value.to_string();
     };

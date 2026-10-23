@@ -18,4 +18,5 @@ pub mod sentinel_query;
 pub mod sync_gate;
 pub mod volume_lock;
 
+pub mod credential_reconcile;
 pub mod credentials;

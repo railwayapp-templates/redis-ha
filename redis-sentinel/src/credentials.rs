@@ -18,8 +18,9 @@ use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, Notify};
+use tracing::warn;
 
-static ROTATION: Mutex<()> = Mutex::const_new(());
+pub(crate) static ROTATION: Mutex<()> = Mutex::const_new(());
 pub static RESTART_SENTINEL: Notify = Notify::const_new();
 
 #[derive(Deserialize, Serialize)]
@@ -37,6 +38,25 @@ enum Operation {
     Database,
     Member,
     Verify,
+}
+impl Operation {
+    fn name(&self) -> &'static str {
+        match self {
+            Operation::Preflight => "preflight",
+            Operation::Prepare => "prepare",
+            Operation::Database => "database",
+            Operation::Member => "member",
+            Operation::Verify => "verify",
+        }
+    }
+}
+
+/// The rotation staged on this volume, as `(current, new)`, while a
+/// `.railway_rotation` journal exists (PREPARE writes it, VERIFY removes it).
+pub(crate) fn staged_rotation(data_dir: &str) -> Option<(String, String)> {
+    let body = std::fs::read(format!("{data_dir}/.railway_rotation")).ok()?;
+    let request: Rotation = serde_json::from_slice(&body).ok()?;
+    Some((request.current_password, request.new_password))
 }
 
 /// Existing watchers cache URLs, but must authenticate using the live pin
@@ -59,8 +79,12 @@ async fn connect(port: u16, password: &str) -> Result<MultiplexedConnection> {
     let url = crate::sentinel_query::build_redis_url("127.0.0.1", port, password);
     let mut conn = Client::open(url)?
         .get_multiplexed_async_connection()
-        .await?;
-    redis::cmd("PING").query_async::<String>(&mut conn).await?;
+        .await
+        .with_context(|| format!("connecting to 127.0.0.1:{port}"))?;
+    redis::cmd("PING")
+        .query_async::<String>(&mut conn)
+        .await
+        .with_context(|| format!("authenticating to 127.0.0.1:{port}"))?;
     Ok(conn)
 }
 async fn rejects_password(port: u16, password: &str) -> Result<bool> {
@@ -168,13 +192,50 @@ pub async fn rotate(
             Json(json!({"error":"invalid password"})),
         );
     }
+    let operation = request.operation.name();
+    let secrets = [
+        request.new_password.clone(),
+        request.current_password.clone(),
+    ];
     match tokio::time::timeout(Duration::from_secs(35), apply(&config, request)).await {
         Ok(Ok(value)) => (StatusCode::OK, Json(value)),
-        _ => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error":"credential rotation could not be verified"})),
-        ),
+        Ok(Err(error)) => {
+            let reason = refusal_reason(&error, &secrets);
+            warn!(operation, reason, "credential operation refused");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(
+                    json!({"error": format!("credential rotation could not be verified: {reason}")}),
+                ),
+            )
+        }
+        Err(_) => {
+            let reason = format!("{operation} timed out after 35s");
+            warn!(operation, reason, "credential operation refused");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(
+                    json!({"error": format!("credential rotation could not be verified: {reason}")}),
+                ),
+            )
+        }
     }
+}
+
+/// The 503 body names the check that refused, so a stuck rotation can be
+/// read off backboard's error instead of a diagnostic build: the error chain
+/// in one line, every password the request carried cut out, bounded to 200
+/// characters.
+fn refusal_reason(error: &anyhow::Error, secrets: &[String]) -> String {
+    let mut reason = error
+        .chain()
+        .map(|cause| cause.to_string().replace(['\n', '\r'], " "))
+        .collect::<Vec<_>>()
+        .join(": ");
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        reason = reason.replace(secret.as_str(), "<redacted>");
+    }
+    reason.chars().take(200).collect()
 }
 
 async fn apply(config: &Config, request: Rotation) -> Result<Value> {
@@ -188,7 +249,8 @@ async fn apply(config: &Config, request: Rotation) -> Result<Value> {
                 .arg("CKQUORUM")
                 .arg(&config.redis_master_name)
                 .query_async::<String>(&mut sentinel)
-                .await?;
+                .await
+                .context("SENTINEL CKQUORUM")?;
         }
         Operation::Prepare => {
             write_atomic(
@@ -282,6 +344,17 @@ async fn apply(config: &Config, request: Rotation) -> Result<Value> {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }
+            // The restarted Sentinel must dial out with the new password, not
+            // with whatever a stale writer or a conf the rewrite never reached
+            // left in sentinel-pass / auth-pass — otherwise every peer goes
+            // s_down and the quorum wait below never ends.
+            crate::credential_reconcile::reconcile_once(
+                &config.data_dir,
+                config.sentinel_port,
+                &config.redis_master_name,
+                &request.new_password,
+            )
+            .await;
             // A listening port is not a quorum member yet. Wait for peer
             // connections before allowing the next Sentinel to restart.
             loop {
@@ -290,7 +363,8 @@ async fn apply(config: &Config, request: Rotation) -> Result<Value> {
                     .arg("SENTINELS")
                     .arg(&config.redis_master_name)
                     .query_async(&mut sentinel)
-                    .await?;
+                    .await
+                    .context("SENTINEL SENTINELS")?;
                 let connected = peers
                     .iter()
                     .filter(|peer| {
@@ -313,7 +387,8 @@ async fn apply(config: &Config, request: Rotation) -> Result<Value> {
                         .arg("CKQUORUM")
                         .arg(&config.redis_master_name)
                         .query_async::<String>(&mut sentinel)
-                        .await?;
+                        .await
+                        .context("SENTINEL CKQUORUM")?;
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -327,7 +402,8 @@ async fn apply(config: &Config, request: Rotation) -> Result<Value> {
                 .arg("CKQUORUM")
                 .arg(&config.redis_master_name)
                 .query_async::<String>(&mut sentinel)
-                .await?;
+                .await
+                .context("SENTINEL CKQUORUM")?;
             anyhow::ensure!(
                 persisted_requirepass(&config.data_dir).as_deref() == Some(&request.new_password),
                 "pin differs"
@@ -358,23 +434,49 @@ async fn apply(config: &Config, request: Rotation) -> Result<Value> {
 
 /// Preserve Sentinel's learned topology, epochs and IDs. Replace only the
 /// credential directives, dropping the temporary default-user ACL overlap.
+///
+/// Directives are matched the way Redis reads them — case-insensitively,
+/// any whitespace, quoted or bare values — so a conf written by an older
+/// build (bare values, in that build's order) or rewritten since by Sentinel
+/// itself (which writes `sentinel-pass` and `auth-pass` bare and
+/// `requirepass` quoted) comes out the same. A conf that requires auth but
+/// carries no `sentinel sentinel-pass` line gets one: Sentinel would fall
+/// back to `requirepass` for outbound auth, but an explicit line is what the
+/// reconcile loop and operators read.
 fn rewrite_sentinel(original: &str, password: &str) -> String {
     let mut lines = Vec::new();
+    let mut requires_auth = false;
+    let mut has_sentinel_pass = false;
     for line in original.lines() {
         let fields: Vec<_> = line.split_whitespace().collect();
-        match fields.as_slice() {
-            ["requirepass", ..] => {
-                lines.push(format!("requirepass {}", quote_conf_value(password)))
-            }
-            ["sentinel", "sentinel-pass", ..] => lines.push(format!(
+        let keyword = |index: usize, expected: &str| {
+            fields
+                .get(index)
+                .is_some_and(|field| field.eq_ignore_ascii_case(expected))
+        };
+        if keyword(0, "requirepass") {
+            requires_auth = true;
+            lines.push(format!("requirepass {}", quote_conf_value(password)));
+            continue;
+        }
+        if keyword(0, "sentinel") && keyword(1, "sentinel-pass") {
+            has_sentinel_pass = true;
+            lines.push(format!(
                 "sentinel sentinel-pass {}",
                 quote_conf_value(password)
-            )),
-            ["sentinel", "auth-pass", name, ..] => lines.push(format!(
-                "sentinel auth-pass {name} {}",
+            ));
+            continue;
+        }
+        if keyword(0, "sentinel") && keyword(1, "auth-pass") && fields.len() >= 3 {
+            lines.push(format!(
+                "sentinel auth-pass {} {}",
+                fields[2],
                 quote_conf_value(password)
-            )),
-            ["user", "default", rules @ ..] => {
+            ));
+            continue;
+        }
+        match fields.as_slice() {
+            [user, "default", rules @ ..] if user.eq_ignore_ascii_case("user") => {
                 // ACL LIST/FLUSHCONFIG writes hashes, never raw secrets.
                 // Keep permission/key/channel restrictions exactly as stored.
                 let permissions: Vec<_> = rules
@@ -400,6 +502,16 @@ fn rewrite_sentinel(original: &str, password: &str) -> String {
             }
             _ => lines.push(line.to_string()),
         }
+    }
+    if requires_auth && !has_sentinel_pass {
+        let after_requirepass = lines
+            .iter()
+            .position(|line| line.starts_with("requirepass "))
+            .map_or(lines.len(), |index| index + 1);
+        lines.insert(
+            after_requirepass,
+            format!("sentinel sentinel-pass {}", quote_conf_value(password)),
+        );
     }
     format!("{}\n", lines.join("\n"))
 }
@@ -567,5 +679,131 @@ mod tests {
         assert!(updated.contains("user default on ~* +@all resetpass #"));
         assert!(!updated.contains("#old"));
         assert_eq!(updated, rewrite_sentinel(&updated, "p:a ss"));
+    }
+
+    /// A conf as an image from before the rotation code wrote it — bare
+    /// values, that build's directive order — after Sentinel has owned it
+    /// for a while: its own rewrite keeps `sentinel-pass`/`auth-pass` bare,
+    /// quotes `requirepass`, and appends the ACL line, its id, epochs and
+    /// the peers it learned. The rotation must leave every credential line
+    /// at the new password and nothing else changed.
+    const LEGACY_CONF: &str = "port 26379
+daemonize no
+logfile \"\"
+loglevel notice
+requirepass \"old\"
+sentinel sentinel-pass old
+sentinel resolve-hostnames yes
+sentinel announce-hostnames yes
+sentinel announce-ip \"redis-1.railway.internal\"
+sentinel announce-port 26379
+sentinel monitor mymaster redis-3.railway.internal 6379 2
+sentinel auth-pass mymaster old
+sentinel down-after-milliseconds mymaster 5000
+sentinel failover-timeout mymaster 30000
+sentinel parallel-syncs mymaster 1
+sentinel master-reboot-down-after-period mymaster 10000
+# Generated by CONFIG REWRITE
+dir \"/data\"
+user default on sanitize-payload #a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3 ~* &* +@all
+sentinel myid 731fde5108215c15037bed36e81515568d46f32f
+sentinel config-epoch mymaster 1
+sentinel leader-epoch mymaster 0
+sentinel current-epoch 1
+sentinel known-sentinel mymaster redis-2.railway.internal 26379 c101de0bd85d1eefec260edd76ee8f1821a238b3
+sentinel known-replica mymaster redis-2.railway.internal 6379
+";
+
+    fn credential_lines(conf: &str) -> Vec<&str> {
+        conf.lines()
+            .filter(|line| {
+                line.starts_with("requirepass ")
+                    || line.starts_with("sentinel sentinel-pass ")
+                    || line.starts_with("sentinel auth-pass ")
+                    || line.starts_with("user default ")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_legacy_conf_comes_out_with_every_credential_at_the_new_password() {
+        let updated = rewrite_sentinel(LEGACY_CONF, "new");
+        assert_eq!(
+            credential_lines(&updated),
+            vec![
+                "requirepass \"new\"",
+                "sentinel sentinel-pass \"new\"",
+                "sentinel auth-pass mymaster \"new\"",
+                "user default on sanitize-payload ~* &* +@all resetpass #11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437",
+            ]
+        );
+        assert!(!updated.contains("old"));
+        // Everything Sentinel learned survives, in place and in order.
+        let kept = |line: &str| assert!(updated.lines().any(|l| l == line), "{line}");
+        kept("sentinel monitor mymaster redis-3.railway.internal 6379 2");
+        kept("sentinel myid 731fde5108215c15037bed36e81515568d46f32f");
+        kept("sentinel config-epoch mymaster 1");
+        kept("sentinel known-sentinel mymaster redis-2.railway.internal 26379 c101de0bd85d1eefec260edd76ee8f1821a238b3");
+        kept("sentinel known-replica mymaster redis-2.railway.internal 6379");
+        assert_eq!(updated.lines().count(), LEGACY_CONF.lines().count());
+        assert_eq!(updated, rewrite_sentinel(&updated, "new"));
+    }
+
+    #[test]
+    fn directives_match_the_way_redis_reads_them() {
+        // Case-insensitive keywords, tabs, leading blanks: all valid conf.
+        let odd = "RequirePass old\n\tSENTINEL  Sentinel-Pass\told\nSentinel AUTH-PASS mymaster old\nUSER default on #x ~* +@all\n";
+        let updated = rewrite_sentinel(odd, "new");
+        assert_eq!(
+            credential_lines(&updated),
+            vec![
+                "requirepass \"new\"",
+                "sentinel sentinel-pass \"new\"",
+                "sentinel auth-pass mymaster \"new\"",
+                "user default on ~* +@all resetpass #11507a0e2f5e69d5dfa40a62a1bd7b6ee57e6bcd85c67c9b8431b36fff21c437",
+            ]
+        );
+        assert!(!updated.contains("old"));
+    }
+
+    #[test]
+    fn a_conf_requiring_auth_without_a_sentinel_pass_line_gets_one() {
+        // A conf from before the explicit sentinel-pass line existed: the
+        // Sentinel fell back to requirepass for outbound auth. After the
+        // rewrite the outbound credential is explicit, right after
+        // requirepass, and present exactly once.
+        let conf = "port 26379\nrequirepass old\nsentinel monitor mymaster h 6379 2\nsentinel auth-pass mymaster old\n";
+        let updated = rewrite_sentinel(conf, "new");
+        assert_eq!(
+            updated,
+            "port 26379\nrequirepass \"new\"\nsentinel sentinel-pass \"new\"\nsentinel monitor mymaster h 6379 2\nsentinel auth-pass mymaster \"new\"\n"
+        );
+        assert_eq!(updated, rewrite_sentinel(&updated, "new"));
+    }
+
+    #[test]
+    fn an_open_conf_stays_open() {
+        // No requirepass: never invent one, never add an outbound password
+        // the peers would refuse.
+        let conf =
+            "port 26379\nsentinel monitor mymaster h 6379 2\nsentinel auth-pass mymaster old\n";
+        let updated = rewrite_sentinel(conf, "new");
+        assert!(!updated.contains("requirepass"));
+        assert!(!updated.contains("sentinel-pass"));
+        assert!(updated.contains("sentinel auth-pass mymaster \"new\""));
+    }
+
+    #[test]
+    fn a_refusal_names_the_check_without_the_passwords() {
+        let error = anyhow::anyhow!("AUTH failed for p:a ss\nsecond line")
+            .context("authenticating to 127.0.0.1:26379")
+            .context("SENTINEL CKQUORUM");
+        let reason = refusal_reason(&error, &["p:a ss".to_string(), String::new()]);
+        assert_eq!(
+            reason,
+            "SENTINEL CKQUORUM: authenticating to 127.0.0.1:26379: AUTH failed for <redacted> second line"
+        );
+        let long = anyhow::anyhow!("{}", "x".repeat(500));
+        assert_eq!(refusal_reason(&long, &[]).chars().count(), 200);
     }
 }
