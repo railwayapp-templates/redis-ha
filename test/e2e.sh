@@ -3033,6 +3033,108 @@ t_password_variable_edit_does_not_rotate() {
   ok "$t"
 }
 
+# The pin is a Sentinel-node contract. A standalone node has nothing a
+# half-applied edit could strand (no Sentinel, no peers, no sentinel.conf), so
+# it applies REDIS_PASSWORD on every boot: a redeploy after the variable
+# changed rotates the password, as the bitnami lineage this image replaced
+# always did and as the dashboard's Regenerate relied on for Redis. The
+# Discord report of 2026-10-26 was exactly this boot on a repinned standalone.
+t_standalone_variable_edit_rotates_on_redeploy() {
+  local t=t_standalone_variable_edit_rotates_on_redeploy n=solo-rot
+  local rotated=rotated-by-redeploy
+  mkvol solo-rot-vol
+  start_node "$n" solo-rot-vol /data -e SENTINEL_ENABLED=
+  wait_for_ping "$n" || { ko "$t" "redis never answered PING" "$n"; return; }
+  [ "$(rcli "$n" SET marker alive)" = "OK" ] \
+    || { ko "$t" "seed write refused" "$n"; return; }
+
+  docker rm -f "$n" >/dev/null 2>&1
+  start_node "$n" solo-rot-vol /data -e SENTINEL_ENABLED= -e REDIS_PASSWORD="$rotated"
+  local i up=0
+  for i in $(seq 1 60); do
+    docker exec -e REDISCLI_AUTH="$rotated" "$n" redis-cli --no-auth-warning PING 2>/dev/null \
+      | grep -q PONG && { up=1; break; }
+    sleep 1
+  done
+  [ "$up" = 1 ] || { ko "$t" "edited variable does not authenticate after the redeploy" "$n"; return; }
+  rcli "$n" PING 2>/dev/null | grep -q PONG \
+    && { ko "$t" "the previous password still authenticates after the redeploy" "$n"; return; }
+  wait_for_log_line "$n" "REDIS_PASSWORD changed since the last boot; applying it" 10 \
+    || { ko "$t" "wrapper did not say it applied the variable" "$n"; return; }
+  docker logs "$n" 2>&1 | grep -- "This node keeps using the database.s current password" >/dev/null \
+    && { ko "$t" "standalone node warned about drift instead of rotating" "$n"; return; }
+  [ "$(docker exec -e REDISCLI_AUTH="$rotated" "$n" redis-cli --no-auth-warning GET marker 2>/dev/null)" = "alive" ] \
+    || { ko "$t" "data did not survive the rotation redeploy" "$n"; return; }
+  [ "$(docker exec -e REDISCLI_AUTH="$rotated" "$n" redis-cli --no-auth-warning CONFIG GET masterauth 2>/dev/null | tail -1)" = "$rotated" ] \
+    || { ko "$t" "masterauth did not follow the rotated requirepass" "$n"; return; }
+
+  docker rm -f "$n" >/dev/null 2>&1
+  ok "$t"
+}
+
+# The other half of the pin's contract: an orchestrated rotation IS honored.
+# Regenerating a standalone service's password from the dashboard rotates the
+# live server first — `CONFIG SET requirepass` + `masterauth` + `CONFIG
+# REWRITE`, authenticated with the password the variables held — and only then
+# upserts REDIS_PASSWORD and redeploys. On that reboot the wrapper must adopt
+# the rewritten conf, not warn about drift: the rotated password
+# authenticates, the previous one does not, the data is intact. The rotated
+# value carries the two characters CONFIG REWRITE escapes (`"` and `\`), so
+# the reboot also proves the wrapper reads Redis's own quoting of the line,
+# not just its own.
+t_config_rewrite_rotation_is_honored_on_reboot() {
+  local t=t_config_rewrite_rotation_is_honored_on_reboot n=rot-1
+  local rotated='rot"ated\by regenerate'
+  mkvol rot-vol
+  start_node "$n" rot-vol /data -e SENTINEL_ENABLED=
+  wait_for_ping "$n" || { ko "$t" "redis never answered PING" "$n"; return; }
+  [ "$(rcli "$n" SET marker alive)" = "OK" ] \
+    || { ko "$t" "seed write refused" "$n"; return; }
+
+  # The exact statement sequence backboard sends, in one session opened with
+  # the previous password. The quoted heredoc keeps the redis-cli escaping
+  # (`\"`, `\\`) intact: redis-cli decodes it to the value in $rotated.
+  local replies
+  replies=$(docker exec -i "$n" redis-cli -a "$PW" --no-auth-warning 2>/dev/null <<'EOC' | tr '\n' ' '
+CONFIG SET requirepass "rot\"ated\\by regenerate"
+CONFIG SET masterauth "rot\"ated\\by regenerate"
+CONFIG REWRITE
+EOC
+)
+  [ "$replies" = "OK OK OK " ] \
+    || { ko "$t" "live rotation did not get three OKs: $replies" "$n"; return; }
+  docker exec -e REDISCLI_AUTH="$rotated" "$n" redis-cli --no-auth-warning PING 2>/dev/null \
+    | grep -q PONG \
+    || { ko "$t" "rotated password does not authenticate live" "$n"; return; }
+
+  # The redeploy that follows the variable upsert: same volume, the variable
+  # now carries the rotated value (the last -e wins).
+  docker rm -f "$n" >/dev/null 2>&1
+  start_node "$n" rot-vol /data -e SENTINEL_ENABLED= -e REDIS_PASSWORD="$rotated"
+  local i up=0
+  for i in $(seq 1 60); do
+    docker exec -e REDISCLI_AUTH="$rotated" "$n" redis-cli --no-auth-warning PING 2>/dev/null \
+      | grep -q PONG && { up=1; break; }
+    sleep 1
+  done
+  [ "$up" = 1 ] || { ko "$t" "rotated password does not authenticate after the reboot" "$n"; return; }
+  rcli "$n" PING 2>/dev/null | grep -q PONG \
+    && { ko "$t" "the previous password still authenticates after the reboot" "$n"; return; }
+  # The pin decision is logged before Redis is spawned, so by now a drift
+  # warning would already be in the log; its absence is the assertion.
+  docker logs "$n" 2>&1 | grep -- "This node keeps using the database.s current password" >/dev/null \
+    && { ko "$t" "wrapper warned about drift on a rotation it should honor" "$n"; return; }
+  [ "$(docker exec -e REDISCLI_AUTH="$rotated" "$n" redis-cli --no-auth-warning GET marker 2>/dev/null)" = "alive" ] \
+    || { ko "$t" "data did not survive the rotation reboot" "$n"; return; }
+  # The regenerated conf carries the rotated value as masterauth too, so a
+  # later HA conversion replicates with the right credential.
+  [ "$(docker exec -e REDISCLI_AUTH="$rotated" "$n" redis-cli --no-auth-warning CONFIG GET masterauth 2>/dev/null | tail -1)" = "$rotated" ] \
+    || { ko "$t" "masterauth did not follow the rotated requirepass" "$n"; return; }
+
+  docker rm -f "$n" >/dev/null 2>&1
+  ok "$t"
+}
+
 # The membership probe's discriminator is the shared password, not DNS: a
 # foreign service that happens to reuse the hostname of a dead member
 # resolves and answers, but refuses the cluster's AUTH — that state is a
@@ -4116,6 +4218,8 @@ ALL_TESTS=(
   t_scale_up_of_unauthed_cluster_stays_unauthed
   t_scale_up_of_authed_cluster_joins_and_votes
   t_password_variable_edit_does_not_rotate
+  t_standalone_variable_edit_rotates_on_redeploy
+  t_config_rewrite_rotation_is_honored_on_reboot
   t_maxmemory_pressure_keeps_cluster_stable
   t_maxmemory_policy_opt_in_evicts_instead_of_refusing
   t_invalid_maxmemory_policy_boots_on_noeviction

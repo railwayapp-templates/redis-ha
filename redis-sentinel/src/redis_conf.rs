@@ -202,7 +202,10 @@ pub(crate) fn replicate_from(config: &Config, boot_master: &BootMaster) -> Optio
             }
             // Parse REPLICA_OF as "host:port"
             let parts: Vec<&str> = config.replica_of.splitn(2, ':').collect();
-            match (parts.first(), parts.get(1).and_then(|p| p.parse::<u16>().ok())) {
+            match (
+                parts.first(),
+                parts.get(1).and_then(|p| p.parse::<u16>().ok()),
+            ) {
                 (Some(host), Some(port)) if !host.is_empty() => Some((host.to_string(), port)),
                 _ => None,
             }
@@ -230,6 +233,49 @@ pub(crate) fn replicate_from(config: &Config, boot_master: &BootMaster) -> Optio
 /// a failover could never be elected from anyway.
 pub fn min_replicas_to_write(sentinel_quorum: u32) -> u32 {
     sentinel_quorum.saturating_sub(1).max(1)
+}
+
+/// Which password this boot runs with, decided once before redis.conf is
+/// regenerated.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BootPassword {
+    /// `REDIS_PASSWORD` as-is: a fresh volume, a variable that matches the
+    /// volume, or a rotation this boot already proved against the cluster.
+    Env,
+    /// Standalone node whose variable changed since the last boot: the
+    /// variable is applied, so a redeploy rotates the password — what the
+    /// bitnami lineage this image replaced always did, and what the
+    /// dashboard's Regenerate relied on for Redis. Nothing else on a
+    /// standalone node holds the previous password (no Sentinel, no peers,
+    /// no sentinel.conf), so there is nothing a half-applied edit could
+    /// strand.
+    EnvRotates,
+    /// Sentinel node whose variable drifted: the persisted password stays.
+    /// sentinel.conf and every peer still carry it, and regenerating
+    /// redis.conf with the new value would strand them all (see the pin's
+    /// comment in the wrapper). Carries the persisted value.
+    PersistedPinned(String),
+}
+
+/// `persisted` is the `requirepass` of the previous boot's redis.conf,
+/// `rotated_at_boot` whether a staged or variable password was already
+/// proven against a live Sentinel and primary this boot.
+pub fn boot_password(
+    persisted: Option<String>,
+    env_password: &str,
+    sentinel_enabled: bool,
+    rotated_at_boot: bool,
+) -> BootPassword {
+    match persisted {
+        Some(active) if active != env_password && !rotated_at_boot => {
+            if sentinel_enabled {
+                BootPassword::PersistedPinned(active)
+            } else {
+                BootPassword::EnvRotates
+            }
+        }
+        _ => BootPassword::Env,
+    }
 }
 
 /// The `requirepass` a previous boot's generated redis.conf carries,
@@ -412,7 +458,10 @@ pub fn generate_redis_conf(
     // dataset frozen at the moment it lost the master role — and stays
     // eligible for a later promotion, which is how that stale dataset becomes
     // the cluster's. Inert on a master, which never reads it.
-    lines.push(format!("masterauth {}", quote_conf_value(&config.redis_password)));
+    lines.push(format!(
+        "masterauth {}",
+        quote_conf_value(&config.redis_password)
+    ));
 
     if let Some((host, port)) = replicate_from(config, boot_master) {
         lines.push(format!("replicaof {} {}", host, port));
@@ -496,6 +545,50 @@ mod tests {
     }
 
     // --- needs_rdb_to_aof_migration: every branch ---
+
+    // --- boot_password: the pin applies to Sentinel nodes only ---
+
+    #[test]
+    fn fresh_volume_takes_the_variable_in_either_mode() {
+        assert_eq!(boot_password(None, "pw", true, false), BootPassword::Env);
+        assert_eq!(boot_password(None, "pw", false, false), BootPassword::Env);
+    }
+
+    #[test]
+    fn matching_variable_is_a_plain_boot() {
+        assert_eq!(
+            boot_password(Some("pw".into()), "pw", true, false),
+            BootPassword::Env
+        );
+        assert_eq!(
+            boot_password(Some("pw".into()), "pw", false, false),
+            BootPassword::Env
+        );
+    }
+
+    #[test]
+    fn sentinel_node_keeps_the_persisted_password_over_a_drifted_variable() {
+        assert_eq!(
+            boot_password(Some("old".into()), "edited", true, false),
+            BootPassword::PersistedPinned("old".into())
+        );
+    }
+
+    #[test]
+    fn standalone_node_applies_the_edited_variable() {
+        assert_eq!(
+            boot_password(Some("old".into()), "edited", false, false),
+            BootPassword::EnvRotates
+        );
+    }
+
+    #[test]
+    fn a_rotation_proven_at_boot_is_not_drift() {
+        assert_eq!(
+            boot_password(Some("old".into()), "staged", true, true),
+            BootPassword::Env
+        );
+    }
 
     #[test]
     fn fresh_volume_needs_no_migration() {
@@ -606,7 +699,11 @@ mod tests {
         write_rdb(dir.path());
         crate::rdb_owner::record(dir.path().to_str().unwrap()).unwrap();
         age_aof_files(dir.path(), std::time::Duration::from_secs(434 * 86_400));
-        fs::write(dir.path().join("dump.rdb"), b"REDIS0011saved by the old image").unwrap();
+        fs::write(
+            dir.path().join("dump.rdb"),
+            b"REDIS0011saved by the old image",
+        )
+        .unwrap();
         assert!(needs_rdb_to_aof_migration(dir.path().to_str().unwrap()));
     }
 
@@ -828,8 +925,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = config_at(dir.path().to_str().unwrap());
         assert!(config.is_primary());
-        assert!(generate_redis_conf(&config, &BootMaster::NoLocalState).contains(r#"masterauth "pw""#));
-        assert!(generate_redis_conf(&config, &BootMaster::SelfIsMaster).contains(r#"masterauth "pw""#));
+        assert!(
+            generate_redis_conf(&config, &BootMaster::NoLocalState).contains(r#"masterauth "pw""#)
+        );
+        assert!(
+            generate_redis_conf(&config, &BootMaster::SelfIsMaster).contains(r#"masterauth "pw""#)
+        );
     }
 
     #[test]
@@ -891,7 +992,7 @@ mod tests {
         assert_eq!(min_replicas_to_write(2), 1); // 3-node cluster
         assert_eq!(min_replicas_to_write(3), 2); // 5-node cluster
         assert_eq!(min_replicas_to_write(4), 3); // 7-node cluster
-        // Degenerate stamps never disable the fence outright.
+                                                 // Degenerate stamps never disable the fence outright.
         assert_eq!(min_replicas_to_write(1), 1);
         assert_eq!(min_replicas_to_write(0), 1);
     }
@@ -945,7 +1046,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut config = config_at(dir.path().to_str().unwrap());
         config.replica_of = "redis-1:6379".to_string();
-        let conf = generate_redis_conf(&config, &BootMaster::ReplicaOf("redis-3".to_string(), 6380));
+        let conf =
+            generate_redis_conf(&config, &BootMaster::ReplicaOf("redis-3".to_string(), 6380));
         assert!(conf.contains("replicaof redis-3 6380"));
         assert!(!conf.contains("replicaof redis-1"));
     }
@@ -1171,11 +1273,7 @@ mod tests {
     fn persisted_requirepass_accepts_an_unquoted_hand_edited_value() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap();
-        std::fs::write(
-            format!("{}/redis.conf", data_dir),
-            "REQUIREPASS hunter2\n",
-        )
-        .unwrap();
+        std::fs::write(format!("{}/redis.conf", data_dir), "REQUIREPASS hunter2\n").unwrap();
         assert_eq!(persisted_requirepass(data_dir), Some("hunter2".to_string()));
     }
 
@@ -1234,7 +1332,9 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("appendonlydir")).unwrap();
         std::fs::write(
-            dir.path().join("appendonlydir").join("appendonly.aof.manifest"),
+            dir.path()
+                .join("appendonlydir")
+                .join("appendonly.aof.manifest"),
             b"file appendonly.aof.1.base.rdb seq 1 type b\n",
         )
         .unwrap();

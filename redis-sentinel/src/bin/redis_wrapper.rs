@@ -25,8 +25,8 @@ use redis_sentinel::{
     process_manager::{enable_aof_after_rdb_load, spawn_redis, spawn_sentinel, supervise},
     quorum, rdb_owner,
     redis_conf::{
-        generate_redis_conf, needs_rdb_to_aof_migration, persisted_requirepass,
-        quarantine_manifestless_aof_dir, quarantine_stale_aof_dir,
+        boot_password, generate_redis_conf, needs_rdb_to_aof_migration, persisted_requirepass,
+        quarantine_manifestless_aof_dir, quarantine_stale_aof_dir, BootPassword,
     },
     sentinel_auth,
     sentinel_conf::{conf_requires_auth, generate_sentinel_conf},
@@ -43,30 +43,55 @@ async fn main() -> Result<()> {
     let mut config = Config::from_env().context("invalid configuration")?;
     let telemetry = tokio::task::spawn_blocking(|| Telemetry::from_env("redis-ha")).await?;
 
-    // The password this node actually runs with is the one already persisted
-    // on the volume, not whatever REDIS_PASSWORD holds right now. The
-    // platform's contract for database services is that editing a credential
-    // variable does NOT rotate the live credential (the dashboard's variable
-    // editor warns exactly that), and half-applying an edit here is worse
-    // than not applying it: sentinel.conf is written once at first boot and
-    // owned by Sentinel afterwards, so a regenerated redis.conf carrying a
-    // new password strands every Sentinel (outbound auth-pass) and every
-    // wrapper watcher (health server, link-heal, quorum-sync) on the old one
-    // — a full write outage through /role going 503 on every node, with
-    // Redis itself perfectly healthy. Pinning to the persisted requirepass
-    // keeps the whole node coherent, and a future orchestrated rotation that
-    // goes through `CONFIG SET requirepass` + `CONFIG REWRITE` updates the
-    // persisted conf and is honored here on the next boot.
+    // Which password this node runs with — see `redis_conf::boot_password`.
+    //
+    // A Sentinel node keeps the one already persisted on the volume, not
+    // whatever REDIS_PASSWORD holds right now. The platform's contract for
+    // database services is that editing a credential variable does NOT rotate
+    // the live credential (the dashboard's variable editor warns exactly
+    // that), and half-applying an edit here is worse than not applying it:
+    // sentinel.conf is written once at first boot and owned by Sentinel
+    // afterwards, so a regenerated redis.conf carrying a new password strands
+    // every Sentinel (outbound auth-pass) and every wrapper watcher (health
+    // server, link-heal, quorum-sync) on the old one — a full write outage
+    // through /role going 503 on every node, with Redis itself perfectly
+    // healthy. Pinning to the persisted requirepass keeps the whole node
+    // coherent; the cluster rotates through `/credentials/rotate`, which
+    // updates the persisted conf, and that is honored here on the next boot.
+    //
+    // A standalone node has none of that to strand — no Sentinel, no peers,
+    // no sentinel.conf — so it applies the variable: a redeploy after a
+    // REDIS_PASSWORD change rotates the password, as the bitnami lineage this
+    // image replaced always did. That is the behavior the dashboard's
+    // Regenerate relied on for Redis before backboard rotated the live server
+    // itself (`CONFIG SET requirepass` + `CONFIG REWRITE`, then the variable
+    // upsert and redeploy — railwaydotcom/monorepo#443); either way the
+    // rewritten conf and the variable agree on the next boot. The e2e
+    // `t_standalone_variable_edit_rotates_on_redeploy` and
+    // `t_config_rewrite_rotation_is_honored_on_reboot` guard the standalone
+    // side, `t_password_variable_edit_does_not_rotate` the Sentinel side.
     //
     // A fresh volume (scale-up, conversion) has no conf and takes the
-    // variable as-is — so after an unapplied variable edit, a NEW node joins
-    // with the new value and cannot authenticate against its peers. The
-    // warning below is the durable signal that the variable has drifted from
-    // the active password.
+    // variable as-is — so after an unapplied variable edit, a NEW Sentinel
+    // node joins with the new value and cannot authenticate against its
+    // peers. The warning below is the durable signal that the variable has
+    // drifted from the active password.
     let rotated_at_boot =
         redis_sentinel::credentials::adopt_proven_boot_password(&mut config).await;
-    if let Some(active_password) = persisted_requirepass(&config.data_dir) {
-        if active_password != config.redis_password && !rotated_at_boot {
+    match boot_password(
+        persisted_requirepass(&config.data_dir),
+        &config.redis_password,
+        config.sentinel_enabled,
+        rotated_at_boot,
+    ) {
+        BootPassword::Env => {}
+        BootPassword::EnvRotates => {
+            info!(
+                "REDIS_PASSWORD changed since the last boot; applying it — a standalone node \
+                 has no Sentinel or peer that could still hold the previous password"
+            );
+        }
+        BootPassword::PersistedPinned(active_password) => {
             tracing::warn!(
                 "The current password in REDIS_PASSWORD doesn't match the database's. This \
                  node keeps using the database's current password. Regenerate the password \
