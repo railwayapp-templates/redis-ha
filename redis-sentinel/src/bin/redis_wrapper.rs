@@ -54,9 +54,14 @@ async fn main() -> Result<()> {
     // wrapper watcher (health server, link-heal, quorum-sync) on the old one
     // — a full write outage through /role going 503 on every node, with
     // Redis itself perfectly healthy. Pinning to the persisted requirepass
-    // keeps the whole node coherent, and a future orchestrated rotation that
-    // goes through `CONFIG SET requirepass` + `CONFIG REWRITE` updates the
-    // persisted conf and is honored here on the next boot.
+    // keeps the whole node coherent, and an orchestrated rotation that goes
+    // through `CONFIG SET requirepass` + `CONFIG REWRITE` updates the
+    // persisted conf and is honored here on the next boot. That is what the
+    // dashboard's Regenerate does for a standalone service (backboard
+    // rotates the live server, then upserts the variable and redeploys); an
+    // HA cluster rotates through `/credentials/rotate` instead. The e2e
+    // `t_config_rewrite_rotation_is_honored_on_reboot` guards this side of
+    // the contract, `t_password_variable_edit_does_not_rotate` the other.
     //
     // A fresh volume (scale-up, conversion) has no conf and takes the
     // variable as-is — so after an unapplied variable edit, a NEW node joins
