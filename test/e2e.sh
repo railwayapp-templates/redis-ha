@@ -3033,6 +3033,45 @@ t_password_variable_edit_does_not_rotate() {
   ok "$t"
 }
 
+# The pin is a Sentinel-node contract. A standalone node has nothing a
+# half-applied edit could strand (no Sentinel, no peers, no sentinel.conf), so
+# it applies REDIS_PASSWORD on every boot: a redeploy after the variable
+# changed rotates the password, as the bitnami lineage this image replaced
+# always did and as the dashboard's Regenerate relied on for Redis. The
+# Discord report of 2026-10-26 was exactly this boot on a repinned standalone.
+t_standalone_variable_edit_rotates_on_redeploy() {
+  local t=t_standalone_variable_edit_rotates_on_redeploy n=solo-rot
+  local rotated=rotated-by-redeploy
+  mkvol solo-rot-vol
+  start_node "$n" solo-rot-vol /data -e SENTINEL_ENABLED=
+  wait_for_ping "$n" || { ko "$t" "redis never answered PING" "$n"; return; }
+  [ "$(rcli "$n" SET marker alive)" = "OK" ] \
+    || { ko "$t" "seed write refused" "$n"; return; }
+
+  docker rm -f "$n" >/dev/null 2>&1
+  start_node "$n" solo-rot-vol /data -e SENTINEL_ENABLED= -e REDIS_PASSWORD="$rotated"
+  local i up=0
+  for i in $(seq 1 60); do
+    docker exec -e REDISCLI_AUTH="$rotated" "$n" redis-cli --no-auth-warning PING 2>/dev/null \
+      | grep -q PONG && { up=1; break; }
+    sleep 1
+  done
+  [ "$up" = 1 ] || { ko "$t" "edited variable does not authenticate after the redeploy" "$n"; return; }
+  rcli "$n" PING 2>/dev/null | grep -q PONG \
+    && { ko "$t" "the previous password still authenticates after the redeploy" "$n"; return; }
+  wait_for_log_line "$n" "REDIS_PASSWORD changed since the last boot; applying it" 10 \
+    || { ko "$t" "wrapper did not say it applied the variable" "$n"; return; }
+  docker logs "$n" 2>&1 | grep -- "This node keeps using the database.s current password" >/dev/null \
+    && { ko "$t" "standalone node warned about drift instead of rotating" "$n"; return; }
+  [ "$(docker exec -e REDISCLI_AUTH="$rotated" "$n" redis-cli --no-auth-warning GET marker 2>/dev/null)" = "alive" ] \
+    || { ko "$t" "data did not survive the rotation redeploy" "$n"; return; }
+  [ "$(docker exec -e REDISCLI_AUTH="$rotated" "$n" redis-cli --no-auth-warning CONFIG GET masterauth 2>/dev/null | tail -1)" = "$rotated" ] \
+    || { ko "$t" "masterauth did not follow the rotated requirepass" "$n"; return; }
+
+  docker rm -f "$n" >/dev/null 2>&1
+  ok "$t"
+}
+
 # The other half of the pin's contract: an orchestrated rotation IS honored.
 # Regenerating a standalone service's password from the dashboard rotates the
 # live server first — `CONFIG SET requirepass` + `masterauth` + `CONFIG
@@ -4179,6 +4218,7 @@ ALL_TESTS=(
   t_scale_up_of_unauthed_cluster_stays_unauthed
   t_scale_up_of_authed_cluster_joins_and_votes
   t_password_variable_edit_does_not_rotate
+  t_standalone_variable_edit_rotates_on_redeploy
   t_config_rewrite_rotation_is_honored_on_reboot
   t_maxmemory_pressure_keeps_cluster_stable
   t_maxmemory_policy_opt_in_evicts_instead_of_refusing
