@@ -132,13 +132,55 @@ fn replication_ready(info: &str, expected_members: usize) -> bool {
         _ => false,
     }
 }
-async fn wait_replication(data: &mut MultiplexedConnection, config: &Config) -> Result<()> {
-    let expected = config
+/// The replicas Sentinel still counts: `SENTINEL REPLICAS` rows whose flags
+/// carry no `s_down`, `o_down` or `disconnected`. A replica whose service was
+/// deleted stays in Sentinel's memory as `s_down` and is not waited on, so a
+/// cluster running with one replica fewer rotates on the replicas it has.
+fn live_replicas(rows: &[Vec<String>]) -> usize {
+    rows.iter()
+        .filter(|row| {
+            row.iter()
+                .position(|field| field == "flags")
+                .and_then(|at| row.get(at + 1))
+                .is_some_and(|flags| {
+                    !flags.contains("disconnected")
+                        && !flags.contains("s_down")
+                        && !flags.contains("o_down")
+                })
+        })
+        .count()
+}
+
+/// How many data members the rotation waits for: the primary plus the
+/// replicas Sentinel counts as up. Without a Sentinel answer (a restart in
+/// progress), the declared member count stands in.
+async fn expected_members(config: &Config, password: &str) -> usize {
+    let declared = config
         .sentinel_hosts
         .split(',')
         .filter(|host| !host.trim().is_empty())
         .count();
+    let Ok(mut sentinel) = connect(config.sentinel_port, password).await else {
+        return declared;
+    };
+    match redis::cmd("SENTINEL")
+        .arg("REPLICAS")
+        .arg(&config.redis_master_name)
+        .query_async::<Vec<Vec<String>>>(&mut sentinel)
+        .await
+    {
+        Ok(rows) => live_replicas(&rows) + 1,
+        Err(_) => declared,
+    }
+}
+
+async fn wait_replication(
+    data: &mut MultiplexedConnection,
+    config: &Config,
+    password: &str,
+) -> Result<()> {
     loop {
+        let expected = expected_members(config, password).await;
         let info: String = redis::cmd("INFO")
             .arg("replication")
             .query_async(data)
@@ -242,7 +284,7 @@ async fn apply(config: &Config, request: Rotation) -> Result<Value> {
     let mut data = connect_either(config.redis_port, &request).await?;
     match request.operation {
         Operation::Preflight => {
-            wait_replication(&mut data, config).await?;
+            wait_replication(&mut data, config, &request.new_password).await?;
             connect(config.redis_port, &request.new_password).await?;
             let mut sentinel = connect(config.sentinel_port, &request.new_password).await?;
             redis::cmd("SENTINEL")
@@ -395,7 +437,7 @@ async fn apply(config: &Config, request: Rotation) -> Result<Value> {
             }
         }
         Operation::Verify => {
-            wait_replication(&mut data, config).await?;
+            wait_replication(&mut data, config, &request.new_password).await?;
             connect(config.redis_port, &request.new_password).await?;
             let mut sentinel = connect(config.sentinel_port, &request.new_password).await?;
             redis::cmd("SENTINEL")
@@ -666,6 +708,30 @@ mod tests {
         assert!(replication_ready(
             "role:master\nslave0:ip=a,state=online\nslave1:ip=b,state=online",
             3
+        ));
+    }
+    #[test]
+    fn live_replicas_skips_what_sentinel_marks_down() {
+        let row = |flags: &str| {
+            vec![
+                "name".to_string(),
+                "redis-2.railway.internal:6379".to_string(),
+                "flags".to_string(),
+                flags.to_string(),
+            ]
+        };
+        // A deleted replica stays in Sentinel's memory as s_down,disconnected.
+        assert_eq!(
+            live_replicas(&[row("slave"), row("s_down,slave,disconnected")]),
+            1
+        );
+        assert_eq!(live_replicas(&[row("slave"), row("slave")]), 2);
+        assert_eq!(live_replicas(&[row("o_down,s_down,slave")]), 0);
+        assert_eq!(live_replicas(&[]), 0);
+        // With one replica gone, a primary with one online replica is ready.
+        assert!(replication_ready(
+            "role:master\nslave0:ip=a,state=online",
+            live_replicas(&[row("slave"), row("s_down,slave,disconnected")]) + 1
         ));
     }
     #[test]
