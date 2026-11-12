@@ -3135,6 +3135,82 @@ EOC
   ok "$t"
 }
 
+# One step of the coordinated rotation protocol on a node's health server,
+# the way backboard drives it: POST /credentials/rotate, Basic auth with the
+# node's pinned password. A 503 is the image saying "not yet" (a Sentinel
+# restarting, a quorum re-forming) and is retried for a minute, as the
+# platform's activity retries do. Echoes the final status code.
+rotation_step() { # rotation_step NODE OPERATION TARGET PREVIOUS
+  local node="$1" body code i
+  body=$(printf '{"operation":"%s","newPassword":"%s","currentPassword":"%s"}' "$2" "$3" "$4")
+  for i in $(seq 1 60); do
+    code=$(docker exec "$node" wget -S -O /dev/null --content-on-error \
+        --header='Content-Type: application/json' \
+        --header="$(basic_auth_header railway "$PW")" \
+        --post-data="$body" "http://127.0.0.1:8080/credentials/rotate" 2>&1 \
+      | sed -n 's/^ *HTTP\/1\.[01] \([0-9][0-9][0-9]\).*/\1/p' | tail -1)
+    [ "$code" = "503" ] || [ -z "$code" ] || break
+    sleep 1
+  done
+  echo "$code"
+}
+
+accepts_password() { # accepts_password NODE PORT PASSWORD
+  docker exec -e REDISCLI_AUTH="$3" "$1" redis-cli -p "$2" --no-auth-warning PING 2>/dev/null | grep -q PONG
+}
+
+# A coordinated rotation that dies after preparing a member, before that
+# member's own step, is compensated with the same protocol toward the
+# previous password. `prepare` adds the target to the default user and leaves
+# requirepass alone, so on the prepared member the compensation's `member`
+# step sets requirepass to the value it already holds, which Redis treats as
+# no change and leaves the ACL as it is. The step has to retire the prepared
+# password itself: otherwise the node, and the edge in front of it, go on
+# accepting a password that was never committed, and the compensation's
+# `verify` refuses forever.
+t_rotation_restore_retires_a_prepared_password() {
+  local t=t_rotation_restore_retires_a_prepared_password prepared='prepared-never-committed'
+  local n code
+  start_ha_trio rrp || { ko "$t" "cluster never became ready" rrp-1 rrp-2 rrp-3; return; }
+  [ "$(rcli rrp-1 SET marker alive)" = "OK" ] || { ko "$t" "seed write refused" rrp-1; return; }
+
+  # The rotation gets as far as preparing the first member.
+  code=$(rotation_step rrp-1 prepare "$prepared" "$PW")
+  [ "$code" = "200" ] || { ko "$t" "prepare on rrp-1 answered ${code:-nothing}" rrp-1; return; }
+  accepts_password rrp-1 6379 "$prepared" \
+    || { ko "$t" "the prepared password does not authenticate on the prepared member" rrp-1; return; }
+
+  # The compensation: prepare and member toward the previous password, on every member.
+  for n in rrp-1 rrp-2 rrp-3; do
+    code=$(rotation_step "$n" prepare "$PW" "$prepared")
+    [ "$code" = "200" ] || { ko "$t" "compensating prepare on ${n} answered ${code:-nothing}" rrp-1 rrp-2 rrp-3; return; }
+  done
+  for n in rrp-1 rrp-2 rrp-3; do
+    code=$(rotation_step "$n" member "$PW" "$prepared")
+    [ "$code" = "200" ] || { ko "$t" "compensating member on ${n} answered ${code:-nothing}" rrp-1 rrp-2 rrp-3; return; }
+  done
+  for n in rrp-1 rrp-2 rrp-3; do
+    accepts_password "$n" 6379 "$PW" \
+      || { ko "$t" "${n} refuses the restored password" "$n"; return; }
+    accepts_password "$n" 6379 "$prepared" \
+      && { ko "$t" "${n} still accepts the prepared password after the compensation" "$n"; return; }
+    accepts_password "$n" 26379 "$prepared" \
+      && { ko "$t" "the Sentinel on ${n} still accepts the prepared password after the compensation" "$n"; return; }
+  done
+  for n in rrp-1 rrp-2 rrp-3; do
+    code=$(rotation_step "$n" verify "$PW" "$prepared")
+    [ "$code" = "200" ] || { ko "$t" "compensating verify on ${n} answered ${code:-nothing}" rrp-1 rrp-2 rrp-3; return; }
+  done
+  [ "$(redis_role rrp-1)" = "master" ] || { ko "$t" "the compensation moved the master" rrp-1 rrp-2 rrp-3; return; }
+  for n in rrp-2 rrp-3; do
+    wait_for_link_status "$n" up 30 || { ko "$t" "${n} lost its master link" rrp-1 "$n"; return; }
+  done
+  wait_for_key rrp-3 marker alive 30 || { ko "$t" "data did not survive the compensation" rrp-1 rrp-3; return; }
+
+  docker rm -f rrp-1 rrp-2 rrp-3 >/dev/null 2>&1
+  ok "$t"
+}
+
 # The membership probe's discriminator is the shared password, not DNS: a
 # foreign service that happens to reuse the hostname of a dead member
 # resolves and answers, but refuses the cluster's AUTH — that state is a
@@ -4220,6 +4296,7 @@ ALL_TESTS=(
   t_password_variable_edit_does_not_rotate
   t_standalone_variable_edit_rotates_on_redeploy
   t_config_rewrite_rotation_is_honored_on_reboot
+  t_rotation_restore_retires_a_prepared_password
   t_maxmemory_pressure_keeps_cluster_stable
   t_maxmemory_policy_opt_in_evicts_instead_of_refusing
   t_invalid_maxmemory_policy_boots_on_noeviction
