@@ -28,6 +28,13 @@ def command(port, password, *args):
     with socket.create_connection(('127.0.0.1', port), timeout=2) as s:
         f = s.makefile('rb'); send(s, f, ('AUTH', password)); return send(s, f, args)
 
+def accepts(port, password):
+    try:
+        command(port, password, 'PING'); return True
+    except RuntimeError as error:
+        if 'WRONGPASS' in str(error) or 'NOAUTH' in str(error): return False
+        raise
+
 def wait(fn, seconds=60):
     until=time.monotonic()+seconds; error=None
     while time.monotonic()<until:
@@ -112,7 +119,21 @@ with tempfile.TemporaryDirectory(prefix='redis-rotation-') as temp:
         for i in range(3): rotate(i,'member',OLD,NEW); quorum()
         for i in range(3): rotate(i,'verify',OLD,NEW)
         assert command(BASE,OLD,'GET','rotation-proof')=='retained'
-        print('PASS: three members rotated, restarted during prepare/adoption, and compensated; quorum retained; data retained')
+        # A rotation that dies after preparing one member, before any member
+        # step: the compensation must leave that member on the previous
+        # password alone. Its requirepass never changed, so the prepared
+        # password has to be retired from the default user explicitly.
+        rotate(0,'prepare'); quorum()
+        assert accepts(BASE,NEW), 'the prepared password does not authenticate on the prepared member'
+        for i in range(3): rotate(i,'prepare',OLD,NEW); quorum()
+        for i in range(3): rotate(i,'member',OLD,NEW); quorum()
+        for i in range(3):
+            assert accepts(BASE+i,OLD), f'node {i} refuses the restored password'
+            assert not accepts(BASE+i,NEW), f'node {i} still accepts the prepared password after the compensation'
+            assert not accepts(BASE+10+i,NEW), f'sentinel {i} still accepts the prepared password after the compensation'
+        for i in range(3): rotate(i,'verify',OLD,NEW)
+        assert command(BASE,OLD,'GET','rotation-proof')=='retained'
+        print('PASS: three members rotated, restarted during prepare/adoption, and compensated, also from a rotation that only prepared one member; quorum retained; data retained')
     except BaseException:
         for p,log,data in processes:
             log.flush(); print(f'node {data.name}:', (data/'wrapper.log').read_text()[-4000:])

@@ -356,6 +356,19 @@ async fn apply(config: &Config, request: Rotation) -> Result<Value> {
                 .arg(&request.new_password)
                 .query_async::<()>(&mut data)
                 .await?;
+            // CONFIG SET requirepass replaces the default user's passwords
+            // only when the value changes. A node that was prepared and then
+            // compensated before its own member step already holds the
+            // restored value as requirepass, and the prepared password stays
+            // in its ACL. One ACL SETUSER leaves the target as the only
+            // password, both rules applied together.
+            redis::cmd("ACL")
+                .arg("SETUSER")
+                .arg("default")
+                .arg("resetpass")
+                .arg(format!(">{}", request.new_password))
+                .query_async::<()>(&mut data)
+                .await?;
             redis::cmd("CONFIG")
                 .arg("REWRITE")
                 .query_async::<()>(&mut data)
