@@ -130,6 +130,33 @@ pub async fn probe_unauthenticated(host: &str, port: u16, deadline: Duration) ->
     }
 }
 
+/// Whether a Redis endpoint is up, judged by any reply to a credential-less
+/// PING: a PONG, or the server refusing it (NOAUTH while it requires a
+/// password, LOADING while it reads its dataset). Only a failure to reach
+/// the server at all — refused connection, timeout, dropped link — is `false`.
+pub async fn answers_at_all(host: &str, port: u16, deadline: Duration) -> bool {
+    let url = build_redis_url(host, port, "");
+    let Some(mut conn) = connect(&url, deadline).await else {
+        return false;
+    };
+    match timeout(
+        deadline,
+        redis::cmd("PING").query_async::<redis::Value>(&mut conn),
+    )
+    .await
+    {
+        Ok(Ok(_)) => true,
+        Ok(Err(err)) => server_replied(&err),
+        Err(_) => false,
+    }
+}
+
+/// True when `err` is the server's own answer rather than a transport
+/// failure.
+fn server_replied(err: &redis::RedisError) -> bool {
+    !(err.is_io_error() || err.is_timeout() || err.is_connection_dropped())
+}
+
 /// Connect to a Redis/Sentinel endpoint, bounding the whole attempt (TCP +
 /// protocol handshake) by `deadline`. `None` on refusal, timeout, or a bad
 /// URL — callers treat all three as "this endpoint has no answer".

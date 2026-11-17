@@ -3334,6 +3334,61 @@ t_wiped_master_volume_does_not_wipe_cluster() {
   ok "$t"
 }
 
+# The fresh-deploy start order that left a new cluster down for good (prod VM
+# conformance, 2026-11-17, 6 of 6 deploys): both replicas boot before the
+# primary. A replica that brings its Sentinel up at that point monitors the
+# env primary and names it to the primary's own first-boot peer query; the
+# primary — no sentinel.conf, empty /data — reads its own name as a wiped
+# incumbent and refuses to boot, on every restart. The replicas must hold
+# their boot until the primary's Redis answers, so the primary finds nobody
+# naming it and starts the cluster off the env topology.
+t_replicas_wait_for_a_late_primary_on_fresh_deploy() {
+  local t=t_replicas_wait_for_a_late_primary_on_fresh_deploy
+  local hosts="late-1:26379,late-2:26379,late-3:26379"
+  mkvol late-vol-1; mkvol late-vol-2; mkvol late-vol-3
+  # Railway's private name resolves before the service's container listens.
+  docker run -d --name late-1-dns --label "$LABEL" --network "$NET" \
+    --network-alias late-1 alpine:latest sleep 600 >/dev/null
+  start_node late-2 late-vol-2 /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=late-1:6379
+  start_node late-3 late-vol-3 /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=late-1:6379
+
+  # Longer than the 8-15s start spread the prod deploys showed.
+  sleep 20
+  local n early=""
+  for n in late-2 late-3; do
+    scli "$n" PING | grep -q PONG && early="${early} ${n}:sentinel-up"
+    docker exec "$n" test -e /data/sentinel.conf && early="${early} ${n}:sentinel.conf"
+  done
+
+  docker rm -f late-1-dns >/dev/null 2>&1
+  start_node late-1 late-vol-1 /data -e SENTINEL_HOSTS="$hosts"
+  local i up=""
+  for i in $(seq 1 60); do
+    docker logs late-1 2>&1 | grep "refusing to boot as an empty master" >/dev/null \
+      && { ko "$t" "the primary of a fresh cluster refused to boot (replicas ahead of it:${early:- none})" late-1 late-2 late-3; return; }
+    [ "$(redis_role late-1)" = "master" ] && { up=1; break; }
+    sleep 1
+  done
+  [ -n "$up" ] || { ko "$t" "late-1 never became master" late-1 late-2 late-3; return; }
+  [ -z "$early" ] \
+    || { ko "$t" "a replica started before its primary ever ran:${early}" late-2 late-3; return; }
+  for n in late-2 late-3; do
+    docker logs "$n" 2>&1 | grep "waiting for it before this node starts" >/dev/null \
+      || { ko "$t" "${n} never logged the wait for its primary" "$n"; return; }
+    wait_for_sentinel_peers "$n" 2 \
+      || { ko "$t" "${n}'s sentinel never met both peers" "$n"; return; }
+    wait_for_sentinel_slave_view "$n" 2 \
+      || { ko "$t" "${n}'s sentinel never saw both replicas" "$n"; return; }
+  done
+  write_key late-1 latekey latevalue \
+    || { ko "$t" "master never accepted a write" late-1 late-2 late-3; return; }
+  wait_for_key late-2 latekey latevalue || { ko "$t" "late-2 never synced" late-1 late-2; return; }
+  wait_for_key late-3 latekey latevalue || { ko "$t" "late-3 never synced" late-1 late-3; return; }
+
+  docker rm -f late-1 late-2 late-3 >/dev/null 2>&1
+  ok "$t"
+}
+
 # The dataset-only wipe: dump.rdb/appendonlydir are lost but sentinel.conf
 # survives on the volume, so the boot resolves SelfIsMaster from its own conf
 # and never reaches the peer query — the guard's conf path, which
@@ -4288,6 +4343,7 @@ ALL_TESTS=(
   t_scaled_member_master_is_preserved_at_boot
   t_foreign_host_reusing_member_name_is_quarantined
   t_wiped_master_volume_does_not_wipe_cluster
+  t_replicas_wait_for_a_late_primary_on_fresh_deploy
   t_wiped_dataset_with_surviving_conf_does_not_wipe_cluster
   t_never_synced_replica_is_not_promotable
   t_sentinel_auth_on_by_default_for_fresh_cluster
