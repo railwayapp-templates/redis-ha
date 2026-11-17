@@ -55,6 +55,13 @@
 //! replica that still holds the data, and this node's next boot joins the
 //! new master as a replica through the peer query.
 //!
+//! A peer answer naming this node is not always a wiped incumbent, though:
+//! on a fresh deploy whose env master starts after its peers, they name it
+//! only because the env topology told them to. Before refusing, the boot
+//! asks every peer whether that master ever ran
+//! ([`crate::master_history`]); a complete, clean set of answers lets the
+//! env master boot, anything else keeps the refusal.
+//!
 //! ## Limits
 //! This is local state, not consensus. A node that was *down* for the whole
 //! failover never saw the switch-master event, so its `sentinel.conf` still
@@ -545,6 +552,11 @@ pub struct BootResolution {
     /// the master, so the empty-primary boot guard must refuse an empty
     /// dataset on this path too, not just on the peer-query path.
     pub conf_names_self: bool,
+    /// True only when `peers_named_self` is set AND every peer showed that
+    /// the master they name never ran (see [`crate::master_history`]): the
+    /// peers echo the env topology on a fresh cluster whose env-master
+    /// booted late. The empty-primary guard lets that boot through.
+    pub master_never_ran: bool,
 }
 
 impl BootResolution {
@@ -553,6 +565,7 @@ impl BootResolution {
             master,
             peers_named_self: false,
             conf_names_self: false,
+            master_never_ran: false,
         }
     }
 }
@@ -601,6 +614,7 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
             master: BootMaster::NoLocalState,
             peers_named_self: false,
             conf_names_self,
+            master_never_ran: false,
         };
     }
     let resolved = match classify_local_state(config) {
@@ -632,6 +646,7 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
     }
 
     let mut peers_named_self = false;
+    let mut master_never_ran = false;
     if enabled(std::env::var(PEER_BOOT_ENV).ok().as_deref()) {
         if let Some((host, port)) = query_peer_sentinels(config).await {
             // A peer can be resuming the same dead world this node just
@@ -665,6 +680,7 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
                             "peer sentinels name this node as primary, but this is a first boot \
                              with no local sentinel state — not self-promoting off a peer answer"
                         );
+                        master_never_ran = peers_saw_no_master_history(config).await;
                     }
                 }
             }
@@ -678,6 +694,49 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
         master: resolved,
         peers_named_self,
         conf_names_self: false,
+        master_never_ran,
+    }
+}
+
+/// Whether the peers that just named this node master only echo the env
+/// topology for a master that never ran — the fresh-deploy race where the
+/// env-master's container started after its peers' Sentinels did. Asked
+/// only when the empty-primary guard would otherwise refuse (env-primary,
+/// no dataset), so a normal boot pays nothing. Every outcome is logged with
+/// the evidence that decided it.
+async fn peers_saw_no_master_history(config: &Config) -> bool {
+    use crate::master_history::{
+        decide_master_history, gather_peer_evidence, MasterHistory, FRESH_CLUSTER_CHECK_ENV,
+    };
+
+    if !config.is_primary() || Config::holds_redis_dataset(&config.data_dir) {
+        return false;
+    }
+    if !enabled(std::env::var(FRESH_CLUSTER_CHECK_ENV).ok().as_deref()) {
+        info!(
+            "fresh-cluster check disabled ({}=false)",
+            FRESH_CLUSTER_CHECK_ENV
+        );
+        return false;
+    }
+    match decide_master_history(&gather_peer_evidence(config).await) {
+        MasterHistory::NeverRan => {
+            warn!(
+                "the peer sentinels name this node as primary, but no peer sentinel ever \
+                 reached it, none knows a replica of it, none ran a failover, and no peer \
+                 redis ever replicated — they echo the env topology of a fresh cluster whose \
+                 primary started late. Booting as the env primary."
+            );
+            true
+        }
+        MasterHistory::Existed(evidence) => {
+            info!("fresh-cluster check: the named master existed — {evidence}");
+            false
+        }
+        MasterHistory::Ambiguous(gap) => {
+            info!("fresh-cluster check: ambiguous, keeping the guard — {gap}");
+            false
+        }
     }
 }
 
@@ -866,7 +925,7 @@ pub fn decide_empty_primary_boot(
 /// the kill switch.
 pub fn empty_primary_boot_guard(config: &Config, resolution: &BootResolution) -> EmptyPrimaryBoot {
     decide_empty_primary_boot(
-        resolution.peers_named_self,
+        resolution.peers_named_self && !resolution.master_never_ran,
         resolution.conf_names_self,
         config.is_primary(),
         Config::holds_redis_dataset(&config.data_dir),
@@ -1157,6 +1216,7 @@ mod tests {
             master: BootMaster::NoLocalState,
             peers_named_self: true,
             conf_names_self: false,
+            master_never_ran: false,
         };
         assert_eq!(
             empty_primary_boot_guard(&config, &refused),
@@ -1174,6 +1234,36 @@ mod tests {
     }
 
     #[test]
+    fn the_guard_lets_a_fresh_cluster_primary_boot_through_the_peer_echo() {
+        // The fresh-deploy race: the peers name this node only because the
+        // env topology told them to, and every peer showed the master never
+        // ran. The guard must not refuse the env-master's first boot.
+        let dir = tempdir().unwrap();
+        let config = config_at(dir.path());
+        assert!(config.is_primary());
+        let echoed = BootResolution {
+            master: BootMaster::NoLocalState,
+            peers_named_self: true,
+            conf_names_self: false,
+            master_never_ran: true,
+        };
+        assert_eq!(
+            empty_primary_boot_guard(&config, &echoed),
+            EmptyPrimaryBoot::Proceed
+        );
+        // The fresh-cluster finding never excuses a surviving conf that
+        // names this node: that path is a dataset loss, not an echo.
+        let conf_too = BootResolution {
+            conf_names_self: true,
+            ..echoed
+        };
+        assert_eq!(
+            empty_primary_boot_guard(&config, &conf_too),
+            EmptyPrimaryBoot::Refuse
+        );
+    }
+
+    #[test]
     fn the_guard_refuses_a_wiped_dataset_the_conf_still_names() {
         let dir = tempdir().unwrap();
         let config = config_at(dir.path());
@@ -1184,6 +1274,7 @@ mod tests {
             master: BootMaster::SelfIsMaster,
             peers_named_self: false,
             conf_names_self: true,
+            master_never_ran: false,
         };
         assert_eq!(
             empty_primary_boot_guard(&config, &conf_named_self),
@@ -1211,6 +1302,7 @@ mod tests {
             master: BootMaster::SelfIsMaster,
             peers_named_self: false,
             conf_names_self: true,
+            master_never_ran: false,
         };
         assert_eq!(
             empty_primary_boot_guard(&config, &conf_named_self),

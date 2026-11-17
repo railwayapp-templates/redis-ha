@@ -3334,6 +3334,51 @@ t_wiped_master_volume_does_not_wipe_cluster() {
   ok "$t"
 }
 
+# The fresh-deploy race the empty-primary guard used to deadlock on (prod
+# VM-conformance, 2026-11-17): the env master starts after its peers'
+# Sentinels are already monitoring it off the env topology. Its first-boot
+# peer query then hears its own name back, and with no sentinel.conf and an
+# empty /data it looks exactly like a wiped incumbent. The peers have never
+# reached it, know no replica of it and never synced, so the guard must read
+# the echo as a fresh cluster and boot it as the env master.
+t_late_primary_on_fresh_deploy_boots() {
+  local t=t_late_primary_on_fresh_deploy_boots
+  local hosts="late-1:26379,late-2:26379,late-3:26379"
+  mkvol late-vol-1; mkvol late-vol-2; mkvol late-vol-3
+  # Railway's private name exists before the container runs; hold it so the
+  # peers' Sentinels can resolve the master they are told to monitor.
+  docker run -d --name late-1-dns --label "$LABEL" --network "$NET" \
+    --network-alias late-1 alpine:latest sleep 600 >/dev/null
+  start_node late-2 late-vol-2 /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=late-1:6379
+  start_node late-3 late-vol-3 /data -e SENTINEL_HOSTS="$hosts" -e REPLICA_OF=late-1:6379
+  local i n answered
+  for n in late-2 late-3; do
+    answered=""
+    for i in $(seq 1 60); do
+      scli "$n" SENTINEL get-master-addr-by-name mymaster | head -1 | grep '^late-1$' >/dev/null \
+        && { answered=1; break; }
+      sleep 1
+    done
+    [ -n "$answered" ] \
+      || { ko "$t" "${n}'s sentinel never monitored late-1 off the env topology" "$n"; return; }
+  done
+
+  docker rm -f late-1-dns >/dev/null 2>&1
+  start_node late-1 late-vol-1 /data -e SENTINEL_HOSTS="$hosts"
+  wait_for_log_line late-1 "echo the env topology of a fresh cluster" 30 \
+    || { ko "$t" "the fresh-cluster check never cleared the peer echo" late-1 late-2 late-3; return; }
+  docker logs late-1 2>&1 | grep "refusing to boot as an empty master" >/dev/null \
+    && { ko "$t" "the guard refused the env master of a fresh cluster" late-1; return; }
+  wait_for_role_master late-1 || { ko "$t" "late-1 never became master" late-1; return; }
+  write_key late-1 latekey latevalue \
+    || { ko "$t" "master never accepted a write" late-1 late-2 late-3; return; }
+  wait_for_key late-2 latekey latevalue || { ko "$t" "late-2 never synced" late-1 late-2; return; }
+  wait_for_key late-3 latekey latevalue || { ko "$t" "late-3 never synced" late-1 late-3; return; }
+
+  docker rm -f late-1 late-2 late-3 >/dev/null 2>&1
+  ok "$t"
+}
+
 # The dataset-only wipe: dump.rdb/appendonlydir are lost but sentinel.conf
 # survives on the volume, so the boot resolves SelfIsMaster from its own conf
 # and never reaches the peer query — the guard's conf path, which
@@ -4288,6 +4333,7 @@ ALL_TESTS=(
   t_scaled_member_master_is_preserved_at_boot
   t_foreign_host_reusing_member_name_is_quarantined
   t_wiped_master_volume_does_not_wipe_cluster
+  t_late_primary_on_fresh_deploy_boots
   t_wiped_dataset_with_surviving_conf_does_not_wipe_cluster
   t_never_synced_replica_is_not_promotable
   t_sentinel_auth_on_by_default_for_fresh_cluster
