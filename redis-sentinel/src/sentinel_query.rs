@@ -266,6 +266,51 @@ pub async fn get_master_fields(
     }
 }
 
+/// Boot-time `SENTINEL MASTER <master_name>` against a peer whose auth
+/// posture is unknown, with the same open-then-NOAUTH-retry shape as
+/// [`get_master_addr_with_auth_fallback`]. `None` when the peer gave no
+/// readable answer.
+pub async fn get_master_fields_with_auth_fallback(
+    host: &str,
+    port: u16,
+    master_name: &str,
+    password: &str,
+    deadline: Duration,
+) -> Option<Vec<String>> {
+    async fn request(
+        conn: &mut MultiplexedConnection,
+        master_name: &str,
+        deadline: Duration,
+    ) -> Result<Option<Vec<String>>, redis::RedisError> {
+        match timeout(
+            deadline,
+            redis::cmd("SENTINEL")
+                .arg("master")
+                .arg(master_name)
+                .query_async::<Vec<String>>(conn),
+        )
+        .await
+        {
+            Ok(Ok(fields)) => Ok(Some(fields)),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Ok(None),
+        }
+    }
+    let open_url = build_redis_url(host, port, "");
+    let mut conn = connect(&open_url, deadline).await?;
+    match request(&mut conn, master_name, deadline).await {
+        Ok(answer) => return answer,
+        Err(err) if is_noauth(&err) && !password.is_empty() => {}
+        Err(_) => return None,
+    }
+    let authed_url = build_redis_url(host, port, password);
+    let mut conn = connect(&authed_url, deadline).await?;
+    request(&mut conn, master_name, deadline)
+        .await
+        .ok()
+        .flatten()
+}
+
 #[cfg(test)]
 mod config_get_value_tests {
     use super::*;
