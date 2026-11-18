@@ -43,6 +43,12 @@
 //! master currently is, and only a cluster where no peer answers — a
 //! genuinely fresh one — falls back to the env topology.
 //!
+//! On that fresh cluster the env primary is the one node that starts with
+//! nobody to ask. An env replica that boots first waits for the primary's
+//! Redis to answer before it starts anything ([`decide_no_peer_answer`]), so
+//! no Sentinel ever monitors — and names to its peers — a primary that has
+//! not run yet.
+//!
 //! A peer answer naming THIS node is refused rather than obeyed
 //! ([`boot_master_from_peer_answer`]), and when the env fallback would then
 //! self-promote a primary whose data dir holds no loadable dataset, the boot
@@ -581,7 +587,8 @@ impl BootResolution {
 ///     A peer answer naming THIS node is refused rather than obeyed — see
 ///     [`boot_master_from_peer_answer`].
 ///  3. Env topology — a genuinely fresh cluster where no peer answers, or a
-///     refused self-answer. A refused self-answer on an env-primary with no
+///     refused self-answer. An env replica takes it only once its primary
+///     answers; until then it re-asks the peers ([`decide_no_peer_answer`]). A refused self-answer on an env-primary with no
 ///     loadable dataset never reaches this fallback: the wrapper's
 ///     empty-primary guard ([`empty_primary_boot_guard`]) exits instead.
 pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
@@ -633,7 +640,31 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
 
     let mut peers_named_self = false;
     if enabled(std::env::var(PEER_BOOT_ENV).ok().as_deref()) {
-        if let Some((host, port)) = query_peer_sentinels(config).await {
+        let mut waited_rounds: u64 = 0;
+        loop {
+            let Some((host, port)) = query_peer_sentinels(config).await else {
+                let primary_answers = !config.is_primary() && env_primary_answers(config).await;
+                match decide_no_peer_answer(config.is_primary(), primary_answers) {
+                    NoPeerAnswer::UseEnvTopology => {
+                        info!("no peer sentinel answered — falling back to the env topology");
+                        break;
+                    }
+                    NoPeerAnswer::WaitForPrimary => {
+                        if waited_rounds.is_multiple_of(PRIMARY_WAIT_LOG_EVERY_ROUNDS) {
+                            info!(
+                                "no peer sentinel answered and the primary ({}:{}) is not up \
+                                 yet — waiting for it before this node starts (waited {}s)",
+                                config.initial_master_host(),
+                                config.initial_master_port(),
+                                waited_rounds * PRIMARY_WAIT_POLL.as_secs()
+                            );
+                        }
+                        waited_rounds += 1;
+                        tokio::time::sleep(PRIMARY_WAIT_POLL).await;
+                        continue;
+                    }
+                }
+            };
             // A peer can be resuming the same dead world this node just
             // refused (mid scale-down, or a whole cluster rebooting on
             // reused volumes) — its answer gets the same bar as local
@@ -668,8 +699,7 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
                     }
                 }
             }
-        } else {
-            info!("no peer sentinel answered — falling back to the env topology");
+            break;
         }
     }
 
@@ -679,6 +709,59 @@ pub async fn boot_master_for_this_boot(config: &Config) -> BootResolution {
         peers_named_self,
         conf_names_self: false,
     }
+}
+
+/// How often a first-boot replica re-asks while its primary is not up.
+const PRIMARY_WAIT_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The wait is logged on its first round and then once per this many rounds.
+const PRIMARY_WAIT_LOG_EVERY_ROUNDS: u64 = 15;
+
+/// What a first boot does when no peer Sentinel answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoPeerAnswer {
+    /// Take the role the env topology declares.
+    UseEnvTopology,
+    /// Ask again later: this node is an env replica and the primary it would
+    /// follow has not started.
+    WaitForPrimary,
+}
+
+/// Pure decision for a first boot no peer Sentinel answered.
+///
+/// On a fresh cluster the env primary is the one node that may start with
+/// nobody to ask, and it does. An env replica that started first would
+/// otherwise bring up a Sentinel monitoring a primary that has never run —
+/// and that Sentinel then answers the primary's own first-boot peer query
+/// with the primary's name, which the empty-primary guard cannot tell from
+/// a cluster still following a master whose volume was wiped. So the replica
+/// holds its boot until the primary answers on its Redis port: every Sentinel
+/// of a fresh cluster then starts after its primary did, and a peer answer
+/// naming a node always describes a master that ran.
+pub(crate) fn decide_no_peer_answer(is_primary: bool, primary_answers: bool) -> NoPeerAnswer {
+    if is_primary || primary_answers {
+        NoPeerAnswer::UseEnvTopology
+    } else {
+        NoPeerAnswer::WaitForPrimary
+    }
+}
+
+/// Whether the env primary's Redis is up, by any reply at all — its own
+/// password may differ from this node's on a conversion, and it may still be
+/// loading its dataset.
+async fn env_primary_answers(config: &Config) -> bool {
+    use common::ConfigExt;
+
+    let deadline = std::time::Duration::from_millis(u64::env_parse(
+        "PEER_BOOT_QUERY_TIMEOUT_MS",
+        DEFAULT_PEER_QUERY_TIMEOUT_MS,
+    ));
+    crate::sentinel_query::answers_at_all(
+        &config.initial_master_host(),
+        config.initial_master_port(),
+        deadline,
+    )
+    .await
 }
 
 /// What a peer answer means for the boot role. A peer naming another node is
@@ -880,6 +963,32 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    // --- decide_no_peer_answer ---
+
+    #[test]
+    fn the_env_primary_starts_a_fresh_cluster_with_nobody_to_ask() {
+        assert_eq!(
+            decide_no_peer_answer(true, false),
+            NoPeerAnswer::UseEnvTopology
+        );
+    }
+
+    #[test]
+    fn a_replica_waits_for_a_primary_that_has_not_started() {
+        assert_eq!(
+            decide_no_peer_answer(false, false),
+            NoPeerAnswer::WaitForPrimary
+        );
+    }
+
+    #[test]
+    fn a_replica_follows_the_env_once_its_primary_answers() {
+        assert_eq!(
+            decide_no_peer_answer(false, true),
+            NoPeerAnswer::UseEnvTopology
+        );
+    }
 
     // --- peer_sentinel_addrs ---
 
