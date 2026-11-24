@@ -4294,6 +4294,156 @@ t_peer_pins_drop_a_removed_peer_after_expiry() {
   ok "$t"
 }
 
+# The coordinated rotation runs on the members that are up, the way backboard
+# drives it when a member is down: preflight and prepare everywhere, the
+# database step on the primary, the member steps on the replicas and then on
+# the primary, verify everywhere. Each step authenticates with the password
+# the node pins at that moment.
+rotate_live_members() { # rotate_live_members NEW OLD PRIMARY [REPLICA...]
+  local new="$1" old="$2" primary="$3"; shift 3
+  local replicas=("$@") n code
+  local everyone=("${replicas[@]}" "$primary")
+  for n in "${everyone[@]}"; do
+    # Preflight authenticates with the password the cluster runs on now, in
+    # both fields, as backboard sends it.
+    code=$(PW="$old" rotation_step "$n" preflight "$old" "$old")
+    [ "$code" = "200" ] || { note "preflight on ${n} answered ${code:-nothing}"; return 1; }
+  done
+  for n in "${everyone[@]}"; do
+    code=$(PW="$old" rotation_step "$n" prepare "$new" "$old")
+    [ "$code" = "200" ] || { note "prepare on ${n} answered ${code:-nothing}"; return 1; }
+  done
+  code=$(PW="$old" rotation_step "$primary" database "$new" "$old")
+  [ "$code" = "200" ] || { note "database on ${primary} answered ${code:-nothing}"; return 1; }
+  for n in "${everyone[@]}"; do
+    code=$(PW="$old" rotation_step "$n" member "$new" "$old")
+    [ "$code" = "200" ] || { note "member on ${n} answered ${code:-nothing}"; return 1; }
+  done
+  for n in "${everyone[@]}"; do
+    code=$(PW="$new" rotation_step "$n" verify "$new" "$old")
+    [ "$code" = "200" ] || { note "verify on ${n} answered ${code:-nothing}"; return 1; }
+  done
+}
+
+wait_accepts_password() { # wait_accepts_password NODE PORT PASSWORD [timeout]
+  local i
+  for i in $(seq 1 "${4:-60}"); do
+    accepts_password "$1" "$2" "$3" && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# A member that is down for a whole rotation comes back with REDIS_PASSWORD
+# on the new password while its volume still pins the previous one. It must
+# end up on the new password, replicating from the live primary, without a
+# second redeploy:
+#   replica        a replica is away; the cluster answers when it boots.
+#   peers-paused   a replica is away and no peer answers for its first 25 s,
+#                  past the boot's 10 s adoption window.
+#   killed-master  the primary dies without demoting itself (its sentinel.conf
+#                  still names it), the replicas fail over and rotate. Its
+#                  boot must come back as a replica on the first answer.
+run_returning_member_case() { # run_returning_member_case MODE TEST PREFIX
+  local mode="$1" t="$2" p="$3"
+  local old="$PW" new="rotated-${3}" hosts="${3}-1:26379,${3}-2:26379,${3}-3:26379"
+  local nodes=("${p}-1" "${p}-2" "${p}-3")
+  local away primary n i role code replica_of=()
+  local live=()
+  fail() { ko "$t" "$1" "${nodes[@]}"; }
+
+  start_ha_trio "$p" || { fail "cluster never became ready"; return; }
+  write_key "${p}-1" before kept || { fail "seed write refused"; return; }
+  for n in "${p}-2" "${p}-3"; do
+    wait_for_key "$n" before kept || { fail "${n} never synced the seed"; return; }
+  done
+
+  if [ "$mode" = killed-master ]; then
+    away="${p}-1"
+    live=("${p}-2" "${p}-3")
+    docker kill "$away" >/dev/null 2>&1
+    primary=""
+    for i in $(seq 1 180); do
+      for n in "${live[@]}"; do
+        role_payload "$n" | grep -q '"role":"primary"' && { primary="$n"; break 2; }
+      done
+      sleep 1
+    done
+    [ -n "$primary" ] || { fail "no replica was promoted after the primary died"; return; }
+  else
+    away="${p}-3"
+    live=("${p}-1" "${p}-2")
+    replica_of=(-e REPLICA_OF="${p}-1:6379")
+    primary="${p}-1"
+    docker stop -t 30 "$away" >/dev/null 2>&1
+  fi
+  note "away: ${away}, primary: ${primary}"
+
+  local others=()
+  for n in "${live[@]}"; do [ "$n" = "$primary" ] || others+=("$n"); done
+  rotate_live_members "$new" "$old" "$primary" "${others[@]}" \
+    || { fail "the rotation did not complete on the live members"; return; }
+  PW="$new" write_key "$primary" during rotated \
+    || { fail "write on ${primary} refused after the rotation"; return; }
+
+  docker rm -f "$away" >/dev/null 2>&1
+  [ "$mode" = peers-paused ] && docker pause "${live[@]}" >/dev/null 2>&1
+  start_node "$away" "${away/-/-vol-}" /data -e SENTINEL_HOSTS="$hosts" "${replica_of[@]}" \
+    -e REDIS_PASSWORD="$new"
+  if [ "$mode" = peers-paused ]; then
+    sleep 25
+    docker unpause "${live[@]}" >/dev/null 2>&1
+  fi
+
+  if [ "$mode" = killed-master ]; then
+    # The first answer, as in t_down_for_failover_master_boots_as_replica:
+    # Sentinel would demote a second master eventually, and waiting for that
+    # passes with or without the fix.
+    for i in $(seq 1 60); do
+      role=$(PW="$new" redis_role "$away")
+      [ -z "$role" ] && role=$(PW="$old" redis_role "$away")
+      [ -n "$role" ] && break
+      sleep 1
+    done
+    [ "$role" = "slave" ] || { fail "${away} came back as '${role}', expected a replica of ${primary}"; return; }
+  fi
+
+  wait_accepts_password "$away" 6379 "$new" 120 \
+    || { fail "${away} never accepted the new password"; return; }
+  accepts_password "$away" 6379 "$old" \
+    && { fail "${away} still accepts the previous password"; return; }
+  wait_accepts_password "$away" 26379 "$new" 60 \
+    || { fail "the Sentinel on ${away} never accepted the new password"; return; }
+  accepts_password "$away" 26379 "$old" \
+    && { fail "the Sentinel on ${away} still accepts the previous password"; return; }
+  PW="$new" wait_for_link_status "$away" up 90 \
+    || { fail "${away} never linked to ${primary}"; return; }
+  [ "$(PW="$new" master_host_of "$away")" = "$primary" ] \
+    || { fail "${away} replicates from '$(PW="$new" master_host_of "$away")', expected ${primary}"; return; }
+  PW="$new" wait_for_key "$away" during rotated 60 \
+    || { fail "the write made while ${away} was away never arrived"; return; }
+  PW="$new" wait_for_key "$away" before kept 10 \
+    || { fail "${away} lost the data from before the rotation"; return; }
+  [ "$(PW="$new" redis_role "$primary")" = "master" ] \
+    || { fail "${primary} lost the primary role when ${away} came back"; return; }
+  # The member answers the next rotation, which authenticates with the pin.
+  code=$(PW="$new" rotation_step "$away" preflight "$new" "$new")
+  [ "$code" = "200" ] || { fail "${away} answered a later preflight with ${code:-nothing}"; return; }
+
+  docker rm -f "${nodes[@]}" >/dev/null 2>&1
+  ok "$t"
+}
+
+t_returning_replica_adopts_rotated_password() {
+  run_returning_member_case replica t_returning_replica_adopts_rotated_password rrr
+}
+t_returning_replica_adopts_rotated_password_after_peers_return() {
+  run_returning_member_case peers-paused t_returning_replica_adopts_rotated_password_after_peers_return rrq
+}
+t_killed_master_returns_as_replica_on_rotated_password() {
+  run_returning_member_case killed-master t_killed_master_returns_as_replica_on_rotated_password rrk
+}
+
 ALL_TESTS=(
   t_fresh_boot
   t_standalone_boot_accepts_writes
@@ -4353,6 +4503,9 @@ ALL_TESTS=(
   t_standalone_variable_edit_rotates_on_redeploy
   t_config_rewrite_rotation_is_honored_on_reboot
   t_rotation_restore_retires_a_prepared_password
+  t_returning_replica_adopts_rotated_password
+  t_returning_replica_adopts_rotated_password_after_peers_return
+  t_killed_master_returns_as_replica_on_rotated_password
   t_maxmemory_pressure_keeps_cluster_stable
   t_maxmemory_policy_opt_in_evicts_instead_of_refusing
   t_invalid_maxmemory_policy_boots_on_noeviction
