@@ -59,6 +59,30 @@ pub(crate) fn staged_rotation(data_dir: &str) -> Option<(String, String)> {
     Some((request.current_password, request.new_password))
 }
 
+/// The password the cluster proved at boot while this volume still pinned
+/// the previous one, as `(previous pin, proven password)`. Peer queries made
+/// before redis.conf is rewritten (the boot-role resolution) must present the
+/// proven password: the peers have refused the pinned one since the rotation.
+static ADOPTED: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+fn note_adopted(previous_pin: &str, password: &str) {
+    *ADOPTED.lock().unwrap() = Some((previous_pin.to_string(), password.to_string()));
+}
+
+/// The proven password while the pin still holds the value it replaced;
+/// once the pin moves on, the pin speaks again.
+fn adopted_over_pin(pin: &str) -> Option<String> {
+    let mut adopted = ADOPTED.lock().unwrap();
+    match adopted.as_ref() {
+        Some((previous, password)) if previous == pin => Some(password.clone()),
+        Some(_) => {
+            *adopted = None;
+            None
+        }
+        None => None,
+    }
+}
+
 /// Existing watchers cache URLs, but must authenticate using the live pin
 /// when reconnecting after a rotation. Credential-less probes stay so.
 pub fn active_url(original: impl AsRef<str>) -> String {
@@ -68,7 +92,8 @@ pub fn active_url(original: impl AsRef<str>) -> String {
     };
     if url.password().is_some() {
         if let Ok(config) = Config::from_env() {
-            if let Some(password) = persisted_requirepass(&config.data_dir) {
+            if let Some(pin) = persisted_requirepass(&config.data_dir) {
+                let password = adopted_over_pin(&pin).unwrap_or(pin);
                 let _ = url.set_password(Some(&password));
             }
         }
@@ -633,21 +658,9 @@ pub fn reconcile_sentinel_boot(data_dir: &str) -> Result<()> {
     Ok(())
 }
 
-/// A restarted member can have missed the local adoption step. Authenticate
-/// against a live Sentinel and the primary it names before adopting a staged
-/// or environment password; a manual variable edit alone never wins.
-pub async fn adopt_proven_boot_password(config: &mut Config) -> bool {
-    let Some(pin) = persisted_requirepass(&config.data_dir) else {
-        return false;
-    };
-    let staged = std::fs::read(format!("{}/.railway_rotation", config.data_dir))
-        .ok()
-        .and_then(|body| serde_json::from_slice::<Rotation>(&body).ok())
-        .map(|r| r.new_password);
-    let candidate = staged.unwrap_or_else(|| config.redis_password.clone());
-    if candidate == pin {
-        return false;
-    }
+/// Whether a live Sentinel and the primary it names both accept `candidate`.
+/// A peer that refuses it, or answers nothing, is skipped.
+async fn cluster_accepts(config: &Config, candidate: &str) -> bool {
     let probe = async {
         for peer in config.sentinel_hosts.split(',').map(str::trim) {
             let url = url::Url::parse(&format!("redis://{peer}"))?;
@@ -655,7 +668,7 @@ pub async fn adopt_proven_boot_password(config: &mut Config) -> bool {
             let client = Client::open(crate::sentinel_query::build_redis_url(
                 host,
                 url.port().unwrap_or(26379),
-                &candidate,
+                candidate,
             ))?;
             let Ok(mut sentinel) = client.get_multiplexed_async_connection().await else {
                 continue;
@@ -675,7 +688,7 @@ pub async fn adopt_proven_boot_password(config: &mut Config) -> bool {
             // Loopback of another local test node is valid; in production the
             // learned private address belongs to the current primary.
             let client = Client::open(crate::sentinel_query::build_redis_url(
-                &master[0], port, &candidate,
+                &master[0], port, candidate,
             ))?;
             let Ok(mut data) = client.get_multiplexed_async_connection().await else {
                 continue;
@@ -690,10 +703,29 @@ pub async fn adopt_proven_boot_password(config: &mut Config) -> bool {
         }
         anyhow::bail!("no primary accepted candidate")
     };
-    if matches!(
+    matches!(
         tokio::time::timeout(Duration::from_secs(10), probe).await,
         Ok(Ok(()))
-    ) {
+    )
+}
+
+/// A restarted member can have missed the local adoption step. Authenticate
+/// against a live Sentinel and the primary it names before adopting a staged
+/// or environment password; a manual variable edit alone never wins.
+pub async fn adopt_proven_boot_password(config: &mut Config) -> bool {
+    let Some(pin) = persisted_requirepass(&config.data_dir) else {
+        return false;
+    };
+    let staged = std::fs::read(format!("{}/.railway_rotation", config.data_dir))
+        .ok()
+        .and_then(|body| serde_json::from_slice::<Rotation>(&body).ok())
+        .map(|r| r.new_password);
+    let candidate = staged.unwrap_or_else(|| config.redis_password.clone());
+    if candidate == pin {
+        return false;
+    }
+    if cluster_accepts(config, &candidate).await {
+        note_adopted(&pin, &candidate);
         config.redis_password = candidate;
         true
     } else {
@@ -701,9 +733,71 @@ pub async fn adopt_proven_boot_password(config: &mut Config) -> bool {
     }
 }
 
+const RETURNING_MEMBER_INTERVAL: Duration = Duration::from_secs(30);
+
+/// A member that was down for a rotation and booted while no peer could
+/// prove the new password runs on the previous one, cut off from a cluster
+/// that refuses it. Every 30 s, while REDIS_PASSWORD differs from the pin
+/// and no rotation is staged on this volume, ask the cluster whether it
+/// accepts the variable's password; once a live Sentinel and its primary do,
+/// run this node's own member step toward it, the same switch a rotation
+/// makes (data password, masterauth, Sentinel restart, quorum). An edited
+/// variable the cluster refuses changes nothing.
+pub fn spawn_returning_member_adoption() {
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(RETURNING_MEMBER_INTERVAL).await;
+            let Ok(config) = Config::from_env() else {
+                continue;
+            };
+            let Some(pin) = persisted_requirepass(&config.data_dir) else {
+                continue;
+            };
+            let candidate = config.redis_password.clone();
+            if candidate == pin || staged_rotation(&config.data_dir).is_some() {
+                continue;
+            }
+            if !cluster_accepts(&config, &candidate).await {
+                continue;
+            }
+            let _guard = ROTATION.lock().await;
+            if persisted_requirepass(&config.data_dir).as_deref() != Some(pin.as_str())
+                || staged_rotation(&config.data_dir).is_some()
+            {
+                continue;
+            }
+            let secrets = [candidate.clone(), pin.clone()];
+            let request = Rotation {
+                operation: Operation::Member,
+                new_password: candidate,
+                current_password: pin,
+            };
+            match tokio::time::timeout(Duration::from_secs(120), apply(&config, request)).await {
+                Ok(Ok(_)) => tracing::info!(
+                    "the cluster rotated its password while this node was away; this node \
+                     now runs on the rotated password"
+                ),
+                Ok(Err(error)) => warn!(
+                    reason = refusal_reason(&error, &secrets),
+                    "adopting the cluster's rotated password failed; retrying"
+                ),
+                Err(_) => warn!("adopting the cluster's rotated password timed out; retrying"),
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_pin_speaks_again_once_it_moves_past_the_adopted_password() {
+        assert_eq!(adopted_over_pin("old"), None);
+        note_adopted("old", "new");
+        assert_eq!(adopted_over_pin("old").as_deref(), Some("new"));
+        assert_eq!(adopted_over_pin("new"), None);
+        assert_eq!(adopted_over_pin("old"), None);
+    }
     #[test]
     fn replication_requires_synced_members() {
         assert!(!replication_ready(

@@ -513,6 +513,9 @@ async fn main() -> Result<()> {
             config.redis_password.clone(),
             local_sentinel_requires_auth,
         );
+        // A member that missed a rotation while it was down, and found no
+        // peer to prove the new password at boot, adopts it once one answers.
+        redis_sentinel::credentials::spawn_returning_member_adoption();
         // Runtime cure for a ghost-mastered cluster: when quorum consensus
         // durably names a master that is not a live member and no node holds
         // the master role, restart through the boot path so the boot-time
